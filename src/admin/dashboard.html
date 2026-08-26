@@ -874,6 +874,7 @@
 
   // ─── SETTINGS ───────────────────────────────────────────────────────────────
 
+  
   async function loadSettings() {
     const data = await apiGet('/settings');
     document.getElementById('settingsContent').innerHTML = `
@@ -883,4 +884,40 @@
       <p><b>Platform Fee:</b> ${data.platformFeePercent}%</p>
       <p><b>Min Swap:</b> ${data.minSwapTon} TON</p>
       <p><b>Max Slippage:</b> ${data.maxSlippagePercent}%</p>
-      <p style="margin-top:12px;color:#64748b;">Settings are rea
+      <p style="margin-top:12px;color:#64748b;">Settings are read-only in the dashboard. Modify via environment variables.</p>
+    `;
+  }
+
+  // ─── MODAL ─────────────────────────────────────────────────────────────────
+
+  function openModal(title, body, onConfirm) {
+    document.getElementById('modalTitle').textContent = title;
+    document.getElementById('modalBody').textContent = body;
+    document.getElementById('modalConfirmBtn').onclick = onConfirm;
+    document.getElementById('confirmModal').classList.add('show');
+  }
+
+  function closeModal() {
+    document.getElementById('confirmModal').classList.remove('show');
+  }
+
+  // ─── TOAST ───────────────────────────────────────────────────────────────────
+
+  function showToast(message, type) {
+    const container = document.getElementById('toastContainer');
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+    toast.textContent = message;
+    container.appendChild(toast);
+    setTimeout(() => toast.remove(), 4000);
+  }
+
+  // ─── INIT ──────────────────────────────────────────────────────────────────
+
+  if (authToken) {
+    initDashboard();
+  }
+</script>
+
+</body>
+</html>
