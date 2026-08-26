@@ -1,0 +1,886 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AFTSwap Admin Dashboard</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      line-height: 1.6;
+    }
+    .sidebar {
+      position: fixed;
+      left: 0;
+      top: 0;
+      width: 260px;
+      height: 100vh;
+      background: #1e293b;
+      border-right: 1px solid #334155;
+      padding: 24px 0;
+      overflow-y: auto;
+    }
+    .logo {
+      padding: 0 24px 24px;
+      font-size: 22px;
+      font-weight: 700;
+      color: #38bdf8;
+      border-bottom: 1px solid #334155;
+      margin-bottom: 16px;
+    }
+    .nav-item {
+      display: block;
+      padding: 12px 24px;
+      color: #94a3b8;
+      text-decoration: none;
+      font-size: 14px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .nav-item:hover, .nav-item.active {
+      background: #334155;
+      color: #f8fafc;
+    }
+    .main {
+      margin-left: 260px;
+      padding: 32px;
+      min-height: 100vh;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 32px;
+    }
+    .header h1 { font-size: 28px; font-weight: 700; }
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+      gap: 20px;
+      margin-bottom: 32px;
+    }
+    .stat-card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 20px;
+    }
+    .stat-card h3 {
+      font-size: 13px;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+    }
+    .stat-card .value {
+      font-size: 28px;
+      font-weight: 700;
+      color: #f8fafc;
+    }
+    .section {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 24px;
+      margin-bottom: 24px;
+    }
+    .section h2 {
+      font-size: 18px;
+      margin-bottom: 16px;
+      color: #f8fafc;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th, td {
+      text-align: left;
+      padding: 12px;
+      border-bottom: 1px solid #334155;
+    }
+    th {
+      color: #94a3b8;
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 12px;
+      letter-spacing: 0.5px;
+    }
+    .badge {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .badge-green { background: #064e3b; color: #34d399; }
+    .badge-yellow { background: #713f12; color: #facc15; }
+    .badge-red { background: #7f1d1d; color: #f87171; }
+    .badge-blue { background: #1e3a8a; color: #60a5fa; }
+    .btn {
+      padding: 8px 16px;
+      border-radius: 6px;
+      border: none;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.2s;
+    }
+    .btn:hover { opacity: 0.85; }
+    .btn-primary { background: #0ea5e9; color: white; }
+    .btn-danger { background: #dc2626; color: white; }
+    .btn-secondary { background: #475569; color: white; }
+    .btn-success { background: #059669; color: white; }
+    .hidden { display: none; }
+    .login-overlay {
+      position: fixed;
+      inset: 0;
+      background: #0f172a;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+    .login-box {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 16px;
+      padding: 40px;
+      width: 100%;
+      max-width: 400px;
+    }
+    .login-box h2 { margin-bottom: 24px; text-align: center; }
+    .form-group { margin-bottom: 16px; }
+    .form-group label {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 13px;
+      color: #94a3b8;
+    }
+    .form-group input, .form-group select {
+      width: 100%;
+      padding: 10px 14px;
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      color: #f8fafc;
+      font-size: 14px;
+    }
+    .form-group input:focus, .form-group select:focus {
+      outline: none;
+      border-color: #0ea5e9;
+    }
+    .pagination {
+      display: flex;
+      gap: 8px;
+      margin-top: 16px;
+      justify-content: flex-end;
+    }
+    .pagination button {
+      padding: 6px 12px;
+      background: #334155;
+      border: none;
+      border-radius: 6px;
+      color: #f8fafc;
+      cursor: pointer;
+    }
+    .pagination button:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+    .toast {
+      position: fixed;
+      top: 24px;
+      right: 24px;
+      padding: 14px 20px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 500;
+      z-index: 2000;
+      animation: slideIn 0.3s ease;
+    }
+    .toast-success { background: #064e3b; color: #34d399; border: 1px solid #059669; }
+    .toast-error { background: #7f1d1d; color: #f87171; border: 1px solid #dc2626; }
+    @keyframes slideIn {
+      from { transform: translateX(100%); opacity: 0; }
+      to { transform: translateX(0); opacity: 1; }
+    }
+    .address-mask {
+      font-family: monospace;
+      background: #0f172a;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+    .empty-state {
+      text-align: center;
+      padding: 40px;
+      color: #64748b;
+    }
+    .tabs {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 16px;
+      border-bottom: 1px solid #334155;
+      padding-bottom: 12px;
+    }
+    .tab {
+      padding: 8px 16px;
+      background: transparent;
+      border: none;
+      color: #94a3b8;
+      cursor: pointer;
+      font-size: 14px;
+      border-radius: 6px;
+    }
+    .tab.active {
+      background: #334155;
+      color: #f8fafc;
+    }
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.7);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 3000;
+    }
+    .modal-overlay.show { display: flex; }
+    .modal {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 16px;
+      padding: 28px;
+      width: 100%;
+      max-width: 480px;
+    }
+    .modal h3 { margin-bottom: 16px; }
+    .modal-actions {
+      display: flex;
+      gap: 12px;
+      justify-content: flex-end;
+      margin-top: 20px;
+    }
+    .search-box {
+      width: 100%;
+      max-width: 320px;
+      padding: 10px 14px;
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      color: #f8fafc;
+      margin-bottom: 16px;
+    }
+  </style>
+</head>
+<body>
+
+<div id="loginOverlay" class="login-overlay">
+  <div class="login-box">
+    <h2>🔐 AFTSwap Admin</h2>
+    <div class="form-group">
+      <label>Telegram ID</label>
+      <input type="number" id="loginTelegramId" placeholder="Your Telegram ID">
+    </div>
+    <div class="form-group">
+      <label>Session Token (JWT)</label>
+      <input type="password" id="loginToken" placeholder="Paste your Bearer token">
+    </div>
+    <button class="btn btn-primary" style="width:100%;margin-top:8px;" onclick="doLogin()">Sign In</button>
+    <p style="margin-top:16px;font-size:12px;color:#64748b;text-align:center;">
+      Generate a JWT externally using your ADMIN_SESSION_SECRET
+    </p>
+  </div>
+</div>
+
+<div class="sidebar">
+  <div class="logo">🔄 AFTSwap</div>
+  <a class="nav-item active" onclick="showSection('dashboard')">📊 Dashboard</a>
+  <a class="nav-item" onclick="showSection('users')">👥 Users</a>
+  <a class="nav-item" onclick="showSection('transactions')">📊 Transactions</a>
+  <a class="nav-item" onclick="showSection('deposits')">💰 Deposits</a>
+  <a class="nav-item" onclick="showSection('withdrawals')">💸 Withdrawals</a>
+  <a class="nav-item" onclick="showSection('swaps')">🔄 Swaps</a>
+  <a class="nav-item" onclick="showSection('admins')">👑 Admin Management</a>
+  <a class="nav-item" onclick="showSection('audit')">📋 Audit Logs</a>
+  <a class="nav-item" onclick="showSection('settings')">⚙️ System Settings</a>
+</div>
+
+<div class="main">
+  <div class="header">
+    <h1 id="pageTitle">Dashboard</h1>
+    <div style="font-size:13px;color:#64748b;">Admin: <span id="adminIdDisplay">—</span></div>
+  </div>
+
+  <div id="toastContainer"></div>
+
+  <!-- DASHBOARD -->
+  <div id="section-dashboard" class="page-section">
+    <div class="stats-grid">
+      <div class="stat-card">
+        <h3>Total Users</h3>
+        <div class="value" id="statTotalUsers">—</div>
+      </div>
+      <div class="stat-card">
+        <h3>Total Swaps</h3>
+        <div class="value" id="statTotalSwaps">—</div>
+      </div>
+      <div class="stat-card">
+        <h3>Pending TXs</h3>
+        <div class="value" id="statPendingTxs">—</div>
+      </div>
+      <div class="stat-card">
+        <h3>Custodial TON</h3>
+        <div class="value" id="statTotalTon">—</div>
+      </div>
+      <div class="stat-card">
+        <h3>Custodial AFT</h3>
+        <div class="value" id="statTotalAft">—</div>
+      </div>
+      <div class="stat-card">
+        <h3>Platform Fee</h3>
+        <div class="value" id="statFeePercent">—</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Fee Configuration</h2>
+      <p style="color:#94a3b8;font-size:14px;">
+        Admin Fee Wallet: <span class="address-mask" id="dashFeeWallet">—</span><br>
+        Platform Fee: <b id="dashFeePercent">—%</b><br>
+        Min Swap: <b id="dashMinSwap">—</b> TON
+      </p>
+    </div>
+  </div>
+
+  <!-- USERS -->
+  <div id="section-users" class="page-section hidden">
+    <div class="section">
+      <h2>Users</h2>
+      <input type="text" class="search-box" id="userSearch" placeholder="Search by ID or name..." oninput="filterUsers()">
+      <table>
+        <thead>
+          <tr>
+            <th>Telegram ID</th>
+            <th>Name</th>
+            <th>Username</th>
+            <th>TON Balance</th>
+            <th>AFT Balance</th>
+            <th>Status</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="usersTableBody"></tbody>
+      </table>
+      <div class="pagination" id="usersPagination"></div>
+    </div>
+  </div>
+
+  <!-- TRANSACTIONS -->
+  <div id="section-transactions" class="page-section hidden">
+    <div class="section">
+      <h2>All Transactions</h2>
+      <div class="tabs">
+        <button class="tab active" onclick="setTxFilter('all')">All</button>
+        <button class="tab" onclick="setTxFilter('swap')">Swaps</button>
+        <button class="tab" onclick="setTxFilter('deposit')">Deposits</button>
+        <button class="tab" onclick="setTxFilter('withdrawal')">Withdrawals</button>
+        <button class="tab" onclick="setTxFilter('fee')">Fees</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Type</th>
+            <th>User</th>
+            <th>Asset</th>
+            <th>Amount</th>
+            <th>Status</th>
+            <th>Date</th>
+          </tr>
+        </thead>
+        <tbody id="txTableBody"></tbody>
+      </table>
+      <div class="pagination" id="txPagination"></div>
+    </div>
+  </div>
+
+  <!-- DEPOSITS -->
+  <div id="section-deposits" class="page-section hidden">
+    <div class="section">
+      <h2>Deposits</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>User</th>
+            <th>Asset</th>
+            <th>Amount</th>
+            <th>TX Hash</th>
+            <th>Status</th>
+            <th>Date</th>
+          </tr>
+        </thead>
+        <tbody id="depositsTableBody"></tbody>
+      </table>
+      <div class="pagination" id="depositsPagination"></div>
+    </div>
+  </div>
+
+  <!-- WITHDRAWALS -->
+  <div id="section-withdrawals" class="page-section hidden">
+    <div class="section">
+      <h2>Withdrawals</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>User</th>
+            <th>Asset</th>
+            <th>Amount</th>
+            <th>To Address</th>
+            <th>Status</th>
+            <th>Date</th>
+          </tr>
+        </thead>
+        <tbody id="withdrawalsTableBody"></tbody>
+      </table>
+      <div class="pagination" id="withdrawalsPagination"></div>
+    </div>
+  </div>
+
+  <!-- SWAPS -->
+  <div id="section-swaps" class="page-section hidden">
+    <div class="section">
+      <h2>Swaps</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>User</th>
+            <th>Direction</th>
+            <th>Input</th>
+            <th>Fee</th>
+            <th>Output</th>
+            <th>Status</th>
+            <th>Date</th>
+          </tr>
+        </thead>
+        <tbody id="swapsTableBody"></tbody>
+      </table>
+      <div class="pagination" id="swapsPagination"></div>
+    </div>
+  </div>
+
+  <!-- ADMIN MANAGEMENT -->
+  <div id="section-admins" class="page-section hidden">
+    <div class="section">
+      <h2>Admin Management</h2>
+      <div style="display:flex;gap:12px;margin-bottom:20px;">
+        <input type="number" id="newAdminId" placeholder="Telegram ID" style="width:200px;padding:8px 12px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#f8fafc;">
+        <button class="btn btn-success" onclick="giveAdmin()">➕ Give Admin</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Telegram ID</th>
+            <th>Name</th>
+            <th>Username</th>
+            <th>Role</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="adminsTableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- AUDIT LOGS -->
+  <div id="section-audit" class="page-section hidden">
+    <div class="section">
+      <h2>Audit Logs</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Timestamp</th>
+            <th>Admin ID</th>
+            <th>Action</th>
+            <th>Target</th>
+            <th>Result</th>
+          </tr>
+        </thead>
+        <tbody id="auditTableBody"></tbody>
+      </table>
+      <div class="pagination" id="auditPagination"></div>
+    </div>
+  </div>
+
+  <!-- SYSTEM SETTINGS -->
+  <div id="section-settings" class="page-section hidden">
+    <div class="section">
+      <h2>System Settings</h2>
+      <div id="settingsContent" style="font-size:14px;color:#94a3b8;line-height:2;">
+        Loading...
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Confirm Modal -->
+<div id="confirmModal" class="modal-overlay">
+  <div class="modal">
+    <h3 id="modalTitle">Confirm Action</h3>
+    <p id="modalBody" style="color:#94a3b8;font-size:14px;">Are you sure?</p>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-danger" id="modalConfirmBtn" onclick="">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  const API_BASE = '/admin/api';
+  let authToken = localStorage.getItem('aftswap_admin_token') || '';
+  let currentAdmin = null;
+  let currentSection = 'dashboard';
+  let txFilter = 'all';
+
+  // ─── AUTH ──────────────────────────────────────────────────────────────────
+
+  async function doLogin() {
+    const telegramId = document.getElementById('loginTelegramId').value;
+    const token = document.getElementById('loginToken').value;
+    if (!telegramId || !token) {
+      showToast('Please enter both Telegram ID and token', 'error');
+      return;
+    }
+    authToken = token;
+    localStorage.setItem('aftswap_admin_token', token);
+    localStorage.setItem('aftswap_admin_id', telegramId);
+    await initDashboard();
+  }
+
+  async function initDashboard() {
+    try {
+      const res = await fetch(`${API_BASE}/dashboard`, {
+        headers: { 'Authorization': `Bearer ${authToken}` }
+      });
+      if (!res.ok) throw new Error('Auth failed');
+      const data = await res.json();
+      document.getElementById('loginOverlay').style.display = 'none';
+      document.getElementById('adminIdDisplay').textContent = localStorage.getItem('aftswap_admin_id') || '—';
+      renderDashboard(data);
+      loadSection(currentSection);
+    } catch (err) {
+      showToast('Authentication failed. Check your token.', 'error');
+      localStorage.removeItem('aftswap_admin_token');
+    }
+  }
+
+  // ─── NAVIGATION ────────────────────────────────────────────────────────────
+
+  function showSection(name) {
+    currentSection = name;
+    document.querySelectorAll('.page-section').forEach(el => el.classList.add('hidden'));
+    document.getElementById(`section-${name}`).classList.remove('hidden');
+    document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+    event.target.classList.add('active');
+    document.getElementById('pageTitle').textContent = name.charAt(0).toUpperCase() + name.slice(1);
+    loadSection(name);
+  }
+
+  async function loadSection(name) {
+    try {
+      if (name === 'dashboard') await loadDashboard();
+      if (name === 'users') await loadUsers(1);
+      if (name === 'transactions') await loadTransactions(1);
+      if (name === 'deposits') await loadDeposits(1);
+      if (name === 'withdrawals') await loadWithdrawals(1);
+      if (name === 'swaps') await loadSwaps(1);
+      if (name === 'admins') await loadAdmins();
+      if (name === 'audit') await loadAudit(1);
+      if (name === 'settings') await loadSettings();
+    } catch (err) {
+      showToast('Failed to load section', 'error');
+    }
+  }
+
+  // ─── API HELPERS ─────────────────────────────────────────────────────────────
+
+  async function apiGet(path) {
+    const res = await fetch(`${API_BASE}${path}`, {
+      headers: { 'Authorization': `Bearer ${authToken}` }
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  async function apiPost(path, body) {
+    const res = await fetch(`${API_BASE}${path}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${authToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `HTTP ${res.status}`);
+    }
+    return res.json();
+  }
+
+  async function apiDelete(path) {
+    const res = await fetch(`${API_BASE}${path}`, {
+      method: 'DELETE',
+      headers: { 'Authorization': `Bearer ${authToken}` }
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  // ─── DASHBOARD ───────────────────────────────────────────────────────────────
+
+  function renderDashboard(data) {
+    document.getElementById('statTotalUsers').textContent = data.totalUsers.toLocaleString();
+    document.getElementById('statTotalSwaps').textContent = data.totalSwaps.toLocaleString();
+    document.getElementById('statPendingTxs').textContent = data.pendingTransactions.toLocaleString();
+    document.getElementById('statTotalTon').textContent = parseFloat(data.totalTonCustodial).toFixed(4);
+    document.getElementById('statTotalAft').textContent = parseFloat(data.totalAftCustodial).toFixed(4);
+    document.getElementById('statFeePercent').textContent = data.platformFeePercent + '%';
+    document.getElementById('dashFeeWallet').textContent = data.adminFeeWallet;
+    document.getElementById('dashFeePercent').textContent = data.platformFeePercent + '%';
+    document.getElementById('dashMinSwap').textContent = data.minSwapTon || '0.1';
+  }
+
+  async function loadDashboard() {
+    const data = await apiGet('/dashboard');
+    renderDashboard(data);
+  }
+
+  // ─── USERS ─────────────────────────────────────────────────────────────────
+
+  let allUsers = [];
+
+  async function loadUsers(page) {
+    const data = await apiGet(`/users?page=${page}`);
+    allUsers = data.users;
+    renderUsers(data.users, page, data.pages);
+  }
+
+  function renderUsers(users, page, totalPages) {
+    const tbody = document.getElementById('usersTableBody');
+    tbody.innerHTML = users.map(u => `
+      <tr>
+        <td><code>${u.telegramId}</code></td>
+        <td>${u.firstName || '—'} ${u.lastName || ''}</td>
+        <td>${u.username ? '@' + u.username : '—'}</td>
+        <td>${parseFloat(u.tonBalance / 1e9).toFixed(4)}</td>
+        <td>${parseFloat(u.aftBalance / 1e9).toFixed(4)}</td>
+        <td>${u.isFrozen ? '<span class="badge badge-red">Frozen</span>' : '<span class="badge badge-green">Active</span>'}</td>
+        <td>
+          <button class="btn ${u.isFrozen ? 'btn-success' : 'btn-danger'}" style="font-size:12px;padding:4px 10px;" onclick="toggleFreezeUser(${u.telegramId}, ${u.isFrozen})">
+            ${u.isFrozen ? 'Unfreeze' : 'Freeze'}
+          </button>
+        </td>
+      </tr>
+    `).join('');
+
+    document.getElementById('usersPagination').innerHTML = `
+      <button ${page <= 1 ? 'disabled' : ''} onclick="loadUsers(${page - 1})">Prev</button>
+      <span style="padding:6px 12px;">${page} / ${totalPages}</span>
+      <button ${page >= totalPages ? 'disabled' : ''} onclick="loadUsers(${page + 1})">Next</button>
+    `;
+  }
+
+  function filterUsers() {
+    const term = document.getElementById('userSearch').value.toLowerCase();
+    const filtered = allUsers.filter(u =>
+      u.telegramId.toString().includes(term) ||
+      (u.firstName || '').toLowerCase().includes(term) ||
+      (u.username || '').toLowerCase().includes(term)
+    );
+    renderUsers(filtered, 1, 1);
+  }
+
+  async function toggleFreezeUser(telegramId, isFrozen) {
+    try {
+      await apiPost(`/users/${telegramId}/freeze`, {});
+      showToast(`User ${isFrozen ? 'unfrozen' : 'frozen'} successfully`, 'success');
+      loadUsers(1);
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  }
+
+  // ─── TRANSACTIONS ────────────────────────────────────────────────────────────
+
+  async function loadTransactions(page) {
+    const typeParam = txFilter !== 'all' ? `&type=${txFilter}` : '';
+    const data = await apiGet(`/transactions?page=${page}${typeParam}`);
+    const tbody = document.getElementById('txTableBody');
+    tbody.innerHTML = data.transactions.map(t => `
+      <tr>
+        <td><code>${t._id.slice(-8)}</code></td>
+        <td><span class="badge ${t.type === 'deposit' ? 'badge-green' : t.type === 'withdrawal' ? 'badge-red' : t.type === 'swap' ? 'badge-blue' : 'badge-yellow'}">${t.type}</span></td>
+        <td>${t.userId?.telegramId || '—'}</td>
+        <td>${t.asset}</td>
+        <td>${(parseFloat(t.amount) / 1e9).toFixed(4)}</td>
+        <td><span class="badge ${t.status === 'completed' ? 'badge-green' : t.status === 'failed' ? 'badge-red' : 'badge-yellow'}">${t.status}</span></td>
+        <td>${new Date(t.createdAt).toLocaleString()}</td>
+      </tr>
+    `).join('');
+
+    document.getElementById('txPagination').innerHTML = `
+      <button ${page <= 1 ? 'disabled' : ''} onclick="loadTransactions(${page - 1})">Prev</button>
+      <span style="padding:6px 12px;">${page} / ${data.pages}</span>
+      <button ${page >= data.pages ? 'disabled' : ''} onclick="loadTransactions(${page + 1})">Next</button>
+    `;
+  }
+
+  function setTxFilter(type) {
+    txFilter = type;
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    event.target.classList.add('active');
+    loadTransactions(1);
+  }
+
+  async function loadDeposits(page) {
+    const data = await apiGet(`/transactions?page=${page}&type=deposit`);
+    document.getElementById('depositsTableBody').innerHTML = data.transactions.map(t => `
+      <tr>
+        <td>${t.userId?.telegramId || '—'}</td>
+        <td>${t.asset}</td>
+        <td>${(parseFloat(t.amount) / 1e9).toFixed(4)}</td>
+        <td><code class="address-mask">${t.txHash ? t.txHash.slice(0, 6) + '...' + t.txHash.slice(-4) : '—'}</code></td>
+        <td><span class="badge ${t.status === 'completed' ? 'badge-green' : 'badge-yellow'}">${t.status}</span></td>
+        <td>${new Date(t.createdAt).toLocaleString()}</td>
+      </tr>
+    `).join('');
+
+    document.getElementById('depositsPagination').innerHTML = `
+      <button ${page <= 1 ? 'disabled' : ''} onclick="loadDeposits(${page - 1})">Prev</button>
+      <span style="padding:6px 12px;">${page} / ${data.pages}</span>
+      <button ${page >= data.pages ? 'disabled' : ''} onclick="loadDeposits(${page + 1})">Next</button>
+    `;
+  }
+
+  async function loadWithdrawals(page) {
+    const data = await apiGet(`/transactions?page=${page}&type=withdrawal`);
+    document.getElementById('withdrawalsTableBody').innerHTML = data.transactions.map(t => `
+      <tr>
+        <td>${t.userId?.telegramId || '—'}</td>
+        <td>${t.asset}</td>
+        <td>${(parseFloat(t.amount) / 1e9).toFixed(4)}</td>
+        <td><code class="address-mask">${t.toAddress ? t.toAddress.slice(0, 6) + '...' + t.toAddress.slice(-4) : '—'}</code></td>
+        <td><span class="badge ${t.status === 'completed' ? 'badge-green' : t.status === 'failed' ? 'badge-red' : 'badge-yellow'}">${t.status}</span></td>
+        <td>${new Date(t.createdAt).toLocaleString()}</td>
+      </tr>
+    `).join('');
+
+    document.getElementById('withdrawalsPagination').innerHTML = `
+      <button ${page <= 1 ? 'disabled' : ''} onclick="loadWithdrawals(${page - 1})">Prev</button>
+      <span style="padding:6px 12px;">${page} / ${data.pages}</span>
+      <button ${page >= data.pages ? 'disabled' : ''} onclick="loadWithdrawals(${page + 1})">Next</button>
+    `;
+  }
+
+  async function loadSwaps(page) {
+    const data = await apiGet(`/transactions?page=${page}&type=swap`);
+    document.getElementById('swapsTableBody').innerHTML = data.transactions.map(t => `
+      <tr>
+        <td>${t.userId?.telegramId || '—'}</td>
+        <td>${t.metadata?.swapDirection || '—'}</td>
+        <td>${(parseFloat(t.amount) / 1e9).toFixed(4)} ${t.asset}</td>
+        <td>${t.fee ? (parseFloat(t.fee) / 1e9).toFixed(4) + ' ' + t.feeAsset : '—'}</td>
+        <td>${t.metadata?.expectedOutput ? (parseFloat(t.metadata.expectedOutput) / 1e9).toFixed(4) : '—'}</td>
+        <td><span class="badge ${t.status === 'completed' ? 'badge-green' : t.status === 'failed' ? 'badge-red' : 'badge-yellow'}">${t.status}</span></td>
+        <td>${new Date(t.createdAt).toLocaleString()}</td>
+      </tr>
+    `).join('');
+
+    document.getElementById('swapsPagination').innerHTML = `
+      <button ${page <= 1 ? 'disabled' : ''} onclick="loadSwaps(${page - 1})">Prev</button>
+      <span style="padding:6px 12px;">${page} / ${data.pages}</span>
+      <button ${page >= data.pages ? 'disabled' : ''} onclick="loadSwaps(${page + 1})">Next</button>
+    `;
+  }
+
+  // ─── ADMIN MANAGEMENT ────────────────────────────────────────────────────────
+
+  async function loadAdmins() {
+    const data = await apiGet('/admins');
+    document.getElementById('adminsTableBody').innerHTML = data.admins.map(a => `
+      <tr>
+        <td><code>${a.telegramId}</code></td>
+        <td>${a.firstName || '—'}</td>
+        <td>${a.username ? '@' + a.username : '—'}</td>
+        <td>${a.isSuperAdmin ? '<span class="badge badge-blue">Super Admin</span>' : '<span class="badge badge-green">Admin</span>'}</td>
+        <td>
+          ${a.isSuperAdmin ? '—' : `<button class="btn btn-danger" style="font-size:12px;padding:4px 10px;" onclick="removeAdmin(${a.telegramId})">Remove</button>`}
+        </td>
+      </tr>
+    `).join('');
+  }
+
+  async function giveAdmin() {
+    const id = document.getElementById('newAdminId').value;
+    if (!id) return;
+    try {
+      await apiPost('/admins', { telegramId: parseInt(id, 10) });
+      showToast('Admin granted successfully', 'success');
+      document.getElementById('newAdminId').value = '';
+      loadAdmins();
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  }
+
+  async function removeAdmin(telegramId) {
+    openModal('Remove Admin', `Remove admin privileges from ${telegramId}?`, async () => {
+      try {
+        await apiDelete(`/admins/${telegramId}`);
+        showToast('Admin removed successfully', 'success');
+        closeModal();
+        loadAdmins();
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    });
+  }
+
+  // ─── AUDIT LOGS ─────────────────────────────────────────────────────────────
+
+  async function loadAudit(page) {
+    const data = await apiGet(`/audit-logs?page=${page}`);
+    document.getElementById('auditTableBody').innerHTML = data.logs.map(l => `
+      <tr>
+        <td>${new Date(l.createdAt).toLocaleString()}</td>
+        <td><code>${l.adminId}</code></td>
+        <td><span class="badge badge-yellow">${l.action}</span></td>
+        <td>${l.target || '—'}</td>
+        <td><span class="badge ${l.result === 'success' ? 'badge-green' : 'badge-red'}">${l.result}</span></td>
+      </tr>
+    `).join('');
+
+    document.getElementById('auditPagination').innerHTML = `
+      <button ${page <= 1 ? 'disabled' : ''} onclick="loadAudit(${page - 1})">Prev</button>
+      <span style="padding:6px 12px;">${page} / ${data.pages}</span>
+      <button ${page >= data.pages ? 'disabled' : ''} onclick="loadAudit(${page + 1})">Next</button>
+    `;
+  }
+
+  // ─── SETTINGS ───────────────────────────────────────────────────────────────
+
+  async function loadSettings() {
+    const data = await apiGet('/settings');
+    document.getElementById('settingsContent').innerHTML = `
+      <p><b>Network:</b> ${data.tonNetwork}</p>
+      <p><b>AFT Jetton:</b> <code class="address-mask">${data.aftJettonAddress}</code></p>
+      <p><b>Fee Wallet:</b> <code class="address-mask">${data.adminFeeWallet}</code></p>
+      <p><b>Platform Fee:</b> ${data.platformFeePercent}%</p>
+      <p><b>Min Swap:</b> ${data.minSwapTon} TON</p>
+      <p><b>Max Slippage:</b> ${data.maxSlippagePercent}%</p>
+      <p style="margin-top:12px;color:#64748b;">Settings are rea
