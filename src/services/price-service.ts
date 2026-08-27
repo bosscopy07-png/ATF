@@ -69,18 +69,18 @@ export class PriceService {
     }
   }
 
-  async getAftPriceUsd(): Promise<PriceData | null> {
-    return this.getCachedOrFetch('aft_usd', async () => {
-      if (config.aftPriceApiUrl) {
-        const data = await this.fetchWithFallback([config.aftPriceApiUrl]);
+  async getAtfPriceUsd(): Promise<PriceData | null> {
+    return this.getCachedOrFetch('atf_usd', async () => {
+      if (config.atfPriceApiUrl) {
+        const data = await this.fetchWithFallback([config.atfPriceApiUrl]);
         return {
           price: parseFloat(data.price || data.usd || data.aft?.usd),
           currency: 'USD',
-          source: config.aftPriceApiUrl,
+          source: config.atfPriceApiUrl,
           timestamp: new Date(),
         };
       }
-      throw new Error('No AFT price provider configured');
+      throw new Error('No ATF price provider configured');
     });
   }
 
@@ -132,9 +132,9 @@ export class PriceService {
     });
   }
 
-  async getAftPriceNgn(): Promise<number | null> {
+  async getAtfPriceNgn(): Promise<number | null> {
     const [aftUsd, usdNgn] = await Promise.all([
-      this.getAftPriceUsd(),
+      this.getAtfPriceUsd(),
       this.getUsdNgnRate(),
     ]);
     if (!aftUsd || !usdNgn) return null;
