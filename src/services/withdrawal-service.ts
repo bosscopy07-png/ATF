@@ -79,7 +79,7 @@ export class WithdrawalService {
     const decimals = request.asset === 'TON' ? TON_DECIMALS : ATF_DECIMALS;
     const amountBase = Precision.toBaseUnits(request.amount, decimals);
 
-    const balanceKey = request.asset === 'TON' ? 'tonBalance' : 'aftBalance';
+    const balanceKey = request.asset === 'TON' ? 'tonBalance' : 'atfBalance';
     const currentBalance = BigInt(user[balanceKey]);
 
     if (Precision.isLessThan(currentBalance, amountBase)) {
@@ -111,7 +111,7 @@ export class WithdrawalService {
         txHash = await this.walletService.sendJetton(
           request.userId,
           request.toAddress,
-          config.aftJettonAddress,
+          config.atfJettonAddress,
           amountBase
         );
       }
@@ -132,4 +132,5 @@ export class WithdrawalService {
       throw error;
     }
   }
-}
+      }
+      
