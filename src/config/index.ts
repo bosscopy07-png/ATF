@@ -39,7 +39,7 @@ export const config = {
   stonfiApiUrl: requireEnv('STONFI_API_URL'),
   stonfiApiKey: process.env.STONFI_API_KEY,
   
-  aftJettonAddress: requireEnv('AFT_JETTON_ADDRESS'),
+  atfJettonAddress: requireEnv('ATF_JETTON_ADDRESS'),
   
   adminFeeWalletAddress: requireEnv('ADMIN_FEE_WALLET_ADDRESS'),
   adminWalletMnemonic: process.env.ADMIN_WALLET_MNEMONIC || '',
@@ -50,7 +50,7 @@ export const config = {
   
   botBrandingImageUrl: requireEnv('BOT_BRANDING_IMAGE_URL'),
   
-  aftPriceApiUrl: process.env.AFT_PRICE_API_URL || '',
+  atfPriceApiUrl: process.env.ATF_PRICE_API_URL || '',
   tonPriceApiUrl: process.env.TON_PRICE_API_URL || 'https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd',
   usdNgnRateApiUrl: process.env.USD_NGN_RATE_API_URL || 'https://api.frankfurter.dev/v2/rate/USD/NGN?providers=CBN',
   
@@ -58,4 +58,4 @@ export const config = {
 };
 
 export const TON_DECIMALS = 9;
-export const AFT_DECIMALS = 9;
+export const ATF_DECIMALS = 9;
