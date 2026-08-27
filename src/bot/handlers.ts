@@ -352,7 +352,7 @@ async function startSwapInput(userId: number, chatId: number, direction: 'ton_to
   await messageManager.showScreen(userId, chatId, caption, keyboards.backKeyboard('swap'));
 }
 
-async function handleSwapInput(userId: number, chatId: number, text: string): Promise<void> {
+    async function handleSwapInput(userId: number, chatId: number, text: string): Promise<void> {
   const user = await User.findOne({ telegramId: userId });
   if (!user) return;
 
@@ -380,54 +380,103 @@ async function handleSwapInput(userId: number, chatId: number, text: string): Pr
     user.stateData = { confirmation, inputAmount: text };
     await user.save();
 
-    const [aftPrice] = await Promise.all([
+    const [aftPrice, tonPrice] = await Promise.all([
       priceService.getAftPriceUsd(),
+      priceService.getTonPriceUsd(),
     ]);
 
-    const receiveUsd = aftPrice && direction === 'ton_to_aft'
-      ? priceService.convertCryptoToUsd(confirmation.expectedOutput, aftPrice.price, AFT_DECIMALS)
-      : null;
+    // Calculate USD value of expected output
+    let receiveUsd: string | null = null;
+    if (direction === 'ton_to_aft' && aftPrice) {
+      receiveUsd = priceService.convertCryptoToUsd(
+        confirmation.expectedOutput,
+        aftPrice.price,
+        AFT_DECIMALS
+      );
+    } else if (direction === 'aft_to_ton' && tonPrice) {
+      receiveUsd = priceService.convertCryptoToUsd(
+        confirmation.expectedOutput,
+        tonPrice.price,
+        TON_DECIMALS
+      );
+    }
 
-    const caption = [
-      '🔄 <b>SWAP QUOTE</b>',
-      '',
-      '<b>You Pay:</b>',
-      `${Precision.formatDisplay(confirmation.inputAmount)} ${direction === 'ton_to_aft' ? 'TON' : 'AFT'}`,
-      '',
-      '<b>Platform Fee:</b>',
-      `${Precision.formatDisplay(confirmation.platformFee)} ${direction === 'ton_to_aft' ? 'TON' : 'AFT'} (${config.platformSwapFeePercent}%)`,
-      '',
-      '<b>Swap Amount:</b>',
-      `${Precision.formatDisplay(confirmation.netSwapAmount)} ${direction === 'ton_to_aft' ? 'TON' : 'AFT'}`,
-      '',
-      '<b>Estimated Receive:</b>',
-      `${Precision.formatDisplay(confirmation.expectedOutput)} ${direction === 'ton_to_aft' ? 'AFT' : 'TON'}`,
-      receiveUsd ? `≈ $${receiveUsd}` : '',
-      '',
-      '<b>Minimum Received:</b>',
-      `${Precision.formatDisplay(confirmation.minOutput)} ${direction === 'ton_to_aft' ? 'AFT' : 'TON'}`,
-      '',
-      '<b>Network/DEX Cost:</b>',
-      `≈ ${Precision.formatDisplay(confirmation.dexCosts)} TON`,
-      '',
-      `<b>Rate:</b> ${confirmation.rate}`,
-      '',
-      `Quote expires in <b>${Math.max(0, Math.floor((confirmation.expiresAt.getTime() - Date.now()) / 1000))}s</b>`,
-    ].filter(Boolean).join('\n');
+    let caption: string;
+
+    if (direction === 'ton_to_aft') {
+      // ─── TON → AFT: Full transparent breakdown ───────────────────────────
+      caption = [
+        '🔄 <b>SWAP QUOTE</b>',
+        '',
+        '<b>You Pay:</b>',
+        `${Precision.formatDisplay(confirmation.inputAmount)} TON`,
+        '',
+        '<b>Platform Fee:</b>',
+        `${Precision.formatDisplay(confirmation.platformFee)} TON (${config.platformSwapFeePercent}%)`,
+        '',
+        '<b>Swap Amount:</b>',
+        `${Precision.formatDisplay(confirmation.netSwapAmount)} TON`,
+        '',
+        '<b>Estimated Receive:</b>',
+        `${Precision.formatDisplay(confirmation.expectedOutput)} AFT`,
+        receiveUsd ? `≈ $${receiveUsd}` : '',
+        '',
+        '<b>Minimum Received:</b>',
+        `${Precision.formatDisplay(confirmation.minOutput)} AFT`,
+        '',
+        '<b>Network/DEX Cost:</b>',
+        `≈ ${Precision.formatDisplay(confirmation.dexCosts)} TON`,
+        '',
+        `<b>Rate:</b> ${confirmation.rate}`,
+        '',
+        `Quote expires in <b>${Math.max(0, Math.floor((confirmation.expiresAt.getTime() - Date.now()) / 1000))}s</b>`,
+      ].filter(Boolean).join('\n');
+    } else {
+      // ─── AFT → TON: SEAMLESS — no gas/network costs shown to user ───────
+      // User only sees: input AFT → fee (1%) → net swap → receive TON
+      // The gas TON cost is silently handled by the platform admin wallet
+      caption = [
+        '🔄 <b>SWAP QUOTE</b>',
+        '',
+        '<b>You Pay:</b>',
+        `${Precision.formatDisplay(confirmation.inputAmount)} AFT`,
+        '',
+        '<b>Platform Fee:</b>',
+        `${Precision.formatDisplay(confirmation.platformFee)} AFT (${config.platformSwapFeePercent}%)`,
+        '',
+        '<b>Swap Amount:</b>',
+        `${Precision.formatDisplay(confirmation.netSwapAmount)} AFT`,
+        '',
+        '<b>Estimated Receive:</b>',
+        `${Precision.formatDisplay(confirmation.expectedOutput)} TON`,
+        receiveUsd ? `≈ $${receiveUsd}` : '',
+        '',
+        '<b>Minimum Received:</b>',
+        `${Precision.formatDisplay(confirmation.minOutput)} TON`,
+        '',
+        `<b>Rate:</b> ${confirmation.rate}`,
+        '',
+        `Quote expires in <b>${Math.max(0, Math.floor((confirmation.expiresAt.getTime() - Date.now()) / 1000))}s</b>`,
+      ].filter(Boolean).join('\n');
+    }
 
     await messageManager.showScreen(userId, chatId, caption, keyboards.confirmSwapKeyboard());
   } catch (error: any) {
     const isMinError = error.message?.includes('Minimum swap amount');
+    const isGasError = error.message?.includes('gas treasury temporarily low');
     await messageManager.showText(
       userId,
       chatId,
       isMinError
         ? `❌ <b>INVALID AMOUNT</b>\n\nMinimum swap amount is:\n<b>${config.minSwapTon} TON</b>\n\nPlease enter a larger amount.`
+        : isGasError
+        ? `⏳ <b>Platform Gas Treasury Low</b>\n\n${error.message}\n\nPlease try again shortly.`
         : `❌ <b>Error</b>\n\n${error.message}`,
       keyboards.backKeyboard('swap')
     );
   }
-}
+    }
+    
 
 async function executeSwap(userId: number, chatId: number): Promise<void> {
   const user = await User.findOne({ telegramId: userId });
