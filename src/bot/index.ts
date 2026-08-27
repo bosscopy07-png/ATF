@@ -1,4 +1,14 @@
 import TelegramBot from 'node-telegram-bot-api';
-import { setBot } from './handlers';
+import { setBot, handleStart, handleCallback, handleText } from './handlers';
 
-export { setBot };
+let botInstance: TelegramBot;
+
+export function getBotInstance(): TelegramBot {
+  return botInstance;
+}
+
+export function setBotInstance(bot: TelegramBot): void {
+  botInstance = bot;
+}
+
+export { setBot, handleStart, handleCallback, handleText };
