@@ -20,7 +20,9 @@ function requireEnvNumber(key: string, defaultValue?: number): number {
 
 export const config = {
   nodeEnv: process.env.NODE_ENV || 'development',
-  port: requireEnvNumber('PORT', 3000),
+  port: requireEnvNumber('PORT', 10000),
+  
+  appMode: (process.env.APP_MODE || 'server') as 'server' | 'worker',
   
   mongodbUri: requireEnv('MONGODB_URI'),
   
@@ -51,6 +53,8 @@ export const config = {
   aftPriceApiUrl: process.env.AFT_PRICE_API_URL || '',
   tonPriceApiUrl: process.env.TON_PRICE_API_URL || '',
   usdNgnRateApiUrl: process.env.USD_NGN_RATE_API_URL || '',
+  
+  renderExternalUrl: process.env.RENDER_EXTERNAL_URL || '',
 };
 
 export const TON_DECIMALS = 9;
