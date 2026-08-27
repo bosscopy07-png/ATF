@@ -74,7 +74,7 @@ export class PriceService {
       if (config.atfPriceApiUrl) {
         const data = await this.fetchWithFallback([config.atfPriceApiUrl]);
         return {
-          price: parseFloat(data.price || data.usd || data.aft?.usd),
+          price: parseFloat(data.price || data.usd || data.atf?.usd),
           currency: 'USD',
           source: config.atfPriceApiUrl,
           timestamp: new Date(),
@@ -133,12 +133,12 @@ export class PriceService {
   }
 
   async getAtfPriceNgn(): Promise<number | null> {
-    const [aftUsd, usdNgn] = await Promise.all([
+    const [atfUsd, usdNgn] = await Promise.all([
       this.getAtfPriceUsd(),
       this.getUsdNgnRate(),
     ]);
-    if (!aftUsd || !usdNgn) return null;
-    return aftUsd.price * usdNgn.price;
+    if (!atfUsd || !usdNgn) return null;
+    return atfUsd.price * usdNgn.price;
   }
 
   async getTonPriceNgn(): Promise<number | null> {
@@ -159,5 +159,5 @@ export class PriceService {
     const amt = parseFloat(usdAmount);
     return Math.round(amt * ngnRate).toLocaleString('en-NG');
   }
-          }
-  
+  }
+          
