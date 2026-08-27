@@ -6,7 +6,7 @@ import { User } from '../models/User';
 import { Wallet } from '../models/Wallet';
 import { Transaction } from '../models/Transaction';
 import { Precision } from '../utils/precision';
-import { TON_DECIMALS, AFT_DECIMALS } from '../config';
+import { TON_DECIMALS, ATF_DECIMALS } from '../config';
 
 const PROCESSED_TXS = new Set<string>();
 
@@ -88,7 +88,7 @@ export class BlockchainMonitor {
     for (const walletDoc of wallets as any[]) {
       try {
         await this.checkTonDeposits(walletDoc);
-        await this.checkAftDeposits(walletDoc);
+        await this.checkAtfDeposits(walletDoc);
       } catch (error) {
         console.error(`Deposit check failed for ${walletDoc.address}:`, error);
       }
@@ -145,12 +145,12 @@ export class BlockchainMonitor {
     }
   }
 
-  private async checkAftDeposits(walletDoc: any): Promise<void> {
+  private async checkAtfDeposits(walletDoc: any): Promise<void> {
     const ownerAddress = Address.parse(walletDoc.address);
 
     try {
       // Derive expected jetton wallet for this user
-      const jettonMaster = this.client.open(JettonMaster.create(Address.parse(config.aftJettonAddress)));
+      const jettonMaster = this.client.open(JettonMaster.create(Address.parse(config.atfJettonAddress)));
       const expectedJettonWallet = await jettonMaster.getWalletAddress(ownerAddress);
 
       const transactions = await this.client.getTransactions(ownerAddress, { limit: 50 });
@@ -159,7 +159,7 @@ export class BlockchainMonitor {
         if (!tx.inMessage?.body) continue;
 
         const txHash = tx.hash().toString('hex');
-        const uniqueId = `aft_deposit_${walletDoc.address}_${txHash}`;
+        const uniqueId = `atf_deposit_${walletDoc.address}_${txHash}`;
 
         if (PROCESSED_TXS.has(uniqueId)) continue;
 
@@ -185,7 +185,7 @@ export class BlockchainMonitor {
         const existing = await Transaction.findOne({ 
           txHash, 
           type: 'deposit', 
-          asset: 'AFT',
+          asset: 'ATF',
           'metadata.queryId': notification.queryId.toString(),
         });
         
@@ -197,14 +197,14 @@ export class BlockchainMonitor {
         const user = await User.findById(walletDoc.userId);
         if (!user) continue;
 
-        // Credit AFT balance
-        user.aftBalance = Precision.add(BigInt(user.aftBalance), notification.amount).toString();
+        // Credit ATF balance
+        user.atfBalance = Precision.add(BigInt(user.atfBalance), notification.amount).toString();
         await user.save();
 
         await Transaction.create({
           userId: user._id,
           type: 'deposit',
-          asset: 'AFT',
+          asset: 'ATF',
           amount: notification.amount.toString(),
           status: 'completed',
           txHash,
@@ -219,10 +219,10 @@ export class BlockchainMonitor {
         });
 
         PROCESSED_TXS.add(uniqueId);
-        console.log(`AFT deposit credited: ${notification.amount.toString()} nanoAFT to user ${user.telegramId}`);
+        console.log(`ATF deposit credited: ${notification.amount.toString()} nanoATF to user ${user.telegramId}`);
       }
     } catch (error) {
-      console.error(`AFT deposit check error for ${walletDoc.address}:`, error);
+      console.error(`ATF deposit check error for ${walletDoc.address}:`, error);
     }
   }
 
@@ -288,4 +288,5 @@ export class BlockchainMonitor {
       return null;
     }
   }
-}
+      }
+      
