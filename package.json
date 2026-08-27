@@ -1,7 +1,7 @@
 {
   "name": "aftswap",
   "version": "1.0.0",
-  "description": "TON ↔ AFT Custodial Exchange Telegram Bot",
+  "description": "TON ↔ ATF Custodial Exchange Telegram Bot",
   "main": "dist/app.js",
   "scripts": {
     "build": "tsc",
@@ -12,9 +12,9 @@
   "dependencies": {
     "@ston-fi/api": "^0.14.0",
     "@ston-fi/sdk": "^2.0.0",
-    "@ton/core": "^0.59.0",
+    "@ton/core": "^0.62.0",
     "@ton/crypto": "^3.3.0",
-    "@ton/ton": "^15.1.0",
+    "@ton/ton": "^15.4.0",
     "axios": "^1.7.7",
     "bcryptjs": "^2.4.3",
     "decimal.js": "^10.4.3",
