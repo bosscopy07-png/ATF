@@ -1,5 +1,5 @@
 import { mnemonicNew, mnemonicToWalletKey, KeyPair } from '@ton/crypto';
-import { WalletContractV4, TonClient, internal, Address, Cell, beginCell, toNano, storeMessageRelaxed } from '@ton/ton';
+import { WalletContractV4, TonClient, internal, Address, Cell, beginCell, toNano, OpenedContract } from '@ton/ton';
 import { JettonMaster, JettonWallet } from '@ton/ton';
 import { encrypt, decrypt } from '../utils/encryption';
 import { Wallet, IWallet } from '../models/Wallet';
@@ -7,15 +7,9 @@ import { User } from '../models/User';
 import { config } from '../config';
 import { Precision } from '../utils/precision';
 
-/**
- * Signer Interface — Production Architecture
- * 
- * LocalSigner: Decrypts mnemonic and signs locally (current)
- * HSMSigner: Calls external HSM/KMS for signing (production target)
- */
 export interface ISigner {
   getAddress(publicKey: Buffer): string;
-  signTransfer(wallet: WalletContractV4, seqno: number, secretKey: Buffer, messages: any[]): Promise<Cell>;
+  signTransfer(wallet: WalletContractV4, seqno: number, secretKey: Buffer, messages: any[]): Cell;
 }
 
 class LocalSigner implements ISigner {
@@ -120,17 +114,15 @@ export class WalletService {
     try {
       const tonBalance = await this.client.getBalance(Address.parse(address));
       
-      // Query ATF jetton balance
       const jettonMaster = this.client.open(JettonMaster.create(Address.parse(config.atfJettonAddress)));
       const jettonWalletAddress = await jettonMaster.getWalletAddress(Address.parse(address));
       const jettonWallet = this.client.open(JettonWallet.create(jettonWalletAddress));
       
       let atfBalance = BigInt(0);
       try {
-        const balance = await jettonWallet.getBalance();
-        atfBalance = balance;
+        atfBalance = await jettonWallet.getBalance();
       } catch {
-        // Jetton wallet doesn't exist yet (no ATF received)
+        // Wallet not deployed yet
       }
 
       return { ton: tonBalance, atf: atfBalance };
@@ -144,36 +136,31 @@ export class WalletService {
     if (!walletDoc) throw new Error('Wallet not found');
 
     const keyPair = await this.getKeyPair(userId);
-    const wallet = this.client.open(
-      WalletContractV4.create({ publicKey: keyPair.publicKey, workchain: 0 })
-    );
-
-    const seqno = await wallet.getSeqno();
+    
+    // Keep original contract for signing
+    const walletContract = WalletContractV4.create({ publicKey: keyPair.publicKey, workchain: 0 });
+    // Opened contract for blockchain interaction
+    const opened = this.client.open(walletContract);
+    
+    const seqno = await opened.getSeqno();
 
     const transfer = this.signer.signTransfer(
-      wallet,
+      walletContract,
       seqno,
       keyPair.secretKey,
       [
         internal({
           to: Address.parse(toAddress),
           value: amount,
-          bounceable: false,
+          bounce: false,
         }),
       ]
     );
 
-    await this.client.sendExternalMessage(wallet, transfer);
+    await this.client.sendExternalMessage(opened, transfer);
     return `${walletDoc.address}_${seqno}`;
   }
 
-  /**
-   * Production Jetton Transfer
-   * 
-   * 1. Derives user's jetton wallet from master + owner
-   * 2. Builds transfer_notification opcode 0xf8a7ea5 payload
-   * 3. Sends via user's TON wallet to their jetton wallet
-   */
   async sendJetton(
     userId: number,
     toAddress: string,
@@ -187,43 +174,37 @@ export class WalletService {
     const ownerAddress = Address.parse(walletDoc.address);
     const destination = Address.parse(toAddress);
 
-    // Derive jetton wallet address from master + owner
-    const jettonMaster = this.client.open(JettonMaster.create(Address.parse(jettonMasterAddress)));
-    const jettonWalletAddress = await jettonMaster.getWalletAddress(ownerAddress);
+    const walletContract = WalletContractV4.create({ publicKey: keyPair.publicKey, workchain: 0 });
+    const opened = this.client.open(walletContract);
+    const seqno = await opened.getSeqno();
 
     // Build jetton transfer body: op::transfer = 0xf8a7ea5
     const transferBody = beginCell()
-      .storeUint(0xf8a7ea5, 32)        // op::transfer
-      .storeUint(0, 64)                 // query_id
-      .storeCoins(amount)               // jetton amount
-      .storeAddress(destination)        // destination
-      .storeAddress(ownerAddress)       // response_destination (for excess)
-      .storeUint(0, 1)                 // custom_payload: None
-      .storeCoins(toNano('0.001'))     // forward_ton_amount
-      .storeUint(0, 1)                 // forward_payload in-cell: None
+      .storeUint(0xf8a7ea5, 32)
+      .storeUint(0, 64)
+      .storeCoins(amount)
+      .storeAddress(destination)
+      .storeAddress(ownerAddress)
+      .storeUint(0, 1)
+      .storeCoins(toNano('0.001'))
+      .storeUint(0, 1)
       .endCell();
 
-    const wallet = this.client.open(
-      WalletContractV4.create({ publicKey: keyPair.publicKey, workchain: 0 })
-    );
-
-    const seqno = await wallet.getSeqno();
-
     const transfer = this.signer.signTransfer(
-      wallet,
+      walletContract,
       seqno,
       keyPair.secretKey,
       [
         internal({
-          to: jettonWalletAddress,
-          value: toNano('0.05'),        // Gas for jetton transfer
-          bounceable: true,
+          to: Address.parse(jettonMasterAddress),
+          value: toNano('0.05'),
+          bounce: true,
           body: transferBody,
         }),
       ]
     );
 
-    await this.client.sendExternalMessage(wallet, transfer);
+    await this.client.sendExternalMessage(opened, transfer);
     return `${walletDoc.address}_jetton_${seqno}`;
   }
 
@@ -232,11 +213,9 @@ export class WalletService {
     return wallet?.address || null;
   }
 
-  /**
-   * Derive jetton wallet address for deposit verification
-   */
   async deriveJettonWallet(ownerAddress: string, jettonMasterAddress: string): Promise<Address> {
     const master = this.client.open(JettonMaster.create(Address.parse(jettonMasterAddress)));
     return master.getWalletAddress(Address.parse(ownerAddress));
   }
-}
+  }
+      
