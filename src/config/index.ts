@@ -50,7 +50,7 @@ export const config = {
   
   botBrandingImageUrl: requireEnv('BOT_BRANDING_IMAGE_URL'),
   
-  atfPriceApiUrl: process.env.ATF_PRICE_API_URL || '',
+  atfPriceApiUrl: process.env.ATF_PRICE_API_URL || 'https://api.ston.fi/v1/assets/EQANcW45W0Tp91bzvHayaPO6-6hf1Lm4XlWZ4rN6L5ofPWdb',
   tonPriceApiUrl: process.env.TON_PRICE_API_URL || 'https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd',
   usdNgnRateApiUrl: process.env.USD_NGN_RATE_API_URL || 'https://api.frankfurter.dev/v2/rate/USD/NGN?providers=CBN',
   
