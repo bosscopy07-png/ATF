@@ -116,26 +116,26 @@ export class WalletService {
     return mnemonicToWalletKey(words);
   }
 
-  async getBalance(address: string): Promise<{ ton: bigint; aft: bigint }> {
+  async getBalance(address: string): Promise<{ ton: bigint; atf: bigint }> {
     try {
       const tonBalance = await this.client.getBalance(Address.parse(address));
       
-      // Query AFT jetton balance
-      const jettonMaster = this.client.open(JettonMaster.create(Address.parse(config.aftJettonAddress)));
+      // Query ATF jetton balance
+      const jettonMaster = this.client.open(JettonMaster.create(Address.parse(config.atfJettonAddress)));
       const jettonWalletAddress = await jettonMaster.getWalletAddress(Address.parse(address));
       const jettonWallet = this.client.open(JettonWallet.create(jettonWalletAddress));
       
-      let aftBalance = BigInt(0);
+      let atfBalance = BigInt(0);
       try {
         const balance = await jettonWallet.getBalance();
-        aftBalance = balance;
+        atfBalance = balance;
       } catch {
-        // Jetton wallet doesn't exist yet (no AFT received)
+        // Jetton wallet doesn't exist yet (no ATF received)
       }
 
-      return { ton: tonBalance, aft: aftBalance };
+      return { ton: tonBalance, atf: atfBalance };
     } catch {
-      return { ton: BigInt(0), aft: BigInt(0) };
+      return { ton: BigInt(0), atf: BigInt(0) };
     }
   }
 
