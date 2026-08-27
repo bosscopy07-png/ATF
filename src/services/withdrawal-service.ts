@@ -2,12 +2,12 @@ import { User } from '../models/User';
 import { Transaction } from '../models/Transaction';
 import { WalletService } from './wallet-service';
 import { Precision } from '../utils/precision';
-import { config, TON_DECIMALS, AFT_DECIMALS } from '../config';
+import { config, TON_DECIMALS, ATF_DECIMALS } from '../config';
 import { isValidTonAddress } from '../utils/validation';
 
 export interface WithdrawalRequest {
   userId: number;
-  asset: 'TON' | 'AFT';
+  asset: 'TON' | 'ATF';
   amount: string;
   toAddress: string;
 }
@@ -36,14 +36,14 @@ export class WithdrawalService {
       throw new Error('Invalid destination address');
     }
 
-    const decimals = request.asset === 'TON' ? TON_DECIMALS : AFT_DECIMALS;
+    const decimals = request.asset === 'TON' ? TON_DECIMALS : ATF_DECIMALS;
     const amountBase = Precision.toBaseUnits(request.amount, decimals);
 
     if (amountBase <= BigInt(0)) {
       throw new Error('Amount must be greater than zero');
     }
 
-    const balanceKey = request.asset === 'TON' ? 'tonBalance' : 'aftBalance';
+    const balanceKey = request.asset === 'TON' ? 'tonBalance' : 'atfBalance';
     const currentBalance = BigInt(user[balanceKey]);
 
     if (Precision.isLessThan(currentBalance, amountBase)) {
@@ -76,7 +76,7 @@ export class WithdrawalService {
     if (!user) throw new Error('User not found');
     if (user.isFrozen) throw new Error('Account is frozen');
 
-    const decimals = request.asset === 'TON' ? TON_DECIMALS : AFT_DECIMALS;
+    const decimals = request.asset === 'TON' ? TON_DECIMALS : ATF_DECIMALS;
     const amountBase = Precision.toBaseUnits(request.amount, decimals);
 
     const balanceKey = request.asset === 'TON' ? 'tonBalance' : 'aftBalance';
