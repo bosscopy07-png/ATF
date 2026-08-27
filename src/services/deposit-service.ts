@@ -4,7 +4,7 @@ import { User } from '../models/User';
 import { Wallet } from '../models/Wallet';
 import { Transaction } from '../models/Transaction';
 import { Precision } from '../utils/precision';
-import { config, TON_DECIMALS } from '../config';
+import { config } from '../config';
 
 const PROCESSED_TXS = new Set<string>();
 
@@ -25,6 +25,24 @@ function parseTransferNotification(body: Cell): {
   } catch {
     return null;
   }
+}
+
+function getInternalMessageValue(tx: any): bigint {
+  if (!tx.inMessage) return BigInt(0);
+  const info = tx.inMessage.info;
+  if (info && info.type === 'internal' && info.value && typeof info.value.coins === 'bigint') {
+    return info.value.coins;
+  }
+  return BigInt(0);
+}
+
+function getInternalMessageSource(tx: any): string | undefined {
+  if (!tx.inMessage) return undefined;
+  const info = tx.inMessage.info;
+  if (info && info.type === 'internal' && info.src) {
+    return info.src.toString();
+  }
+  return undefined;
 }
 
 export class DepositService {
@@ -55,7 +73,8 @@ export class DepositService {
     const transactions = await this.client.getTransactions(address, { limit: 20 });
 
     for (const tx of transactions) {
-      if (!tx.inMessage?.value || tx.inMessage.value === BigInt(0)) continue;
+      const amount = getInternalMessageValue(tx);
+      if (amount === BigInt(0)) continue;
 
       const txHash = tx.hash().toString('hex');
       const uniqueId = `ton_deposit_${walletDoc.address}_${txHash}`;
@@ -68,7 +87,6 @@ export class DepositService {
         continue;
       }
 
-      const amount = tx.inMessage.value;
       const user = await User.findById(walletDoc.userId);
       if (!user) continue;
 
@@ -83,7 +101,7 @@ export class DepositService {
         status: 'completed',
         txHash,
         toAddress: walletDoc.address,
-        fromAddress: tx.inMessage.source?.toString(),
+        fromAddress: getInternalMessageSource(tx),
       });
 
       PROCESSED_TXS.add(uniqueId);
@@ -107,11 +125,10 @@ export class DepositService {
 
         if (PROCESSED_TXS.has(uniqueId)) continue;
 
-        const messageSource = tx.inMessage.source;
+        const messageSource = getInternalMessageSource(tx);
         if (!messageSource) continue;
 
-        // SECURITY: Verify source is expected jetton wallet
-        if (messageSource.toString() !== expectedJettonWallet.toString()) continue;
+        if (messageSource !== expectedJettonWallet.toString()) continue;
 
         const notification = parseTransferNotification(tx.inMessage.body);
         if (!notification) continue;
@@ -155,5 +172,4 @@ export class DepositService {
       console.error('ATF deposit check error:', error);
     }
   }
-}
-  
+                                                                }
