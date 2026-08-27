@@ -7,7 +7,7 @@ export interface ITransaction extends Document {
   userId: mongoose.Types.ObjectId;
   type: TransactionType;
   asset: 'TON' | 'ATF';
-  amount: string; // base units
+  amount: string;
   fee?: string;
   feeAsset?: string;
   feePercentage?: number;
@@ -18,20 +18,8 @@ export interface ITransaction extends Document {
   txHash?: string;
   fromAddress?: string;
   toAddress?: string;
-  metadata: {
-    quote?: any;
-    swapDirection?: 'ton_to_aft' | 'aft_to_ton';
-    inputAmount?: string;
-    platformFee?: string;
-    netSwapAmount?: string;
-    expectedOutput?: string;
-    minOutput?: string;
-    slippage?: number;
-    dexCosts?: string;
-    expiresAt?: Date;
-    destinationAddress?: string;
-    [key: string]: any;
-  };
+  reconciledAt?: Date;
+  metadata: Record<string, any>;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -52,6 +40,7 @@ const TransactionSchema = new Schema<ITransaction>(
     txHash: { type: String, index: true },
     fromAddress: { type: String },
     toAddress: { type: String },
+    reconciledAt: { type: Date },
     metadata: { type: Schema.Types.Mixed, default: {} },
   },
   { timestamps: true }
@@ -60,3 +49,4 @@ const TransactionSchema = new Schema<ITransaction>(
 TransactionSchema.index({ txHash: 1, type: 1 }, { unique: true, sparse: true });
 
 export const Transaction = mongoose.model<ITransaction>('Transaction', TransactionSchema);
+                                      
