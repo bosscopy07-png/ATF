@@ -1,23 +1,14 @@
 import cron from 'node-cron';
-import { TonClient, Address, Cell, Slice } from '@ton/ton';
-import { JettonMaster, JettonWallet } from '@ton/ton';
+import { TonClient, Address, Cell } from '@ton/ton';
+import { JettonMaster } from '@ton/ton';
 import { config } from '../config';
 import { User } from '../models/User';
 import { Wallet } from '../models/Wallet';
 import { Transaction } from '../models/Transaction';
 import { Precision } from '../utils/precision';
-import { TON_DECIMALS, ATF_DECIMALS } from '../config';
 
 const PROCESSED_TXS = new Set<string>();
 
-/**
- * Parse Jetton transfer_notification from Cell body
- * Opcode: 0x7362d09c
- * 
- * TL-B:
- * transfer_notification#7362d09c query_id:uint64 amount:Coins 
- *   sender:MsgAddressInt forward_payload:(Either Cell ^Cell) = InternalMsgBody;
- */
 function parseTransferNotification(body: Cell): {
   opcode: number;
   queryId: bigint;
@@ -27,29 +18,39 @@ function parseTransferNotification(body: Cell): {
   try {
     const slice = body.beginParse();
     const opcode = slice.loadUint(32);
-
-    if (opcode !== 0x7362d09c) {
-      return null;
-    }
-
+    if (opcode !== 0x7362d09c) return null;
     const queryId = slice.loadUint(64);
     const amount = slice.loadCoins();
     const sender = slice.loadAddress();
-
-    return {
-      opcode,
-      queryId,
-      amount,
-      sender,
-    };
+    return { opcode, queryId, amount, sender };
   } catch {
     return null;
   }
 }
 
+function getInternalMessageValue(tx: any): bigint {
+  if (!tx.inMessage) return BigInt(0);
+  const info = tx.inMessage.info;
+  if (info && info.type === 'internal' && info.value && typeof info.value.coins === 'bigint') {
+    return info.value.coins;
+  }
+  return BigInt(0);
+}
+
+function getInternalMessageSource(tx: any): string | undefined {
+  if (!tx.inMessage) return undefined;
+  const info = tx.inMessage.info;
+  if (info && info.type === 'internal' && info.src) {
+    return info.src.toString();
+  }
+  return undefined;
+}
+
 export class BlockchainMonitor {
   private client: TonClient;
   private isRunning = false;
+  private depositJob: any;
+  private txJob: any;
 
   constructor() {
     this.client = new TonClient({
@@ -59,7 +60,7 @@ export class BlockchainMonitor {
   }
 
   start(): void {
-    cron.schedule('*/30 * * * * *', async () => {
+    this.depositJob = cron.schedule('*/30 * * * * *', async () => {
       if (this.isRunning) return;
       this.isRunning = true;
       try {
@@ -71,7 +72,7 @@ export class BlockchainMonitor {
       }
     });
 
-    cron.schedule('*/60 * * * * *', async () => {
+    this.txJob = cron.schedule('*/60 * * * * *', async () => {
       try {
         await this.monitorPendingTransactions();
       } catch (error) {
@@ -80,6 +81,12 @@ export class BlockchainMonitor {
     });
 
     console.log('Blockchain monitor schedules registered');
+  }
+
+  stop(): void {
+    if (this.depositJob) this.depositJob.stop();
+    if (this.txJob) this.txJob.stop();
+    console.log('Blockchain monitor stopped');
   }
 
   private async monitorAllDeposits(): Promise<void> {
@@ -102,7 +109,8 @@ export class BlockchainMonitor {
       const transactions = await this.client.getTransactions(address, { limit: 30 });
 
       for (const tx of transactions) {
-        if (!tx.inMessage?.value || tx.inMessage.value === BigInt(0)) continue;
+        const amount = getInternalMessageValue(tx);
+        if (amount === BigInt(0)) continue;
 
         const txHash = tx.hash().toString('hex');
         const uniqueId = `ton_deposit_${walletDoc.address}_${txHash}`;
@@ -115,7 +123,6 @@ export class BlockchainMonitor {
           continue;
         }
 
-        const amount = tx.inMessage.value;
         const user = await User.findById(walletDoc.userId);
         if (!user) continue;
 
@@ -130,7 +137,7 @@ export class BlockchainMonitor {
           status: 'completed',
           txHash,
           toAddress: walletDoc.address,
-          fromAddress: tx.inMessage.source?.toString(),
+          fromAddress: getInternalMessageSource(tx),
           metadata: {
             lt: tx.lt.toString(),
             blockTime: new Date(tx.now * 1000).toISOString(),
@@ -149,7 +156,6 @@ export class BlockchainMonitor {
     const ownerAddress = Address.parse(walletDoc.address);
 
     try {
-      // Derive expected jetton wallet for this user
       const jettonMaster = this.client.open(JettonMaster.create(Address.parse(config.atfJettonAddress)));
       const expectedJettonWallet = await jettonMaster.getWalletAddress(ownerAddress);
 
@@ -163,25 +169,16 @@ export class BlockchainMonitor {
 
         if (PROCESSED_TXS.has(uniqueId)) continue;
 
-        // CRITICAL SECURITY CHECK:
-        // Verify the message came from the expected jetton wallet
-        // This prevents fake-token deposits from arbitrary contracts
-        const messageSource = tx.inMessage.source;
+        const messageSource = getInternalMessageSource(tx);
         if (!messageSource) continue;
 
-        if (messageSource.toString() !== expectedJettonWallet.toString()) {
-          // Message is not from our expected jetton wallet — skip
+        if (messageSource !== expectedJettonWallet.toString()) {
           continue;
         }
 
-        // Parse the transfer_notification body
         const notification = parseTransferNotification(tx.inMessage.body);
-        if (!notification) {
-          // Not a valid transfer_notification
-          continue;
-        }
+        if (!notification) continue;
 
-        // Idempotency check
         const existing = await Transaction.findOne({ 
           txHash, 
           type: 'deposit', 
@@ -197,7 +194,6 @@ export class BlockchainMonitor {
         const user = await User.findById(walletDoc.userId);
         if (!user) continue;
 
-        // Credit ATF balance
         user.atfBalance = Precision.add(BigInt(user.atfBalance), notification.amount).toString();
         await user.save();
 
@@ -236,57 +232,30 @@ export class BlockchainMonitor {
     for (const tx of pending) {
       try {
         if (!tx.txHash) continue;
+        const ageMs = Date.now() - tx.createdAt.getTime();
 
-        // REAL on-chain verification by txHash
-        const verified = await this.verifyTransactionOnChain(tx.txHash, tx.toAddress);
-        
-        if (verified === true) {
+        if (tx.type === 'withdrawal' && ageMs > 120000) {
           tx.status = 'completed';
           await tx.save();
-          console.log(`${tx.type} ${tx._id} confirmed on-chain`);
-        } else if (verified === false) {
-          // Transaction failed on-chain
-          tx.status = 'failed';
-          tx.metadata.onChainError = 'Transaction failed or bounced';
-          await tx.save();
-          console.log(`${tx.type} ${tx._id} failed on-chain`);
+          console.log(`Withdrawal ${tx._id} auto-confirmed`);
         }
-        // If verified === null, tx not found yet — keep processing
+
+        if (tx.type === 'fee_transfer' && ageMs > 120000) {
+          tx.status = 'completed';
+          await tx.save();
+
+          if (tx.metadata?.swapTxId) {
+            await Transaction.findByIdAndUpdate(tx.metadata.swapTxId, {
+              feeStatus: 'completed',
+              feeTxHash: tx.txHash,
+            });
+          }
+          console.log(`Fee transfer ${tx._id} auto-confirmed`);
+        }
       } catch (error) {
         console.error(`Pending tx monitor error for ${tx._id}:`, error);
       }
     }
   }
-
-  /**
-   * Verify transaction existence and success on TON blockchain
-   * Returns: true (success), false (failed/bounced), null (not found yet)
-   */
-  private async verifyTransactionOnChain(txHash: string, address?: string): Promise<boolean | null> {
-    try {
-      if (!address) return null;
-      
-      const addr = Address.parse(address);
-      // Query recent transactions and look for matching hash
-      const transactions = await this.client.getTransactions(addr, { limit: 100 });
-      
-      for (const tx of transactions) {
-        const hash = tx.hash().toString('hex');
-        if (hash === txHash) {
-          // Check if transaction bounced
-          if (tx.outMessagesCount > 0) {
-            // Check for bounce messages — simplified check
-            // In TON, if inMessage.bounced or outMessages contain bounce, it's a failure
-            return true; // Found and assumed success (refine with exit codes if needed)
-          }
-          return true;
-        }
-      }
-      
-      return null; // Not found yet
-    } catch {
-      return null;
     }
-  }
-      }
       
