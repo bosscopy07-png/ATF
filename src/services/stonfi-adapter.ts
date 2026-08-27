@@ -1,5 +1,5 @@
 import { StonApiClient } from '@ston-fi/api';
-import { dexFactory, pTON } from '@ston-fi/sdk';
+import { dexFactory } from '@ston-fi/sdk';
 import { TonClient, Address } from '@ton/ton';
 import { config } from '../config';
 
@@ -13,6 +13,13 @@ export interface SwapQuote {
   ptonMasterAddress: string;
   route: string;
   expiresAt: Date;
+}
+
+export interface SwapTxParams {
+  to: Address;
+  value: bigint;
+  body: any;
+  gasTon: string; // Human-readable TON required for gas
 }
 
 export class STONFiAdapter {
@@ -60,7 +67,7 @@ export class STONFiAdapter {
     quote: SwapQuote,
     offerAddress: string,
     askAddress: string
-  ): Promise<any> {
+  ): Promise<SwapTxParams> {
     const routerInfo = {
       address: quote.routerAddress,
       ptonMasterAddress: quote.ptonMasterAddress,
@@ -80,30 +87,40 @@ export class STONFiAdapter {
 
     const isTonToJetton = offerAddress.toLowerCase() === 'ton';
     const isJettonToTon = askAddress.toLowerCase() === 'ton';
+    let rawParams: any;
 
     if (isTonToJetton) {
       const proxyTon = dexContracts.pTON.create(quote.ptonMasterAddress);
-      return router.getSwapTonToJettonTxParams({
+      rawParams = await router.getSwapTonToJettonTxParams({
         ...sharedParams,
         proxyTon,
         askJettonAddress: askAddress,
       });
-    }
-
-    if (isJettonToTon) {
+    } else if (isJettonToTon) {
       const proxyTon = dexContracts.pTON.create(quote.ptonMasterAddress);
-      return router.getSwapJettonToTonTxParams({
+      rawParams = await router.getSwapJettonToTonTxParams({
         ...sharedParams,
         proxyTon,
         offerJettonAddress: offerAddress,
       });
+    } else {
+      rawParams = await router.getSwapJettonToJettonTxParams({
+        ...sharedParams,
+        offerJettonAddress: offerAddress,
+        askJettonAddress: askAddress,
+      });
     }
 
-    return router.getSwapJettonToJettonTxParams({
-      ...sharedParams,
-      offerJettonAddress: offerAddress,
-      askJettonAddress: askAddress,
-    });
+    // Extract TON gas requirement from the transaction value
+    const valueNano = BigInt(rawParams.value.toString());
+    const gasTon = (Number(valueNano) / 1e9).toFixed(9);
+
+    return {
+      to: Address.parse(rawParams.to.toString()),
+      value: valueNano,
+      body: rawParams.body,
+      gasTon,
+    };
   }
 
   async getSwapStatus(routerAddress: string, ownerAddress: string, queryId: string): Promise<any> {
@@ -112,24 +129,5 @@ export class STONFiAdapter {
       ownerAddress,
       queryId,
     });
-  }
-
-  /**
-   * Verify swap completion by checking STON.fi API and on-chain state
-   */
-  async verifySwapExecution(
-    routerAddress: string,
-    ownerAddress: string,
-    queryId: string
-  ): Promise<{ success: boolean; outputAmount?: string }> {
-    try {
-      const status = await this.getSwapStatus(routerAddress, ownerAddress, queryId);
-      if (status && status.success) {
-        return { success: true, outputAmount: status.askUnits };
-      }
-      return { success: false };
-    } catch {
-      return { success: false };
-    }
   }
 }
