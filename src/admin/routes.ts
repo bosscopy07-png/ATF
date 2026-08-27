@@ -56,7 +56,7 @@ router.get('/users', async (req: AuthenticatedRequest, res: Response) => {
 });
 
 router.get('/users/:telegramId', async (req: AuthenticatedRequest, res: Response) => {
-  const user = await User.findOne({ telegramId: parseInt(req.params.telegramId, 10) }).select('-stateData');
+  const user = await User.findOne({ telegramId: parseInt(req.params.telegramId as string, 10) }).select('-stateData');
   if (!user) {
     res.status(404).json({ error: 'User not found' });
     return;
@@ -71,7 +71,7 @@ router.get('/users/:telegramId', async (req: AuthenticatedRequest, res: Response
 });
 
 router.post('/users/:telegramId/freeze', async (req: AuthenticatedRequest, res: Response) => {
-  const targetId = parseInt(req.params.telegramId, 10);
+  const targetId = parseInt(req.params.telegramId as string, 10);
 
   if (targetId === config.superAdminTelegramId) {
     res.status(403).json({ error: 'Cannot freeze Super Admin' });
@@ -103,8 +103,8 @@ router.get('/transactions', async (req: AuthenticatedRequest, res: Response) => 
   const skip = (page - 1) * limit;
 
   const filter: any = {};
-  if (req.query.type) filter.type = req.query.type;
-  if (req.query.status) filter.status = req.query.status;
+  if (req.query.type) filter.type = req.query.type as string;
+  if (req.query.status) filter.status = req.query.status as string;
 
   const txs = await Transaction.find(filter)
     .sort({ createdAt: -1 })
@@ -128,7 +128,7 @@ router.get('/transactions/:id', async (req: AuthenticatedRequest, res: Response)
 
 router.post('/admins', requireSuperAdmin, async (req: AuthenticatedRequest, res: Response) => {
   const { telegramId } = req.body;
-  const target = await User.findOne({ telegramId: parseInt(telegramId, 10) });
+  const target = await User.findOne({ telegramId: parseInt(telegramId as string, 10) });
 
   if (!target) {
     res.status(404).json({ error: 'User not found' });
@@ -149,7 +149,7 @@ router.post('/admins', requireSuperAdmin, async (req: AuthenticatedRequest, res:
 });
 
 router.delete('/admins/:telegramId', requireSuperAdmin, async (req: AuthenticatedRequest, res: Response) => {
-  const targetId = parseInt(req.params.telegramId, 10);
+  const targetId = parseInt(req.params.telegramId as string, 10);
 
   if (targetId === config.superAdminTelegramId) {
     res.status(403).json({ error: 'Cannot remove Super Admin' });
@@ -222,3 +222,4 @@ router.get('/reconciliation', async (req: AuthenticatedRequest, res: Response) =
 });
 
 export { router as adminRoutes };
+  
