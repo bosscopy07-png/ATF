@@ -19,7 +19,7 @@ export interface SwapTxParams {
   to: Address;
   value: bigint;
   body: any;
-  gasTon: string; // Human-readable TON required for gas
+  gasTon: string;
 }
 
 export class STONFiAdapter {
@@ -45,9 +45,11 @@ export class STONFiAdapter {
       askAddress,
       offerUnits,
       slippageTolerance,
-    });
+    }) as any; // Cast due to API type variations
 
-    const router = result.router;
+    // STON.fi API returns router info differently across versions
+    const routerAddress = result.routerAddress || result.router?.address || '';
+    const ptonMasterAddress = result.ptonMasterAddress || result.router?.ptonMasterAddress || '';
 
     return {
       offerUnits: result.offerUnits,
@@ -55,9 +57,9 @@ export class STONFiAdapter {
       minAskUnits: result.minAskUnits,
       feeUnits: result.feeUnits || '0',
       slippageTolerance,
-      routerAddress: router.address,
-      ptonMasterAddress: router.ptonMasterAddress || '',
-      route: router.address,
+      routerAddress,
+      ptonMasterAddress,
+      route: result.route || routerAddress,
       expiresAt: new Date(Date.now() + 30000),
     };
   }
@@ -111,7 +113,6 @@ export class STONFiAdapter {
       });
     }
 
-    // Extract TON gas requirement from the transaction value
     const valueNano = BigInt(rawParams.value.toString());
     const gasTon = (Number(valueNano) / 1e9).toFixed(9);
 
