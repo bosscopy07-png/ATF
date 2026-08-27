@@ -40,11 +40,10 @@ class OnChainVerifier {
         const hash = tx.hash().toString('hex');
         if (hash === txHash) {
           // Check for bounce — if inMessage.bounced exists or outMessages indicate failure
-          // In TON, a bounced message returns TON to sender but fails the operation
           if (tx.inMessage && 'bounced' in tx.inMessage && tx.inMessage.bounced) {
             return false;
           }
-          
+
           // Check transaction description for compute phase success
           // @ts-ignore — raw TON access
           if (tx.description?.computePhase?.success === false) {
@@ -59,27 +58,6 @@ class OnChainVerifier {
     } catch (error) {
       console.error(`On-chain verification error for ${txHash}:`, error);
       return null;
-    }
-  }
-
-  /**
-   * Verify swap execution by checking for output token receipt
-   */
-  async verifySwapOutput(
-    userAddress: string,
-    expectedOutput: string,
-    direction: string
-  ): Promise<{ success: boolean; actualOutput?: bigint }> {
-    try {
-      // Re-query user balance — if output token increased, swap succeeded
-      const addr = Address.parse(userAddress);
-      const balance = await this.client.getBalance(addr);
-      
-      // For precise verification, compare jetton balances before/after
-      // This is simplified — production should track pre/post swap balances
-      return { success: true };
-    } catch {
-      return { success: false };
     }
   }
 }
@@ -117,6 +95,19 @@ async function reconcileSwaps(): Promise<ReconcileResult> {
         swap.status = 'completed';
         await swap.save();
         result.confirmed++;
+
+        // ─── FINALIZE GAS FUNDING TX IF PRESENT (AFT→TON seamless) ─────────
+        if (swap.metadata?.gasTon) {
+          await Transaction.updateMany(
+            {
+              type: 'fee_transfer',
+              'metadata.swapTxId': swap._id.toString(),
+              'metadata.purpose': 'swap_gas_funding',
+            },
+            { status: 'completed' }
+          );
+          console.log(`Gas funding finalized for swap ${swap._id}`);
+        }
 
         // Handle fee transfer
         if (swap.feeStatus === 'pending' || swap.feeStatus === 'processing') {
@@ -227,7 +218,7 @@ async function reconcileWithdrawals(): Promise<void> {
         tx.status = 'failed';
         tx.metadata.onChainFailure = true;
         await tx.save();
-        
+
         // ROLLBACK: Return funds to user since withdrawal failed
         const user = await User.findById(tx.userId);
         if (user) {
@@ -235,7 +226,7 @@ async function reconcileWithdrawals(): Promise<void> {
           user[balanceKey] = Precision.add(BigInt(user[balanceKey]), BigInt(tx.amount)).toString();
           await user.save();
         }
-        
+
         console.log(`Withdrawal ${tx._id} failed on-chain — funds returned to user`);
       }
     } catch (error) {
@@ -342,3 +333,4 @@ if (require.main === module) {
 }
 
 export { startReconciler, runReconciliation };
+              
