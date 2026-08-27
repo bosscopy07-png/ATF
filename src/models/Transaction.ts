@@ -6,7 +6,7 @@ export type TransactionStatus = 'pending' | 'processing' | 'completed' | 'failed
 export interface ITransaction extends Document {
   userId: mongoose.Types.ObjectId;
   type: TransactionType;
-  asset: 'TON' | 'AFT';
+  asset: 'TON' | 'ATF';
   amount: string; // base units
   fee?: string;
   feeAsset?: string;
@@ -40,7 +40,7 @@ const TransactionSchema = new Schema<ITransaction>(
   {
     userId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     type: { type: String, enum: ['deposit', 'withdrawal', 'swap', 'fee', 'fee_transfer'], required: true },
-    asset: { type: String, enum: ['TON', 'AFT'], required: true },
+    asset: { type: String, enum: ['TON', 'ATF'], required: true },
     amount: { type: String, required: true },
     fee: { type: String },
     feeAsset: { type: String },
