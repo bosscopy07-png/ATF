@@ -22,7 +22,7 @@ interface ReconcileMetrics {
 }
 
 interface SwapMetadata {
-  swapDirection: 'ton_to_aft' | 'aft_to_ton';
+  swapDirection: 'ton_to_atf' | 'atf_to_ton';
   expectedOutput?: string;
   gasTon?: string;
   [key: string]: unknown;
@@ -265,7 +265,7 @@ class ReconciliationService {
     if (!user) throw new ReconcileError('User not found', 'INVALID_STATE', false);
 
     const meta = swap.metadata as SwapMetadata;
-    const outputAsset = meta?.swapDirection === 'ton_to_aft' ? 'aftBalance' : 'tonBalance';
+    const outputAsset = meta?.swapDirection === 'ton_to_atf' ? 'atfBalance' : 'tonBalance';
     const outputAmount = BigInt(meta?.expectedOutput || '0');
 
     // Atomic credit
@@ -367,7 +367,7 @@ class ReconciliationService {
     if (!user) return;
 
     const meta = swap.metadata as SwapMetadata;
-    const inputAsset = meta?.swapDirection === 'ton_to_aft' ? 'tonBalance' : 'aftBalance';
+    const inputAsset = meta?.swapDirection === 'ton_to_atf' ? 'tonBalance' : 'atfBalance';
     const inputAmount = BigInt(swap.amount || '0');
 
     // Idempotency: check if already rolled back
@@ -459,7 +459,7 @@ class ReconciliationService {
     const user = await User.findById(tx.userId).session(session);
     if (!user) return;
 
-    const balanceKey = tx.asset === 'TON' ? 'tonBalance' : 'aftBalance';
+    const balanceKey = tx.asset === 'TON' ? 'tonBalance' : 'atfBalance';
     const amount = BigInt(tx.amount || '0');
 
     // Check if already rolled back
@@ -598,5 +598,5 @@ process.on('SIGTERM', async () => {
 
 if (require.main === module) {
   startReconciler().catch(console.error);
-          }
-          
+        }
+        
