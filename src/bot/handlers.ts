@@ -88,18 +88,18 @@ export async function showMainMenu(userId: number, chatId: number): Promise<void
   const tonUsd = tonPrice ? priceService.convertCryptoToUsd(tonBalance, tonPrice.price, TON_DECIMALS) : '—';
 
   const caption = [
-    '🏠 <b>AFTSWAP</b>',
+    '🏠 <b>ATFSWAP</b>',
     '',
     `💎 <b>TON</b>`,
     `${Precision.formatDisplay(tonBalance)} TON`,
     aftPrice ? `≈ $${tonUsd}` : '',
     '',
-    `🪙 <b>AFT</b>`,
-    `${Precision.formatDisplay(aftBalance)} AFT`,
+    `🪙 <b>ATF</b>`,
+    `${Precision.formatDisplay(aftBalance)} ATF`,
     aftPrice ? `≈ $${aftUsd}` : '',
     '',
     '━━━━━━━━━━━━',
-    aftPrice ? `📈 AFT <code>$${aftPrice.price.toFixed(6)}</code>` : '',
+    aftPrice ? `📈 ATF <code>$${aftPrice.price.toFixed(6)}</code>` : '',
     '',
     'Choose an action:',
   ].filter(Boolean).join('\n');
@@ -337,12 +337,12 @@ async function startSwapInput(userId: number, chatId: number, direction: 'ton_to
   const balance = Precision.fromBaseUnits(BigInt(user[balanceKey]), direction === 'ton_to_aft' ? TON_DECIMALS : AFT_DECIMALS);
 
   const caption = [
-    direction === 'ton_to_aft' ? '💎 <b>TON → 🪙 AFT</b>' : '🪙 <b>AFT → 💎 TON</b>',
+    direction === 'ton_to_aft' ? '💎 <b>TON → 🪙 ATF</b>' : '🪙 <b>ATF → 💎 TON</b>',
     '',
-    `Enter ${direction === 'ton_to_aft' ? 'TON' : 'AFT'} amount.`,
+    `Enter ${direction === 'ton_to_aft' ? 'TON' : 'ATF'} amount.`,
     '',
     direction === 'ton_to_aft' ? `Minimum: <b>${config.minSwapTon} TON</b>` : '',
-    `Your balance: <b>${Precision.formatDisplay(balance)} ${direction === 'ton_to_aft' ? 'TON' : 'AFT'}</b>`,
+    `Your balance: <b>${Precision.formatDisplay(balance)} ${direction === 'ton_to_aft' ? 'TON' : 'ATF'}</b>`,
   ].filter(Boolean).join('\n');
 
   user.state = `swap_input_${direction}`;
@@ -418,11 +418,11 @@ async function startSwapInput(userId: number, chatId: number, direction: 'ton_to
         `${Precision.formatDisplay(confirmation.netSwapAmount)} TON`,
         '',
         '<b>Estimated Receive:</b>',
-        `${Precision.formatDisplay(confirmation.expectedOutput)} AFT`,
+        `${Precision.formatDisplay(confirmation.expectedOutput)} ATF`,
         receiveUsd ? `≈ $${receiveUsd}` : '',
         '',
         '<b>Minimum Received:</b>',
-        `${Precision.formatDisplay(confirmation.minOutput)} AFT`,
+        `${Precision.formatDisplay(confirmation.minOutput)} ATF`,
         '',
         '<b>Network/DEX Cost:</b>',
         `≈ ${Precision.formatDisplay(confirmation.dexCosts)} TON`,
@@ -439,13 +439,13 @@ async function startSwapInput(userId: number, chatId: number, direction: 'ton_to
         '🔄 <b>SWAP QUOTE</b>',
         '',
         '<b>You Pay:</b>',
-        `${Precision.formatDisplay(confirmation.inputAmount)} AFT`,
+        `${Precision.formatDisplay(confirmation.inputAmount)} ATF`,
         '',
         '<b>Platform Fee:</b>',
-        `${Precision.formatDisplay(confirmation.platformFee)} AFT (${config.platformSwapFeePercent}%)`,
+        `${Precision.formatDisplay(confirmation.platformFee)} ATF (${config.platformSwapFeePercent}%)`,
         '',
         '<b>Swap Amount:</b>',
-        `${Precision.formatDisplay(confirmation.netSwapAmount)} AFT`,
+        `${Precision.formatDisplay(confirmation.netSwapAmount)} ATF`,
         '',
         '<b>Estimated Receive:</b>',
         `${Precision.formatDisplay(confirmation.expectedOutput)} TON`,
@@ -573,12 +573,12 @@ async function showDepositAft(userId: number, chatId: number): Promise<void> {
   }
 
   const caption = [
-    '🪙 <b>DEPOSIT AFT</b>',
+    '🪙 <b>DEPOSIT ATF</b>',
     '',
     'Send AFT to:',
     `<code>${wallet.address}</code>`,
     '',
-    `Token: <b>AFT</b>`,
+    `Token: <b>ATF</b>`,
     'Minimum: <b>None</b>',
     '',
     '⚠️ <i>Only send the configured AFT Jetton.</i>',
@@ -599,7 +599,7 @@ async function showWithdrawMenu(userId: number, chatId: number): Promise<void> {
   await messageManager.showScreen(userId, chatId, caption, keyboards.withdrawAssetKeyboard());
 }
 
-async function startWithdrawal(userId: number, chatId: number, asset: 'TON' | 'AFT'): Promise<void> {
+async function startWithdrawal(userId: number, chatId: number, asset: 'TON' | 'ATF'): Promise<void> {
   const user = await User.findOne({ telegramId: userId });
   if (!user) return;
 
@@ -756,8 +756,8 @@ async function showAccount(userId: number, chatId: number): Promise<void> {
     `${Precision.formatDisplay(tonBalance)} TON`,
     tonUsd ? `≈ $${tonUsd}` : '',
     '',
-    '🪙 <b>AFT</b>',
-    `${Precision.formatDisplay(aftBalance)} AFT`,
+    '🪙 <b>ATF</b>',
+    `${Precision.formatDisplay(aftBalance)} ATF`,
     aftUsd ? `≈ $${aftUsd}` : '',
     ngnRate && aftUsd ? `≈ ₦${priceService.convertUsdToNgn(aftUsd, ngnRate.price)}` : '',
     '',
@@ -767,7 +767,7 @@ async function showAccount(userId: number, chatId: number): Promise<void> {
     `≈ $${totalUsd}`,
     totalNgn ? `≈ ₦${totalNgn}` : '',
     '',
-    aftPrice ? `📈 AFT Price: <code>$${aftPrice.price.toFixed(6)}</code>` : '⚠️ Price temporarily unavailable',
+    aftPrice ? `📈 ATF Price: <code>$${aftPrice.price.toFixed(6)}</code>` : '⚠️ Price temporarily unavailable',
     '',
     wallet ? `Wallet: <code>${formatAddressShort(wallet.address)}</code>` : '',
   ].filter(Boolean).join('\n');
@@ -785,7 +785,7 @@ async function showExportWarning(userId: number, chatId: number): Promise<void> 
     '',
     'Never share it with anyone.',
     '',
-    '<b>AFTSwap support will NEVER ask for it.</b>',
+    '<b>ATFSwap support will NEVER ask for it.</b>',
   ].join('\n');
 
   await messageManager.showScreen(userId, chatId, caption, keyboards.exportWarningKeyboard());
@@ -882,8 +882,8 @@ async function showPrices(userId: number, chatId: number): Promise<void> {
     '💵 <b>LIVE PRICES</b>',
     '',
     aftPrice
-      ? `🪙 <b>AFT</b>\n$${aftPrice.price.toFixed(6)}\n${ngnRate ? `🇳🇬 ₦${(aftPrice.price * ngnRate.price).toFixed(2)}` : ''}`
-      : '⚠️ AFT price unavailable',
+      ? `🪙 <b>ATF</b>\n$${aftPrice.price.toFixed(6)}\n${ngnRate ? `🇳🇬 ₦${(aftPrice.price * ngnRate.price).toFixed(2)}` : ''}`
+      : '⚠️ ATF price unavailable',
     '',
     tonPrice
       ? `💎 <b>TON</b>\n$${tonPrice.price.toFixed(2)}\n${ngnRate ? `🇳🇬 ₦${(tonPrice.price * ngnRate.price).toFixed(2)}` : ''}`
@@ -903,14 +903,14 @@ async function showHelp(userId: number, chatId: number): Promise<void> {
   const caption = [
     'ℹ️ <b>HELP</b>',
     '',
-    '<b>AFTSwap</b> is a custodial TON ↔ AFT exchange.',
+    '<b>ATFSwap</b> is a custodial TON ↔ AFT exchange.',
     '',
     '<b>Commands:</b>',
     '/start — Open main menu',
     '',
     '<b>Features:</b>',
-    '• Deposit TON and AFT',
-    '• Swap between TON and AFT',
+    '• Deposit TON and ATF',
+    '• Swap between TON and ATF',
     '• Withdraw to any TON address',
     '• View live prices',
     '',
@@ -1222,7 +1222,7 @@ async function showUserDetail(userId: number, chatId: number, targetId: number):
       `Status: ${target.isFrozen ? '🔒 Frozen' : '🟢 Active'}`,
       '',
       `💎 TON: ${Precision.formatDisplay(tonBalance)}`,
-      `🪙 AFT: ${Precision.formatDisplay(aftBalance)}`,
+      `🪙 ATF: ${Precision.formatDisplay(aftBalance)}`,
       '',
       `Created: ${target.createdAt.toLocaleDateString()}`,
     ].join('\n');
