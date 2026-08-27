@@ -5,7 +5,7 @@ import { Transaction } from '../models/Transaction';
 import { AdminAction } from '../models/AdminAction';
 import { Wallet } from '../models/Wallet';
 import { Precision } from '../utils/precision';
-import { config, TON_DECIMALS, AFT_DECIMALS } from '../config';
+import { config, TON_DECIMALS, ATF_DECIMALS } from '../config';
 
 const router = Router();
 
@@ -16,12 +16,12 @@ router.get('/dashboard', async (req: AuthenticatedRequest, res: Response) => {
   const totalWithdrawals = await Transaction.countDocuments({ type: 'withdrawal' });
   const pendingTxs = await Transaction.countDocuments({ status: { $in: ['pending', 'processing'] } });
 
-  const users = await User.find().select('tonBalance aftBalance');
+  const users = await User.find().select('tonBalance atfBalance');
   let totalTon = BigInt(0);
-  let totalAft = BigInt(0);
+  let totalAtf = BigInt(0);
   for (const u of users) {
     totalTon += BigInt(u.tonBalance);
-    totalAft += BigInt(u.aftBalance);
+    totalAtf += BigInt(u.atfBalance);
   }
 
   res.json({
@@ -31,7 +31,7 @@ router.get('/dashboard', async (req: AuthenticatedRequest, res: Response) => {
     totalWithdrawals,
     pendingTransactions: pendingTxs,
     totalTonCustodial: Precision.fromBaseUnits(totalTon, TON_DECIMALS),
-    totalAftCustodial: Precision.fromBaseUnits(totalAft, AFT_DECIMALS),
+    totalAtfCustodial: Precision.fromBaseUnits(totalAtf, ATF_DECIMALS),
     adminFeeWallet: config.adminFeeWalletAddress.replace(/(.{6}).+(.{4})/, '$1...$2'),
     platformFeePercent: config.platformSwapFeePercent,
     minSwapTon: config.minSwapTon,
@@ -201,7 +201,7 @@ router.get('/settings', async (req: AuthenticatedRequest, res: Response) => {
     platformFeePercent: config.platformSwapFeePercent,
     minSwapTon: config.minSwapTon,
     maxSlippagePercent: config.maxSlippagePercent,
-    aftJettonAddress: config.aftJettonAddress,
+    atfJettonAddress: config.atfJettonAddress,
     tonNetwork: config.tonNetwork,
   });
 });
@@ -222,4 +222,3 @@ router.get('/reconciliation', async (req: AuthenticatedRequest, res: Response) =
 });
 
 export { router as adminRoutes };
-    
