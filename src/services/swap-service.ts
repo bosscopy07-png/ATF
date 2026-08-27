@@ -24,7 +24,6 @@ export interface SwapConfirmation {
   expiresAt: Date;
   quote: any;
   txParams?: any;
-  // ATF→TON seamless gas fields
   gasTon?: string;
   gasAtfEquivalent?: string;
   trueNetSwapAmount?: string;
@@ -53,7 +52,6 @@ export class SwapService {
     const outputDecimals = isTonToAtf ? ATF_DECIMALS : TON_DECIMALS;
     const amountBase = Precision.toBaseUnits(request.amount, inputDecimals);
 
-    // Validate minimum for TON→ATF
     if (isTonToAtf) {
       const minBase = Precision.toBaseUnits(config.minSwapTon.toString(), TON_DECIMALS);
       if (Precision.isLessThan(amountBase, minBase)) {
@@ -61,29 +59,23 @@ export class SwapService {
       }
     }
 
-    // Check balance
     const balanceKey = isTonToAtf ? 'tonBalance' : 'atfBalance';
     const currentBalance = BigInt(user[balanceKey]);
     if (Precision.isLessThan(currentBalance, amountBase)) {
       throw new Error('Insufficient balance');
     }
 
-    // Calculate 1% platform fee
     const feeBase = Precision.calculateFee(amountBase, config.platformSwapFeePercent);
     let netSwapBase = Precision.subtract(amountBase, feeBase);
 
-    // ─── ATF→TON: SEAMLESS GAS HANDLING ─────────────────────────────────────
     let gasTon: string | undefined;
-    let gasAtfEquivalentBase: bigint = BigInt(0);
+    let gasAtfEquivalentBase = BigInt(0);
     let trueNetSwapBase = netSwapBase;
 
     if (!isTonToAtf) {
-      // For ATF→TON, we need to estimate gas before quoting
-      // We do a preliminary tx build to extract gas requirement
       const walletAddress = await this.walletService.getAddress(request.userId);
       if (!walletAddress) throw new Error('Wallet not found');
 
-      // Preliminary quote to get router info for gas estimation
       const prelimQuote = await this.stonfi.getQuote(
         config.atfJettonAddress,
         'ton',
@@ -101,7 +93,6 @@ export class SwapService {
       gasTon = txParams.gasTon;
       const gasTonBase = txParams.value;
 
-      // Convert gas TON to ATF equivalent using live prices
       const [tonPrice, atfPrice] = await Promise.all([
         this.priceService.getTonPriceUsd(),
         this.priceService.getAtfPriceUsd(),
@@ -115,8 +106,6 @@ export class SwapService {
       const gasAtfFloat = gasUsd / atfPrice.price;
       gasAtfEquivalentBase = Precision.toBaseUnits(gasAtfFloat.toFixed(ATF_DECIMALS), ATF_DECIMALS);
 
-      // Reduce net swap amount by gas equivalent
-      // User pays: inputAmount = platformFee + gasAtf + trueNetSwap
       trueNetSwapBase = Precision.subtract(netSwapBase, gasAtfEquivalentBase);
 
       if (trueNetSwapBase <= BigInt(0)) {
@@ -126,7 +115,6 @@ export class SwapService {
       netSwapBase = trueNetSwapBase;
     }
 
-    // Get final DEX quote for actual net swap amount
     const offerAddress = isTonToAtf ? 'ton' : config.atfJettonAddress;
     const askAddress = isTonToAtf ? config.atfJettonAddress : 'ton';
 
@@ -137,7 +125,6 @@ export class SwapService {
       (config.maxSlippagePercent / 100).toString()
     );
 
-    // Build final tx params (for execution later)
     const walletAddress = await this.walletService.getAddress(request.userId);
     let txParams: any;
     if (walletAddress) {
@@ -166,13 +153,12 @@ export class SwapService {
       expiresAt: quote.expiresAt,
       quote,
       txParams,
-      // ATF→TON only
       gasTon,
-      gasAtfEquivalent: gasAtfEquivalentBase > BigInt(0) 
-        ? Precision.fromBaseUnits(gasAtfEquivalentBase, ATF_DECIMALS) 
+      gasAtfEquivalent: gasAtfEquivalentBase > BigInt(0)
+        ? Precision.fromBaseUnits(gasAtfEquivalentBase, ATF_DECIMALS)
         : undefined,
-      trueNetSwapAmount: !isTonToAtf 
-        ? Precision.fromBaseUnits(trueNetSwapBase, ATF_DECIMALS) 
+      trueNetSwapAmount: !isTonToAtf
+        ? Precision.fromBaseUnits(trueNetSwapBase, ATF_DECIMALS)
         : undefined,
     };
   }
@@ -195,24 +181,18 @@ export class SwapService {
     const amountBase = Precision.toBaseUnits(confirmation.inputAmount, inputDecimals);
     const feeBase = Precision.calculateFee(amountBase, config.platformSwapFeePercent);
 
-    // For ATF→TON, include gas equivalent in total deduction
     let gasAtfBase = BigInt(0);
     if (!isTonToAtf && confirmation.gasAtfEquivalent) {
       gasAtfBase = Precision.toBaseUnits(confirmation.gasAtfEquivalent, ATF_DECIMALS);
     }
 
-    const totalDeduction = Precision.add(Precision.add(amountBase, BigInt(0)), gasAtfBase); // amountBase already includes everything in our model
-    // Actually: user entered amount = fee + gas + trueNetSwap
-    // We already deducted the full inputAmount from user balance in prepareSwap check
-    // But for execution, we need to deduct exactly inputAmount
-
     const balanceKey = isTonToAtf ? 'tonBalance' : 'atfBalance';
     const currentBalance = BigInt(user[balanceKey]);
+
     if (Precision.isLessThan(currentBalance, amountBase)) {
       throw new Error('Insufficient balance');
     }
 
-    // Lock full amount from user
     user[balanceKey] = Precision.subtract(currentBalance, amountBase).toString();
     await user.save();
 
@@ -238,7 +218,6 @@ export class SwapService {
         dexCosts: confirmation.dexCosts,
         expiresAt: confirmation.expiresAt,
         quote: confirmation.quote,
-        // ATF→TON gas tracking
         gasTon: confirmation.gasTon,
         gasAtfEquivalent: confirmation.gasAtfEquivalent,
         trueNetSwapAmount: confirmation.trueNetSwapAmount,
@@ -249,23 +228,17 @@ export class SwapService {
       const walletAddress = await this.walletService.getAddress(userId);
       if (!walletAddress) throw new Error('Wallet not found');
 
-      // ─── ATF→TON: FUND GAS FROM ADMIN WALLET ─────────────────────────────
       if (!isTonToAtf && confirmation.gasTon && confirmation.txParams) {
         const gasNano = BigInt(Math.round(parseFloat(confirmation.gasTon) * 1e9));
-        
-        // Ensure admin wallet is initialized
         await this.adminWallet.initialize();
-        
-        // Check admin has enough TON
+
         const adminBalance = await this.adminWallet.getBalance();
         if (adminBalance < gasNano) {
           throw new Error('Platform gas treasury temporarily low. Please try again later.');
         }
 
-        // Admin sends gas TON to user wallet
         const gasTxHash = await this.adminWallet.sendTon(walletAddress, gasNano);
-        
-        // Log gas funding
+
         await Transaction.create({
           userId: user._id,
           type: 'fee_transfer',
@@ -281,11 +254,9 @@ export class SwapService {
           },
         });
 
-        // Small delay to ensure gas arrives (or use polling)
         await new Promise(r => setTimeout(r, 3000));
       }
 
-      // Execute swap via STON.fi
       const offerAddress = isTonToAtf ? 'ton' : config.atfJettonAddress;
       const askAddress = isTonToAtf ? config.atfJettonAddress : 'ton';
 
@@ -307,13 +278,11 @@ export class SwapService {
       tx.toAddress = swapParams.to.toString();
       await tx.save();
 
-      // Process platform fee (1%) to admin wallet
       this.transferFee(userId, feeBase, isTonToAtf ? 'TON' : 'ATF', tx._id.toString())
         .catch(err => console.error('Fee transfer async error:', err));
 
       return tx._id.toString();
     } catch (error) {
-      // Rollback user balance on any failure
       user[balanceKey] = Precision.add(BigInt(user[balanceKey]), amountBase).toString();
       await user.save();
 
@@ -367,4 +336,4 @@ export class SwapService {
     }
   }
       }
-    
+        
