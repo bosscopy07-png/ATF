@@ -28,8 +28,8 @@ export function mainMenuKeyboard(isAdmin: boolean): TelegramBot.InlineKeyboardMa
 export function swapPairKeyboard(): TelegramBot.InlineKeyboardMarkup {
   return {
     inline_keyboard: [
-      [{ text: '💎 TON → 🪙 AFT', callback_data: 'swap_ton_aft' }],
-      [{ text: '🪙 AFT → 💎 TON', callback_data: 'swap_aft_ton' }],
+      [{ text: '💎 TON → 🪙 ATF', callback_data: 'swap_ton_atf' }],
+      [{ text: '🪙 ATF → 💎 TON', callback_data: 'swap_atf_ton' }],
       [{ text: '⬅️ Back', callback_data: 'back_main' }],
     ],
   };
@@ -48,13 +48,13 @@ export function depositKeyboard(): TelegramBot.InlineKeyboardMarkup {
   return {
     inline_keyboard: [
       [{ text: '💎 Deposit TON', callback_data: 'deposit_ton' }],
-      [{ text: '🪙 Deposit AFT', callback_data: 'deposit_aft' }],
+      [{ text: '🪙 Deposit ATF', callback_data: 'deposit_atf' }],
       [{ text: '⬅️ Back', callback_data: 'back_main' }],
     ],
   };
 }
 
-export function depositTonScreen(address: string): TelegramBot.InlineKeyboardMarkup {
+export function depositTonScreen(): TelegramBot.InlineKeyboardMarkup {
   return {
     inline_keyboard: [
       [{ text: '🔄 Check Deposit', callback_data: 'check_deposit_ton' }],
@@ -63,10 +63,10 @@ export function depositTonScreen(address: string): TelegramBot.InlineKeyboardMar
   };
 }
 
-export function depositAftScreen(): TelegramBot.InlineKeyboardMarkup {
+export function depositAtfScreen(): TelegramBot.InlineKeyboardMarkup {
   return {
     inline_keyboard: [
-      [{ text: '🔄 Check Deposit', callback_data: 'check_deposit_aft' }],
+      [{ text: '🔄 Check Deposit', callback_data: 'check_deposit_atf' }],
       [{ text: '⬅️ Back', callback_data: 'deposit' }],
     ],
   };
@@ -76,7 +76,7 @@ export function withdrawAssetKeyboard(): TelegramBot.InlineKeyboardMarkup {
   return {
     inline_keyboard: [
       [{ text: '💎 TON', callback_data: 'withdraw_ton' }],
-      [{ text: '🪙 AFT', callback_data: 'withdraw_aft' }],
+      [{ text: '🪙 ATF', callback_data: 'withdraw_atf' }],
       [{ text: '⬅️ Back', callback_data: 'back_main' }],
     ],
   };
@@ -188,7 +188,7 @@ export function helpKeyboard(): TelegramBot.InlineKeyboardMarkup {
 export function userListKeyboard(users: any[], page: number): TelegramBot.InlineKeyboardMarkup {
   const rows = users.map(u => [
     { text: `${u.firstName || 'User'} (${u.telegramId})`, callback_data: `admin_user_${u.telegramId}` },
-  ]);
+  ]) as TelegramBot.InlineKeyboardButton[][];
 
   const nav: TelegramBot.InlineKeyboardButton[] = [];
   if (page > 1) nav.push({ text: '◀️', callback_data: `admin_users_page_${page - 1}` });
@@ -213,4 +213,5 @@ export function userActionKeyboard(telegramId: number, isFrozen: boolean): Teleg
       [{ text: '⬅️ Back', callback_data: 'admin_users' }],
     ],
   };
-}
+       }
+  
