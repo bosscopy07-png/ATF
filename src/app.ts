@@ -119,7 +119,7 @@ async function startServer(): Promise<void> {
     res.status(allHealthy ? 200 : 503).json({
       status: allHealthy ? 'ok' : 'degraded',
       timestamp: new Date().toISOString(),
-      version: config.version || '1.0.0',
+      version: '1.0.0',
       mode: 'server',
       services,
     });
@@ -307,4 +307,4 @@ bootstrap().catch((error) => {
   console.error('[Bootstrap] Unhandled bootstrap error:', error);
   process.exit(1);
 });
-        
+                
