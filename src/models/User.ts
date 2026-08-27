@@ -9,7 +9,7 @@ export interface IUser extends Document {
   isSuperAdmin: boolean;
   isFrozen: boolean;
   tonBalance: string; // base units as string
-  aftBalance: string; // base units as string
+  atfBalance: string; // base units as string
   state: string;
   stateData: Record<string, any>;
   createdAt: Date;
@@ -26,7 +26,7 @@ const UserSchema = new Schema<IUser>(
     isSuperAdmin: { type: Boolean, default: false },
     isFrozen: { type: Boolean, default: false },
     tonBalance: { type: String, default: '0' },
-    aftBalance: { type: String, default: '0' },
+    atfBalance: { type: String, default: '0' },
     state: { type: String, default: 'idle' },
     stateData: { type: Schema.Types.Mixed, default: {} },
   },
