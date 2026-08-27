@@ -40,6 +40,8 @@ export const config = {
   aftJettonAddress: requireEnv('AFT_JETTON_ADDRESS'),
   
   adminFeeWalletAddress: requireEnv('ADMIN_FEE_WALLET_ADDRESS'),
+  adminWalletMnemonic: process.env.ADMIN_WALLET_MNEMONIC || '',
+  
   platformSwapFeePercent: requireEnvNumber('PLATFORM_SWAP_FEE_PERCENT', 1),
   minSwapTon: requireEnvNumber('MIN_SWAP_TON', 0.1),
   maxSlippagePercent: requireEnvNumber('MAX_SLIPPAGE_PERCENT', 1.0),
@@ -52,4 +54,4 @@ export const config = {
 };
 
 export const TON_DECIMALS = 9;
-export const AFT_DECIMALS = 9; // Will be validated from chain at runtime
+export const AFT_DECIMALS = 9;
