@@ -100,18 +100,16 @@ export async function showMainMenu(userId: number, chatId: number): Promise<void
     `❄️ <code>${Precision.formatDisplay(tonBalance)}</code> TON`,
     tonPrice ? `💵 ≈ $${tonUsd}` : '',
     ' ',                           // ← blank line
-    ' ',                           // ← extra breathing room between sections
     '🪙 <b>ATF Balance</b>',
     ' ',                           // ← blank line
     `⚡ <code>${Precision.formatDisplay(atfBalance)}</code> ATF`,
     atfPrice ? `💵 ≈ $${atfUsd}` : '',
     ' ',                           // ← blank line
-    ' ',                           // ← extra breathing room
     '━━━━━━━━━━━━━━━',
     ' ',                           // ← blank line
     atfPrice ? `📈 ATF Price: <code>$${atfPrice.price.toFixed(6)}</code>` : '',
     ' ',                           // ← blank line
-    ' ',                           // ← breathing room before CTA
+                      
     '<i>Choose an action below 👇</i>',
   ].filter(Boolean).join('\n');
 
