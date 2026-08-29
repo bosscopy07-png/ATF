@@ -84,39 +84,46 @@ export async function showMainMenu(userId: number, chatId: number): Promise<void
     priceService.getTonPriceUsd(),
   ]);
 
-  const atfUsd = atfPrice ? priceService.convertCryptoToUsd(atfBalance, atfPrice.price, ATF_DECIMALS) : '—';
-  const tonUsd = tonPrice ? priceService.convertCryptoToUsd(tonBalance, tonPrice.price, TON_DECIMALS) : '—';
+  const atfUsd = atfPrice 
+    ? priceService.convertCryptoToUsd(atfBalance, atfPrice.price, ATF_DECIMALS) 
+    : '—';
+    
+  const tonUsd = tonPrice 
+    ? priceService.convertCryptoToUsd(tonBalance, tonPrice.price, TON_DECIMALS) 
+    : '—';
 
   const caption = [
     '🏠 <b>ATFSWAP</b> 🎗️',
     '',
-    
-    `💎 <b>TON</b> 🌊`,
-    
-    `${Precision.formatDisplay(tonBalance)} TON ❄️`,
-    atfPrice ? `≈ $${atfUsd}` : '',
     '',
-    
-    `🪙 <b>ATF</b> 💱`,
-    
-    `${Precision.formatDisplay(atfBalance)} ATF ⚡`,
-    atfPrice ? `≈ $${atfUsd}` : '',
+    '💎 <b>TON Balance</b>',
     '',
-    
-    '━━━━━━━━━━━━',
-    atfPrice ? `📈 ATF <code>$${atfPrice.price.toFixed(6)}</code>` : '',
+    `❄️ <code>${Precision.formatDisplay(tonBalance)}</code> TON`,
+    tonPrice ? `💵 ≈ $${tonUsd}` : '',
     '',
-    
-    'Choose an action:',
+    '',
+    '🪙 <b>ATF Balance</b>',
+    '',
+    `⚡ <code>${Precision.formatDisplay(atfBalance)}</code> ATF`,
+    atfPrice ? `💵 ≈ $${atfUsd}` : '',
+    '',
+    '',
+    '━━━━━━━━━━━━━━━',
+    '',
+    atfPrice ? `📈 ATF Price: <code>$${atfPrice.price.toFixed(6)}</code>` : '',
+    '',
+    '',
+    '<i>Choose an action below 👇</i>',
   ].filter(Boolean).join('\n');
 
   await messageManager.showScreen(
     userId,
     chatId,
     caption,
-    keyboards.mainMenuKeyboard(user?.isAdmin || false)
+    keyboards.mainMenuKeyboard(!!user?.isAdmin)
   );
 }
+
 
 // ─── START COMMAND ─────────────────────────────────────────────────────────────
 
