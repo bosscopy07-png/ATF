@@ -4,7 +4,7 @@
   "description": "TON ↔ ATF Custodial Exchange Telegram Bot",
   "main": "dist/app.js",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/copy-admin-dashboard.js",
     "start": "node dist/app.js",
     "dev:server": "APP_MODE=server ts-node src/app.ts",
     "dev:worker": "APP_MODE=worker ts-node src/app.ts"
