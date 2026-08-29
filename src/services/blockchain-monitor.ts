@@ -19,7 +19,7 @@ function parseTransferNotification(body: Cell): {
     const slice = body.beginParse();
     const opcode = slice.loadUint(32);
     if (opcode !== 0x7362d09c) return null;
-    const queryId = slice.loadUint(64);
+    const queryId = BigInt(slice.loadUint(64));
     const amount = slice.loadCoins();
     const sender = slice.loadAddress();
     return { opcode, queryId, amount, sender };
@@ -257,5 +257,5 @@ export class BlockchainMonitor {
       }
     }
   }
-    }
-      
+          }
+                                            
