@@ -1,6 +1,7 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { config } from '../config';
 import { setBot, handleStart, handleCallback, handleText } from './handlers';
+import { setDepositBot } from '../services/deposit-service';
 
 let botInstance: TelegramBot;
 
@@ -16,6 +17,7 @@ export async function startBot(): Promise<void> {
   const bot = new TelegramBot(config.telegramBotToken, { polling: true });
   setBotInstance(bot);
   setBot(bot);
+  setDepositBot(bot); // ← INJECTED: so deposit-service can send notifications
 
   bot.on('message', (msg) => {
     if (msg.text === '/start') {
