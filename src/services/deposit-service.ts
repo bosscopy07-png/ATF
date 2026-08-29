@@ -1,12 +1,20 @@
 import { TonClient, Address, Cell } from '@ton/ton';
 import { JettonMaster } from '@ton/ton';
+import TelegramBot from 'node-telegram-bot-api';
 import { User } from '../models/User';
 import { Wallet } from '../models/Wallet';
 import { Transaction } from '../models/Transaction';
 import { Precision } from '../utils/precision';
-import { config } from '../config';
+import { config, TON_DECIMALS, ATF_DECIMALS } from '../config';
 
 const PROCESSED_TXS = new Set<string>();
+const MAX_PROCESSED_CACHE = 10_000;
+
+let botInstance: TelegramBot | null = null;
+
+export function setDepositBot(bot: TelegramBot): void {
+  botInstance = bot;
+}
 
 function parseTransferNotification(body: Cell): {
   opcode: number;
@@ -90,7 +98,9 @@ export class DepositService {
       const user = await User.findById(walletDoc.userId);
       if (!user) continue;
 
-      user.tonBalance = Precision.add(BigInt(user.tonBalance), amount).toString();
+      const displayAmount = Precision.fromBaseUnits(amount, TON_DECIMALS);
+      const newBalance = Precision.add(BigInt(user.tonBalance || '0'), amount).toString();
+      user.tonBalance = newBalance;
       await user.save();
 
       await Transaction.create({
@@ -102,9 +112,16 @@ export class DepositService {
         txHash,
         toAddress: walletDoc.address,
         fromAddress: getInternalMessageSource(tx),
+        metadata: {
+          lt: tx.lt?.toString(),
+          blockTime: tx.now ? new Date(tx.now * 1000).toISOString() : undefined,
+        },
       });
 
       PROCESSED_TXS.add(uniqueId);
+      this.trimProcessedCache();
+
+      await this.notifyDeposit(user.telegramId, 'TON', displayAmount, txHash);
     }
   }
 
@@ -148,7 +165,9 @@ export class DepositService {
         const user = await User.findById(walletDoc.userId);
         if (!user) continue;
 
-        user.atfBalance = Precision.add(BigInt(user.atfBalance), notification.amount).toString();
+        const displayAmount = Precision.fromBaseUnits(notification.amount, ATF_DECIMALS);
+        const newBalance = Precision.add(BigInt(user.atfBalance || '0'), notification.amount).toString();
+        user.atfBalance = newBalance;
         await user.save();
 
         await Transaction.create({
@@ -163,13 +182,50 @@ export class DepositService {
           metadata: {
             queryId: notification.queryId.toString(),
             jettonWallet: expectedJettonWallet.toString(),
+            lt: tx.lt?.toString(),
+            blockTime: tx.now ? new Date(tx.now * 1000).toISOString() : undefined,
           },
         });
 
         PROCESSED_TXS.add(uniqueId);
+        this.trimProcessedCache();
+
+        await this.notifyDeposit(user.telegramId, 'ATF', displayAmount, txHash);
       }
     } catch (error) {
       console.error('ATF deposit check error:', error);
     }
   }
-}
+
+  private trimProcessedCache(): void {
+    if (PROCESSED_TXS.size > MAX_PROCESSED_CACHE) {
+      const toDelete = PROCESSED_TXS.size - MAX_PROCESSED_CACHE;
+      let i = 0;
+      for (const key of PROCESSED_TXS) {
+        if (i >= toDelete) break;
+        PROCESSED_TXS.delete(key);
+        i++;
+      }
+    }
+  }
+
+  private async notifyDeposit(telegramId: number, asset: string, amount: string, txHash: string): Promise<void> {
+    if (!botInstance || !telegramId) return;
+
+    try {
+      const shortHash = txHash.slice(0, 6) + '…' + txHash.slice(-4);
+      const message = [
+        `✅ <b>Deposit Received</b>`,
+        ``,
+        `Asset: <b>${asset}</b>`,
+        `Amount: <b>${Precision.formatDisplay(amount)} ${asset}</b>`,
+        `Tx: <code>${shortHash}</code>`,
+      ].join('\n');
+
+      await botInstance.sendMessage(telegramId, message, { parse_mode: 'HTML' });
+    } catch (err) {
+      console.error(`Failed to notify user ${telegramId} about deposit:`, err);
+    }
+  }
+      }
+          
