@@ -11,6 +11,12 @@ const BATCH_SIZE = 50;
 const RPC_RETRY_ATTEMPTS = 3;
 const RPC_RETRY_DELAY_MS = 1_000;
 
+// ─── Utilities ─────────────────────────────────────────────────────────────
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // ─── Types ─────────────────────────────────────────────────────────────────
 
 interface ReconcileMetrics {
@@ -123,7 +129,7 @@ class OnChainVerifier {
       } catch (error) {
         lastError = error as Error;
         if (i < attempts - 1) {
-          await delay(RPC_RETRY_DELAY_MS * Math.pow(2, i)); // exponential backoff
+          await delay(RPC_RETRY_DELAY_MS * Math.pow(2, i));
         }
       }
     }
@@ -147,7 +153,7 @@ class ReconciliationService {
   async start(): Promise<void> {
     if (this.timer) return;
 
-    console.log('[Reconciler] Starting...');
+    console.log('[Reconciler] Started');
     await this.tick();
 
     this.timer = setInterval(() => {
@@ -178,22 +184,25 @@ class ReconciliationService {
     };
 
     try {
-      await Promise.all([
-        this.reconcileSwaps(metrics),
-        this.reconcileWithdrawals(metrics),
-        this.reconcileFeeTransfers(metrics),
-        this.reconcileDeposits(metrics),
-      ]);
+      // Run sequentially to avoid MongoDB session contention
+      await this.reconcileSwaps(metrics).catch((e) => console.error('[Reconciler] Swaps error:', e));
+      await this.reconcileWithdrawals(metrics).catch((e) => console.error('[Reconciler] Withdrawals error:', e));
+      await this.reconcileFeeTransfers(metrics).catch((e) => console.error('[Reconciler] Fee transfers error:', e));
+      await this.reconcileDeposits(metrics).catch((e) => console.error('[Reconciler] Deposits error:', e));
     } catch (error) {
       console.error('[Reconciler] Fatal tick error:', error);
     } finally {
       this.isRunning = false;
       const duration = Date.now() - startTime;
-      console.log(
-        `[Reconciler] Tick complete in ${duration}ms: ` +
-          `processed=${metrics.processed}, confirmed=${metrics.confirmed}, ` +
-          `failed=${metrics.failed}, recovered=${metrics.feesRecovered}, skipped=${metrics.skipped}`
-      );
+
+      // Only log when there is actual activity — stops empty spam
+      if (metrics.processed > 0 || metrics.confirmed > 0 || metrics.failed > 0 || metrics.feesRecovered > 0) {
+        console.log(
+          `[Reconciler] Tick complete in ${duration}ms: ` +
+            `processed=${metrics.processed}, confirmed=${metrics.confirmed}, ` +
+            `failed=${metrics.failed}, recovered=${metrics.feesRecovered}, skipped=${metrics.skipped}`
+        );
+      }
     }
   }
 
@@ -221,7 +230,6 @@ class ReconciliationService {
       const session = await mongoose.startSession();
       try {
         await session.withTransaction(async () => {
-          // Re-fetch with session lock to prevent race conditions
           const lockedSwap = await Transaction.findOne(
             { _id: swap._id, status: { $in: ['pending', 'processing'] } },
             null,
@@ -243,7 +251,6 @@ class ReconciliationService {
           } else if (verified === 'failed') {
             await this.failSwap(lockedSwap, session, metrics);
           }
-          // If pending: do nothing, wait for next tick
         });
       } catch (error) {
         await this.handleSwapError(swap, error as Error, metrics);
@@ -258,7 +265,6 @@ class ReconciliationService {
     session: ClientSession,
     metrics: ReconcileMetrics
   ): Promise<void> {
-    // Idempotency: already completed?
     if (swap.status === 'completed') return;
 
     const user = await User.findById(swap.userId).session(session);
@@ -268,17 +274,14 @@ class ReconciliationService {
     const outputAsset = meta?.swapDirection === 'ton_to_atf' ? 'atfBalance' : 'tonBalance';
     const outputAmount = BigInt(meta?.expectedOutput || '0');
 
-    // Atomic credit
     user[outputAsset] = Precision.add(BigInt(user[outputAsset] || '0'), outputAmount).toString();
     await user.save({ session });
 
-    // Update swap
     swap.status = 'completed';
     swap.reconciledAt = new Date();
     await swap.save({ session });
     metrics.confirmed++;
 
-    // Finalize gas funding tx if present
     if (meta?.gasTon) {
       await Transaction.updateMany(
         {
@@ -291,7 +294,6 @@ class ReconciliationService {
       );
     }
 
-    // Handle fee
     if (swap.feeStatus === 'pending' || swap.feeStatus === 'processing') {
       const feeTx = await Transaction.findOne({
         type: 'fee_transfer',
@@ -370,7 +372,6 @@ class ReconciliationService {
     const inputAsset = meta?.swapDirection === 'ton_to_atf' ? 'tonBalance' : 'atfBalance';
     const inputAmount = BigInt(swap.amount || '0');
 
-    // Idempotency: check if already rolled back
     if (swap.metadata?.rolledBack) return;
 
     user[inputAsset] = Precision.add(BigInt(user[inputAsset] || '0'), inputAmount).toString();
@@ -420,8 +421,12 @@ class ReconciliationService {
 
     for (const tx of pending) {
       if (this.shuttingDown) break;
+      metrics.processed++;
 
-      if (!tx.txHash) continue;
+      if (!tx.txHash) {
+        metrics.skipped++;
+        continue;
+      }
 
       const session = await mongoose.startSession();
       try {
@@ -431,7 +436,10 @@ class ReconciliationService {
             null,
             { session }
           );
-          if (!lockedTx) return;
+          if (!lockedTx) {
+            metrics.skipped++;
+            return;
+          }
 
           const verified = await this.verifier.verifyTransaction(
             lockedTx.txHash!,
@@ -442,9 +450,11 @@ class ReconciliationService {
             lockedTx.status = 'completed';
             lockedTx.reconciledAt = new Date();
             await lockedTx.save({ session });
+            metrics.confirmed++;
             console.log(`[Reconciler] Withdrawal ${tx._id} confirmed`);
           } else if (verified === 'failed') {
             await this.rollbackWithdrawal(lockedTx, session);
+            metrics.failed++;
           }
         });
       } catch (error) {
@@ -462,7 +472,6 @@ class ReconciliationService {
     const balanceKey = tx.asset === 'TON' ? 'tonBalance' : 'atfBalance';
     const amount = BigInt(tx.amount || '0');
 
-    // Check if already rolled back
     if (tx.metadata?.rolledBack) return;
 
     user[balanceKey] = Precision.add(BigInt(user[balanceKey] || '0'), amount).toString();
@@ -490,7 +499,12 @@ class ReconciliationService {
 
     for (const tx of pending) {
       if (this.shuttingDown) break;
-      if (!tx.txHash) continue;
+      metrics.processed++;
+
+      if (!tx.txHash) {
+        metrics.skipped++;
+        continue;
+      }
 
       const session = await mongoose.startSession();
       try {
@@ -500,7 +514,10 @@ class ReconciliationService {
             null,
             { session }
           );
-          if (!lockedTx) return;
+          if (!lockedTx) {
+            metrics.skipped++;
+            return;
+          }
 
           const verified = await this.verifier.verifyTransaction(
             lockedTx.txHash!,
@@ -511,6 +528,7 @@ class ReconciliationService {
             lockedTx.status = 'completed';
             lockedTx.reconciledAt = new Date();
             await lockedTx.save({ session });
+            metrics.confirmed++;
 
             if (lockedTx.metadata?.swapTxId) {
               await Transaction.findByIdAndUpdate(
@@ -524,6 +542,7 @@ class ReconciliationService {
             lockedTx.status = 'failed';
             lockedTx.metadata = { ...lockedTx.metadata, onChainFailure: true };
             await lockedTx.save({ session });
+            metrics.failed++;
             console.log(`[Reconciler] Fee transfer ${tx._id} failed`);
           }
         });
@@ -549,6 +568,7 @@ class ReconciliationService {
 
     for (const tx of orphaned) {
       if (this.shuttingDown) break;
+      metrics.processed++;
 
       await Transaction.findByIdAndUpdate(tx._id, {
         $set: {
@@ -560,12 +580,6 @@ class ReconciliationService {
       console.log(`[Reconciler] Orphaned deposit ${tx._id} marked failed`);
     }
   }
-}
-
-// ─── Utilities ─────────────────────────────────────────────────────────────
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // ─── Bootstrap ─────────────────────────────────────────────────────────────
@@ -595,8 +609,4 @@ process.on('SIGTERM', async () => {
   await mongoose.disconnect();
   process.exit(0);
 });
-
-if (require.main === module) {
-  startReconciler().catch(console.error);
-        }
-        
+  
