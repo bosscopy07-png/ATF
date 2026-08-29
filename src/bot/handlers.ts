@@ -92,7 +92,7 @@ export async function showMainMenu(userId: number, chatId: number): Promise<void
     '',
     `💎 <b>TON</b>`,
     `${Precision.formatDisplay(tonBalance)} TON`,
-    atfPrice ? `≈ $${tonUsd}` : '',
+    atfPrice ? `≈ $${atfUsd}` : '',
     '',
     `🪙 <b>ATF</b>`,
     `${Precision.formatDisplay(atfBalance)} ATF`,
@@ -316,7 +316,6 @@ export async function handleCallback(query: TelegramBot.CallbackQuery): Promise<
     return;
   }
 }
-
 // ─── SWAP FLOW ─────────────────────────────────────────────────────────────────
 
 async function showSwapPair(userId: number, chatId: number): Promise<void> {
@@ -561,7 +560,7 @@ async function showDepositTon(userId: number, chatId: number): Promise<void> {
     '⚠️ <i>Only send TON to this address.</i>',
   ].join('\n');
 
-  await messageManager.showScreen(userId, chatId, caption, keyboards.depositTonScreen(wallet.address));
+  await messageManager.showScreen(userId, chatId, caption, keyboards.depositTonScreen());
 }
 
 async function showDepositAtf(userId: number, chatId: number): Promise<void> {
@@ -724,7 +723,6 @@ async function executeWithdrawal(userId: number, chatId: number): Promise<void> 
     );
   }
 }
-
 // ─── ACCOUNT / DASHBOARD ───────────────────────────────────────────────────────
 
 async function showAccount(userId: number, chatId: number): Promise<void> {
@@ -809,7 +807,7 @@ async function exportWallet(userId: number, chatId: number): Promise<void> {
       `<code>${mnemonicPhrase}</code>`,
       '',
       '⚠️ Delete this message immediately after saving.',
-    ].join('\n');
+  ].join('\n');
 
     await messageManager.showText(userId, chatId, caption, keyboards.backKeyboard('account'));
 
@@ -925,9 +923,7 @@ export async function handleText(msg: TelegramBot.Message): Promise<void> {
 
   // Delete user message immediately
   try {
-    if (botInstance) {
-      await botInstance.deleteMessage(chatId, msg.message_id);
-    }
+    await messageManager.deleteUserMessage(chatId, msg.message_id);
   } catch {
     // ignore deletion errors
   }
@@ -1074,7 +1070,6 @@ async function handleGiveAdmin(userId: number, chatId: number, text: string): Pr
     keyboards.backKeyboard('admin_management')
   );
 }
-
 
 async function startRemoveAdmin(userId: number, chatId: number): Promise<void> {
   try {
@@ -1311,4 +1306,4 @@ async function showSystemSettings(userId: number, chatId: number): Promise<void>
   } catch {
     await showMainMenu(userId, chatId);
   }
-                                                             }
+                                  }
