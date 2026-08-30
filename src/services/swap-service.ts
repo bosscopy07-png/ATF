@@ -52,21 +52,27 @@ export class SwapService {
     const outputDecimals = isTonToAtf ? ATF_DECIMALS : TON_DECIMALS;
     const amountBase = Precision.toBaseUnits(request.amount, inputDecimals);
 
-    if (isTonToAtf) {
-      const minBase = Precision.toBaseUnits(config.minSwapTon.toString(), TON_DECIMALS);
-      if (Precision.isLessThan(amountBase, minBase)) {
-        throw new Error(`Minimum swap amount is ${config.minSwapTon} TON`);
-      }
-    }
-
     const balanceKey = isTonToAtf ? 'tonBalance' : 'atfBalance';
-    const currentBalance = BigInt(user[balanceKey]);
+    const currentBalance = BigInt(user[balanceKey] || '0');
     if (Precision.isLessThan(currentBalance, amountBase)) {
       throw new Error('Insufficient balance');
     }
 
     const feeBase = Precision.calculateFee(amountBase, config.platformSwapFeePercent);
     let netSwapBase = Precision.subtract(amountBase, feeBase);
+
+    // ─── Minimum validation (check NET amount, not gross) ──────────────
+    if (isTonToAtf) {
+      const minBase = Precision.toBaseUnits(config.minSwapTon.toString(), TON_DECIMALS);
+      if (Precision.isLessThan(netSwapBase, minBase)) {
+        throw new Error(`Minimum swap amount is ${config.minSwapTon} TON (after fees)`);
+      }
+    } else {
+      // ATF → TON: ensure something remains after fee
+      if (netSwapBase <= BigInt(0)) {
+        throw new Error('Amount too small after platform fee');
+      }
+    }
 
     let gasTon: string | undefined;
     let gasAtfEquivalentBase = BigInt(0);
@@ -187,7 +193,7 @@ export class SwapService {
     }
 
     const balanceKey = isTonToAtf ? 'tonBalance' : 'atfBalance';
-    const currentBalance = BigInt(user[balanceKey]);
+    const currentBalance = BigInt(user[balanceKey] || '0');
 
     if (Precision.isLessThan(currentBalance, amountBase)) {
       throw new Error('Insufficient balance');
@@ -283,7 +289,7 @@ export class SwapService {
 
       return tx._id.toString();
     } catch (error) {
-      user[balanceKey] = Precision.add(BigInt(user[balanceKey]), amountBase).toString();
+      user[balanceKey] = Precision.add(BigInt(user[balanceKey] || '0'), amountBase).toString();
       await user.save();
 
       tx.status = 'failed';
@@ -335,5 +341,5 @@ export class SwapService {
       console.error('Fee transfer failed:', error);
     }
   }
-      }
-        
+    }
+          
