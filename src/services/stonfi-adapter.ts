@@ -22,6 +22,14 @@ export interface SwapTxParams {
   gasTon: string;
 }
 
+// STON.fi wrapped-TON (pTON) master on mainnet.
+// If you run on testnet, swap this for the testnet pTON address.
+const PTON_MASTER_ADDRESS = config.ptonMasterAddress || 'EQCM3B12QK1e4yZSf8GtBRT0aLMNyEsCtD_WgIhfw2JTP_0';
+
+function resolveTonAddress(address: string): string {
+  return address.toLowerCase() === 'ton' ? PTON_MASTER_ADDRESS : address;
+}
+
 export class STONFiAdapter {
   private apiClient: StonApiClient;
   private tonClient: TonClient;
@@ -40,28 +48,38 @@ export class STONFiAdapter {
     offerUnits: string,
     slippageTolerance: string = '0.01'
   ): Promise<SwapQuote> {
-    const result = await this.apiClient.simulateSwap({
-      offerAddress,
-      askAddress,
-      offerUnits,
-      slippageTolerance,
-    }) as any; // Cast due to API type variations
+    try {
+      const result = await this.apiClient.simulateSwap({
+        offerAddress: resolveTonAddress(offerAddress),
+        askAddress: resolveTonAddress(askAddress),
+        offerUnits,
+        slippageTolerance,
+      }) as any;
 
-    // STON.fi API returns router info differently across versions
-    const routerAddress = result.routerAddress || result.router?.address || '';
-    const ptonMasterAddress = result.ptonMasterAddress || result.router?.ptonMasterAddress || '';
+      const routerAddress = result.routerAddress || result.router?.address || '';
+      const ptonMasterAddress = result.ptonMasterAddress || result.router?.ptonMasterAddress || PTON_MASTER_ADDRESS;
 
-    return {
-      offerUnits: result.offerUnits,
-      askUnits: result.askUnits,
-      minAskUnits: result.minAskUnits,
-      feeUnits: result.feeUnits || '0',
-      slippageTolerance,
-      routerAddress,
-      ptonMasterAddress,
-      route: result.route || routerAddress,
-      expiresAt: new Date(Date.now() + 30000),
-    };
+      return {
+        offerUnits: result.offerUnits,
+        askUnits: result.askUnits,
+        minAskUnits: result.minAskUnits,
+        feeUnits: result.feeUnits || '0',
+        slippageTolerance,
+        routerAddress,
+        ptonMasterAddress,
+        route: result.route || routerAddress,
+        expiresAt: new Date(Date.now() + 30000),
+      };
+    } catch (error: any) {
+      const apiMsg = error?.response?.data?.message || error?.response?.data?.error || '';
+      if (apiMsg) {
+        throw new Error(`STON.fi API: ${apiMsg}`);
+      }
+      if (error?.message?.includes('400')) {
+        throw new Error('Swap amount too small or trading pair unavailable on STON.fi');
+      }
+      throw error;
+    }
   }
 
   async buildSwapTransaction(
@@ -131,4 +149,4 @@ export class STONFiAdapter {
       queryId,
     });
   }
-}
+          }
