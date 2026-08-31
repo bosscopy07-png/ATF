@@ -23,8 +23,13 @@ export interface SwapTxParams {
 }
 
 // STON.fi wrapped-TON (pTON) master on mainnet.
-// Override via env if you run on testnet.
+// If you are on testnet, set PTON_MASTER_ADDRESS in your .env.
 const PTON_MASTER_ADDRESS = process.env.PTON_MASTER_ADDRESS || 'EQCM3B12QK1e4yZSf8GtBRT0aLMNyEsCtD_WgIhfw2JTP_0';
+
+// The API simulateSwap needs real addresses. "ton" is not valid there.
+function resolveApiAddress(address: string): string {
+  return address.toLowerCase() === 'ton' ? PTON_MASTER_ADDRESS : address;
+}
 
 export class STONFiAdapter {
   private apiClient: StonApiClient;
@@ -46,8 +51,8 @@ export class STONFiAdapter {
   ): Promise<SwapQuote> {
     try {
       const result = await this.apiClient.simulateSwap({
-        offerAddress,
-        askAddress,
+        offerAddress: resolveApiAddress(offerAddress),
+        askAddress: resolveApiAddress(askAddress),
         offerUnits,
         slippageTolerance,
       }) as any;
@@ -67,24 +72,17 @@ export class STONFiAdapter {
         expiresAt: new Date(Date.now() + 30000),
       };
     } catch (error: any) {
-      // Log the full STON.fi response so you can debug in server logs
       const status = error?.response?.status;
       const data = error?.response?.data;
-      const apiMsg = data?.message || data?.error || data?.detail || JSON.stringify(data) || '';
-      const reqInfo = `${offerUnits} units (${offerAddress} → ${askAddress})`;
+      // The STON.fi client sometimes throws the request object as the message
+      const apiMsg = typeof data === 'string' ? data : (data?.message || data?.error || data?.detail || JSON.stringify(data || {}));
+      const reqInfo = `${offerUnits} units (${resolveApiAddress(offerAddress)} → ${resolveApiAddress(askAddress)})`;
 
       console.error(`[STON.fi] getQuote failed | status=${status} | req=[${reqInfo}] | response=`, data || error?.message);
 
       if (status === 400) {
-        if (apiMsg && apiMsg.toLowerCase().includes('minimum')) {
-          throw new Error(`Swap amount below STON.fi pool minimum. Try a larger amount. [${reqInfo}]`);
-        }
-        if (apiMsg && (apiMsg.toLowerCase().includes('pair') || apiMsg.toLowerCase().includes('pool') || apiMsg.toLowerCase().includes('route'))) {
-          throw new Error(`Trading pair not found on STON.fi. Ensure a TON/ATF liquidity pool exists. [${reqInfo}]`);
-        }
-        throw new Error(`Swap amount too small or pair unavailable on STON.fi. [${reqInfo}] | API: ${apiMsg}`);
+        throw new Error(`STON.fi rejected the swap. Amount too small, pool missing, or pair not listed. [${reqInfo}] | API: ${apiMsg}`);
       }
-
       throw new Error(`STON.fi request failed: ${apiMsg || error?.message} [${reqInfo}]`);
     }
   }
@@ -112,6 +110,7 @@ export class STONFiAdapter {
       minAskAmount: quote.minAskUnits,
     };
 
+    // SDK uses "ton" sentinel to pick the native-TON swap method
     const isTonToJetton = offerAddress.toLowerCase() === 'ton';
     const isJettonToTon = askAddress.toLowerCase() === 'ton';
     let rawParams: any;
@@ -157,4 +156,4 @@ export class STONFiAdapter {
     });
   }
   }
-    
+        
