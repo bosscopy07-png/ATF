@@ -45,8 +45,6 @@ export class STONFiAdapter {
     slippageTolerance: string = '0.01'
   ): Promise<SwapQuote> {
     try {
-      // Pass 'ton' literally — the API recognizes it as native TON.
-      // Do NOT convert to pTON here; the API routes native TON, not the pTON jetton.
       const result = await this.apiClient.simulateSwap({
         offerAddress,
         askAddress,
@@ -55,7 +53,6 @@ export class STONFiAdapter {
       }) as any;
 
       const routerAddress = result.routerAddress || result.router?.address || '';
-      // API may not return pTON address when native TON is used, so fallback.
       const ptonMasterAddress = result.ptonMasterAddress || result.router?.ptonMasterAddress || PTON_MASTER_ADDRESS;
 
       return {
@@ -70,16 +67,25 @@ export class STONFiAdapter {
         expiresAt: new Date(Date.now() + 30000),
       };
     } catch (error: any) {
-      const apiMsg = error?.response?.data?.message || error?.response?.data?.error || '';
+      // Log the full STON.fi response so you can debug in server logs
+      const status = error?.response?.status;
+      const data = error?.response?.data;
+      const apiMsg = data?.message || data?.error || data?.detail || JSON.stringify(data) || '';
       const reqInfo = `${offerUnits} units (${offerAddress} → ${askAddress})`;
 
-      if (apiMsg) {
-        throw new Error(`STON.fi: ${apiMsg} [${reqInfo}]`);
+      console.error(`[STON.fi] getQuote failed | status=${status} | req=[${reqInfo}] | response=`, data || error?.message);
+
+      if (status === 400) {
+        if (apiMsg && apiMsg.toLowerCase().includes('minimum')) {
+          throw new Error(`Swap amount below STON.fi pool minimum. Try a larger amount. [${reqInfo}]`);
+        }
+        if (apiMsg && (apiMsg.toLowerCase().includes('pair') || apiMsg.toLowerCase().includes('pool') || apiMsg.toLowerCase().includes('route'))) {
+          throw new Error(`Trading pair not found on STON.fi. Ensure a TON/ATF liquidity pool exists. [${reqInfo}]`);
+        }
+        throw new Error(`Swap amount too small or pair unavailable on STON.fi. [${reqInfo}] | API: ${apiMsg}`);
       }
-      if (error?.response?.status === 400) {
-        throw new Error(`Swap amount too small, pool unavailable, or invalid pair. [${reqInfo}]`);
-      }
-      throw new Error(`STON.fi request failed: ${error?.message || error} [${reqInfo}]`);
+
+      throw new Error(`STON.fi request failed: ${apiMsg || error?.message} [${reqInfo}]`);
     }
   }
 
@@ -150,5 +156,5 @@ export class STONFiAdapter {
       queryId,
     });
   }
- }
- 
+  }
+    
