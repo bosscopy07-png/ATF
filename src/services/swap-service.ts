@@ -29,7 +29,6 @@ export interface SwapConfirmation {
   trueNetSwapAmount?: string;
 }
 
-/** provisional hash avoids null collisions on unique {txHash, type} indexes */
 function provisionalTxHash(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -48,9 +47,7 @@ export class SwapService {
   }
 
   async prepareSwap(request: SwapRequest): Promise<SwapConfirmation> {
-    if (!config.atfJettonAddress) {
-      throw new Error('ATF jetton address not configured');
-    }
+    if (!config.atfJettonAddress) throw new Error('ATF jetton address not configured');
 
     const user = await User.findOne({ telegramId: request.userId });
     if (!user) throw new Error('User not found');
@@ -181,9 +178,7 @@ export class SwapService {
     confirmation: SwapConfirmation,
     direction: 'ton_to_atf' | 'atf_to_ton'
   ): Promise<string> {
-    if (!config.atfJettonAddress) {
-      throw new Error('ATF jetton address not configured');
-    }
+    if (!config.atfJettonAddress) throw new Error('ATF jetton address not configured');
 
     const user = await User.findOne({ telegramId: userId });
     if (!user) throw new Error('User not found');
@@ -211,13 +206,15 @@ export class SwapService {
     }
 
     let tx: any;
+    let deducted = false;
 
     try {
       // 1. Debit balance
       user[balanceKey] = Precision.subtract(currentBalance, amountBase).toString();
       await user.save();
+      deducted = true;
 
-      // 2. Create swap record with provisional hash (null would violate unique index)
+      // 2. Create swap record (provisional hash avoids null unique-index collisions)
       tx = await Transaction.create({
         userId: user._id,
         type: 'swap',
@@ -251,7 +248,7 @@ export class SwapService {
       if (!walletAddress) throw new Error('Wallet not found');
 
       // 3. Fund gas for ATF -> TON swaps
-      if (!isTonToAtf && confirmation.gasTon && confirmation.txParams) {
+      if (!isTonToAtf && confirmation.gasTon) {
         const gasNano = BigInt(Math.round(parseFloat(confirmation.gasTon) * 1e9));
         await this.adminWallet.initialize();
 
@@ -280,47 +277,54 @@ export class SwapService {
         await new Promise(r => setTimeout(r, 3000));
       }
 
-      // 4. Build & broadcast swap
+      // 4. REBUILD swap params fresh — NEVER use confirmation.txParams from stateData
+      //    (MongoDB stateData corrupts Address objects and Cell bodies)
       const offerAddress = isTonToAtf ? 'ton' : config.atfJettonAddress;
       const askAddress = isTonToAtf ? config.atfJettonAddress : 'ton';
 
-      const swapParams = confirmation.txParams || await this.stonfi.buildSwapTransaction(
+      const swapParams = await this.stonfi.buildSwapTransaction(
         walletAddress,
         confirmation.quote,
         offerAddress,
         askAddress
       );
 
-      // IMPORTANT: STON.fi requires the swap payload (body) to be sent with the TON.
-      // If your WalletService.sendTon only accepts 3 args, add a 4th `body` parameter
-      // or use a dedicated sendTransaction method. The `as any` below bypasses the
-      // type-checker so the payload is included at runtime.
+      // 5. Broadcast swap
+      // IMPORTANT: Your WalletService.sendTon MUST accept a 4th `body` argument
+      // and forward it to the TON transfer. If it doesn't, the STON.fi swap
+      // payload will be lost and the swap will fail on-chain.
       const txHash = await (this.walletService as any).sendTon(
         userId,
-        swapParams.to.toString(),
+        swapParams.to,                 // now a safe string
         BigInt(swapParams.value.toString()),
-        swapParams.body
+        swapParams.body                // STON.fi swap payload (Cell)
       );
 
       tx.txHash = txHash;
       tx.status = 'processing';
-      tx.toAddress = swapParams.to.toString();
+      tx.toAddress = swapParams.to;
       await tx.save();
 
+      // 6. Async fee transfer
       this.transferFee(userId, feeBase, isTonToAtf ? 'TON' : 'ATF', tx._id.toString())
         .catch(err => console.error('Fee transfer async error:', err));
 
       return tx._id.toString();
     } catch (error) {
-      // Rollback balance on ANY failure
-      try {
-        const currentUser = await User.findById(user._id);
-        if (currentUser) {
-          currentUser[balanceKey] = Precision.add(BigInt(currentUser[balanceKey] || '0'), amountBase).toString();
-          await currentUser.save();
+      // Only rollback if we actually deducted
+      if (deducted) {
+        try {
+          const currentUser = await User.findById(user._id);
+          if (currentUser) {
+            currentUser[balanceKey] = Precision.add(
+              BigInt(currentUser[balanceKey] || '0'),
+              amountBase
+            ).toString();
+            await currentUser.save();
+          }
+        } catch (rollbackErr) {
+          console.error('[SwapService] Balance rollback failed:', rollbackErr);
         }
-      } catch (rollbackErr) {
-        console.error('[SwapService] Balance rollback failed:', rollbackErr);
       }
 
       if (tx) {
@@ -377,4 +381,5 @@ export class SwapService {
       console.error('Fee transfer failed:', error);
     }
   }
-}
+              }
+    
