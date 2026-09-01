@@ -18,22 +18,13 @@ export interface SwapQuote {
 }
 
 export interface SwapTxParams {
-  to: Address;
+  to: string;           // ← CHANGED: string, not Address object
   value: bigint;
-  body: any;
+  body: any;            // Cell from STON.fi SDK
   gasTon: string;
 }
 
-/*
- * STON.fi uses this specific address to represent native TON/GRAM
- * in the simulateSwap REST API. Do NOT use "ton" or pTON here.
- */
 const NATIVE_API_ADDRESS: string = 'EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c';
-
-/*
- * pTON proxy master address used by the SDK when building
- * actual swap transactions.
- */
 const PTON_MASTER_ADDRESS: string = 'EQCM3B12QK1e4yZSf8GtBRT0aLMNyEsCtD_WgIhfw2JTP_0';
 
 function normalizeAsset(address: string): string {
@@ -41,22 +32,31 @@ function normalizeAsset(address: string): string {
 }
 
 function isNativeGram(address: string): boolean {
-  const normalized = normalizeAsset(address).toLowerCase();
+  const n = normalizeAsset(address).toLowerCase();
   return (
-    normalized === 'gram' ||
-    normalized === 'ton' ||
-    normalized === 'native' ||
-    normalized === 'native-gram' ||
-    normalized === 'native-ton' ||
-    normalized === NATIVE_API_ADDRESS.toLowerCase()
+    n === 'gram' ||
+    n === 'ton' ||
+    n === 'native' ||
+    n === 'native-gram' ||
+    n === 'native-ton' ||
+    n === NATIVE_API_ADDRESS.toLowerCase()
   );
 }
 
 function toApiAssetAddress(address: string): string {
-  if (isNativeGram(address)) {
-    return NATIVE_API_ADDRESS;
+  return isNativeGram(address) ? NATIVE_API_ADDRESS : normalizeAsset(address);
+}
+
+/** Safely extract address string from STON.fi SDK response */
+function extractAddress(raw: any): string {
+  if (typeof raw === 'string') return raw;
+  if (raw instanceof Address) return raw.toString();
+  if (raw?.toString && typeof raw.toString === 'function') {
+    const s = raw.toString();
+    if (s !== '[object Object]') return s;
   }
-  return normalizeAsset(address);
+  if (raw?.address) return String(raw.address);
+  throw new Error(`Cannot extract address from: ${JSON.stringify(raw)}`);
 }
 
 export class STONFiAdapter {
@@ -107,16 +107,10 @@ export class STONFiAdapter {
         slippageTolerance,
       }) as any;
 
-      if (!result) {
-        throw new Error('STON.fi returned an empty simulation response');
-      }
+      if (!result) throw new Error('STON.fi returned an empty simulation response');
 
-      const routerAddress: string =
-        result.routerAddress || result.router_address || '';
-
-      if (!routerAddress) {
-        throw new Error('STON.fi simulation did not return a router address');
-      }
+      const routerAddress: string = result.routerAddress || result.router_address || '';
+      if (!routerAddress) throw new Error('STON.fi simulation did not return a router address');
 
       const ptonMasterAddress: string =
         result.router?.ptonMasterAddress ||
@@ -129,12 +123,8 @@ export class STONFiAdapter {
       const minAskUnits = String(result.minAskUnits ?? result.min_ask_units ?? '');
       const feeUnits = String(result.feeUnits ?? result.fee_units ?? '0');
 
-      if (!askUnits) {
-        throw new Error('STON.fi simulation did not return askUnits');
-      }
-      if (!minAskUnits) {
-        throw new Error('STON.fi simulation did not return minAskUnits');
-      }
+      if (!askUnits) throw new Error('STON.fi simulation did not return askUnits');
+      if (!minAskUnits) throw new Error('STON.fi simulation did not return minAskUnits');
 
       return {
         offerAddress: apiOfferAddress,
@@ -152,8 +142,8 @@ export class STONFiAdapter {
     } catch (error: any) {
       const status = error?.response?.status ?? error?.status;
       const responseData = error?.response?.data ?? error?.data;
-
       let apiMessage = '';
+
       if (typeof responseData === 'string') {
         apiMessage = responseData;
       } else if (responseData && typeof responseData === 'object') {
@@ -164,28 +154,24 @@ export class STONFiAdapter {
           responseData.reason ||
           JSON.stringify(responseData);
       }
-      if (!apiMessage) {
-        apiMessage = error?.message || 'Unknown STON.fi error';
-      }
+      if (!apiMessage) apiMessage = error?.message || 'Unknown STON.fi error';
 
       console.error(
-        `[STON.fi] getQuote failed | status=${status} | ` +
-          `pair=${apiOfferAddress}->${apiAskAddress} | amount=${offerUnits} | ` +
-          `response=`,
+        `[STON.fi] getQuote failed | status=${status} | pair=${apiOfferAddress}->${apiAskAddress} | amount=${offerUnits} | response=`,
         responseData || error?.message
       );
 
       if (status === 400) {
         throw new Error(
           `STON.fi rejected the swap (HTTP 400). ` +
-            `Pair: ${apiOfferAddress} -> ${apiAskAddress}. ` +
-            `Amount: ${offerUnits}. API: ${apiMessage}`
+          `Pair: ${apiOfferAddress} -> ${apiAskAddress}. ` +
+          `Amount: ${offerUnits}. API: ${apiMessage}`
         );
       }
       throw new Error(
         `STON.fi request failed. ` +
-          `Pair: ${apiOfferAddress} -> ${apiAskAddress}. ` +
-          `API: ${apiMessage}`
+        `Pair: ${apiOfferAddress} -> ${apiAskAddress}. ` +
+        `API: ${apiMessage}`
       );
     }
   }
@@ -199,12 +185,8 @@ export class STONFiAdapter {
     const offer = normalizeAsset(offerAddress);
     const ask = normalizeAsset(askAddress);
 
-    if (!userWalletAddress) {
-      throw new Error('User wallet address is required');
-    }
-    if (!quote.routerAddress) {
-      throw new Error('Swap quote is missing router address');
-    }
+    if (!userWalletAddress) throw new Error('User wallet address is required');
+    if (!quote.routerAddress) throw new Error('Swap quote is missing router address');
 
     const ptonMasterAddress: string = quote.ptonMasterAddress || PTON_MASTER_ADDRESS;
 
@@ -222,9 +204,7 @@ export class STONFiAdapter {
     const nativeOffer = isNativeGram(offer);
     const nativeAsk = isNativeGram(ask);
 
-    if (nativeOffer && nativeAsk) {
-      throw new Error('Cannot build GRAM to GRAM swap');
-    }
+    if (nativeOffer && nativeAsk) throw new Error('Cannot build GRAM to GRAM swap');
 
     const sharedParams = {
       userWalletAddress,
@@ -266,7 +246,7 @@ export class STONFiAdapter {
     const gasTon = `${whole}.${remainder.toString().padStart(9, '0')}`;
 
     return {
-      to: Address.parse(rawParams.to.toString()),
+      to: extractAddress(rawParams.to),   // ← safe string extraction
       value: valueNano,
       body: rawParams.body,
       gasTon,
@@ -280,5 +260,5 @@ export class STONFiAdapter {
 
     return this.apiClient.getSwapStatus({ routerAddress, ownerAddress, queryId });
   }
-      }
-      
+  }
+  
