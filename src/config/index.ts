@@ -41,6 +41,25 @@ function requireEnvNumber(
   return num;
 }
 
+/*
+ * STON.fi canonical native TON/GRAM asset address.
+ *
+ * This is what must be sent to STON.fi's API.
+ */
+export const NATIVE_GRAM_ADDRESS =
+  'EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c';
+
+/*
+ * STON.fi pTON master.
+ *
+ * This is NOT the native asset address.
+ * It is used by the SDK when constructing
+ * native GRAM/TON swap transactions.
+ */
+export const PTON_MASTER_ADDRESS =
+  process.env.PTON_MASTER_ADDRESS ||
+  'EQCM3B12QK1e4yZSf8GtBRT0aLMNyEsCtD_WgIhfw2JTP_0';
+
 export const config = {
   nodeEnv:
     process.env.NODE_ENV ||
@@ -83,9 +102,6 @@ export const config = {
       'ENCRYPTION_KEY'
     ),
 
-  /*
-   * Blockchain
-   */
   tonNetwork:
     process.env.TON_NETWORK ||
     'mainnet',
@@ -99,9 +115,6 @@ export const config = {
     process.env.TON_API_KEY ||
     undefined,
 
-  /*
-   * STON.fi
-   */
   stonfiApiUrl:
     process.env.STONFI_API_URL ||
     'https://api.ston.fi',
@@ -111,34 +124,25 @@ export const config = {
     undefined,
 
   /*
-   * Native GRAM/TON is represented as "ton"
-   * when communicating with the STON.fi API.
-   *
-   * GRAM is the application-facing name.
+   * Application-facing name is GRAM.
+   * STON.fi-facing representation is
+   * NATIVE_GRAM_ADDRESS.
    */
   nativeAsset:
     process.env.NATIVE_ASSET ||
-    'ton',
+    'gram',
 
-  /*
-   * pTON is ONLY used while constructing
-   * native-asset swap transactions.
-   */
+  nativeGramAddress:
+    NATIVE_GRAM_ADDRESS,
+
   ptonMasterAddress:
-    process.env.PTON_MASTER_ADDRESS ||
-    'EQCM3B12QK1e4yZSf8GtBRT0aLMNyEsCtD_WgIhfw2JTP_0',
+    PTON_MASTER_ADDRESS,
 
-  /*
-   * ATF
-   */
   atfJettonAddress:
     requireEnv(
       'ATF_JETTON_ADDRESS'
     ),
 
-  /*
-   * Wallet / fees
-   */
   adminFeeWalletAddress:
     requireEnv(
       'ADMIN_FEE_WALLET_ADDRESS'
@@ -166,17 +170,11 @@ export const config = {
       1.0
     ),
 
-  /*
-   * Branding
-   */
   botBrandingImageUrl:
     requireEnv(
       'BOT_BRANDING_IMAGE_URL'
     ),
 
-  /*
-   * Price APIs
-   */
   atfPriceApiUrl:
     process.env.ATF_PRICE_API_URL ||
     'https://api.ston.fi/v1/assets/EQANcW45W0Tp91bzvHayaPO6-6hf1Lm4XlWZ4rN6L5ofPWdb',
@@ -189,9 +187,6 @@ export const config = {
     process.env.USD_NGN_RATE_API_URL ||
     'https://api.frankfurter.dev/v2/rate/USD/NGN?providers=CBN',
 
-  /*
-   * Render
-   */
   renderExternalUrl:
     process.env.RENDER_EXTERNAL_URL ||
     '',
