@@ -20,6 +20,10 @@ export interface WithdrawalPreview {
   receiveAmount: string;
 }
 
+function provisionalTxHash(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 export class WithdrawalService {
   private walletService: WalletService;
 
@@ -44,7 +48,7 @@ export class WithdrawalService {
     }
 
     const balanceKey = request.asset === 'TON' ? 'tonBalance' : 'atfBalance';
-    const currentBalance = BigInt(user[balanceKey]);
+    const currentBalance = BigInt(user[balanceKey] || '0');
 
     if (Precision.isLessThan(currentBalance, amountBase)) {
       throw new Error('Insufficient balance');
@@ -80,39 +84,73 @@ export class WithdrawalService {
     const amountBase = Precision.toBaseUnits(request.amount, decimals);
 
     const balanceKey = request.asset === 'TON' ? 'tonBalance' : 'atfBalance';
-    const currentBalance = BigInt(user[balanceKey]);
+    const currentBalance = BigInt(user[balanceKey] || '0');
 
     if (Precision.isLessThan(currentBalance, amountBase)) {
       throw new Error('Insufficient balance');
     }
 
-    user[balanceKey] = Precision.subtract(currentBalance, amountBase).toString();
-    await user.save();
+    const networkCostBase = request.asset === 'TON'
+      ? Precision.toBaseUnits('0.005', TON_DECIMALS)
+      : Precision.toBaseUnits('0.05', TON_DECIMALS);
 
-    const tx = await Transaction.create({
-      userId: user._id,
-      type: 'withdrawal',
-      asset: request.asset,
-      amount: amountBase.toString(),
-      status: 'processing',
-      toAddress: request.toAddress,
-      metadata: {
-        requestedAmount: request.amount,
-        destination: request.toAddress,
-      },
-    });
+    const sendBase = request.asset === 'TON'
+      ? Precision.subtract(amountBase, networkCostBase)
+      : amountBase;
+
+    if (sendBase <= BigInt(0)) {
+      throw new Error('Amount too small to cover network costs');
+    }
+
+    const walletAddress = await this.walletService.getAddress(request.userId);
+    if (!walletAddress) throw new Error('Wallet not found');
+
+    // Verify on-chain balance before broadcasting
+    const { ton: onChainTon } = await this.walletService.getBalance(walletAddress);
+
+    if (request.asset === 'TON' && onChainTon < amountBase) {
+      throw new Error('On-chain TON balance insufficient. Funds may be pending or already spent.');
+    }
+    if (request.asset === 'ATF' && onChainTon < networkCostBase) {
+      throw new Error('Custodial wallet lacks TON for gas. Deposit TON to this wallet first.');
+    }
+
+    let tx: any;
+    let deducted = false;
 
     try {
+      // Debit internal balance
+      user[balanceKey] = Precision.subtract(currentBalance, amountBase).toString();
+      await user.save();
+      deducted = true;
+
+      tx = await Transaction.create({
+        userId: user._id,
+        type: 'withdrawal',
+        asset: request.asset,
+        amount: amountBase.toString(),
+        status: 'processing',
+        toAddress: request.toAddress,
+        txHash: provisionalTxHash('withdrawal'),
+        metadata: {
+          requestedAmount: request.amount,
+          destination: request.toAddress,
+          networkCost: Precision.fromBaseUnits(networkCostBase, TON_DECIMALS),
+          sendAmount: Precision.fromBaseUnits(sendBase, decimals),
+        },
+      });
+
       let txHash: string;
 
       if (request.asset === 'TON') {
-        txHash = await this.walletService.sendTon(request.userId, request.toAddress, amountBase);
+        // Send receive amount; 0.005 TON stays in wallet for gas
+        txHash = await this.walletService.sendTon(request.userId, request.toAddress, sendBase);
       } else {
         txHash = await this.walletService.sendJetton(
           request.userId,
           request.toAddress,
-          config.atfJettonAddress,
-          amountBase
+          config.atfJettonAddress!,
+          sendBase
         );
       }
 
@@ -122,15 +160,30 @@ export class WithdrawalService {
 
       return tx._id.toString();
     } catch (error) {
-      user[balanceKey] = Precision.add(BigInt(user[balanceKey]), amountBase).toString();
-      await user.save();
+      if (deducted) {
+        try {
+          const currentUser = await User.findById(user._id);
+          if (currentUser) {
+            currentUser[balanceKey] = Precision.add(
+              BigInt(currentUser[balanceKey] || '0'),
+              amountBase
+            ).toString();
+            await currentUser.save();
+          }
+        } catch (rollbackErr) {
+          console.error('[WithdrawalService] Balance rollback failed:', rollbackErr);
+        }
+      }
 
-      tx.status = 'failed';
-      tx.metadata.error = (error as Error).message;
-      await tx.save();
+      if (tx) {
+        try {
+          tx.status = 'failed';
+          tx.metadata = { ...tx.metadata, error: (error as Error).message };
+          await tx.save();
+        } catch {}
+      }
 
       throw error;
     }
   }
-      }
-      
+}
