@@ -155,6 +155,17 @@ export class WalletService {
     );
 
     await this.client.sendExternalMessage(opened, transfer);
+
+    // Wait for inclusion and return the REAL on-chain tx hash
+    await new Promise(r => setTimeout(r, 1500));
+    try {
+      const txs = await this.client.getTransactions(opened.address, { limit: 3 });
+      if (txs.length > 0) {
+        return txs[0].hash().toString('hex');
+      }
+    } catch (e) {
+      console.error('Failed to fetch tx hash after sendTon:', e);
+    }
     return `${walletDoc.address}_${seqno}`;
   }
 
@@ -175,18 +186,17 @@ export class WalletService {
     const opened = this.client.open(walletContract);
     const seqno = await opened.getSeqno();
 
-    // CRITICAL FIX: send transfer message to the USER'S jetton wallet, NOT the master
     const userJettonWallet = await this.deriveJettonWallet(walletDoc.address, jettonMasterAddress);
 
     const transferBody = beginCell()
-      .storeUint(0xf8a7ea5, 32)        // op::transfer
-      .storeUint(Date.now(), 64)       // query_id
+      .storeUint(0xf8a7ea5, 32)
+      .storeUint(Date.now(), 64)
       .storeCoins(amount)
       .storeAddress(destination)
-      .storeAddress(ownerAddress)      // response_destination
-      .storeUint(0, 1)                // custom_payload: null
-      .storeCoins(toNano('0.001'))     // forward_ton_amount
-      .storeUint(0, 1)                // forward_payload: null
+      .storeAddress(ownerAddress)
+      .storeUint(0, 1)
+      .storeCoins(toNano('0.001'))
+      .storeUint(0, 1)
       .endCell();
 
     const transfer = this.signer.signTransfer(
@@ -195,7 +205,7 @@ export class WalletService {
       keyPair.secretKey,
       [
         internal({
-          to: userJettonWallet,        // ← FIXED
+          to: userJettonWallet,
           value: toNano('0.05'),
           bounce: true,
           body: transferBody,
@@ -204,6 +214,16 @@ export class WalletService {
     );
 
     await this.client.sendExternalMessage(opened, transfer);
+
+    await new Promise(r => setTimeout(r, 1500));
+    try {
+      const txs = await this.client.getTransactions(opened.address, { limit: 3 });
+      if (txs.length > 0) {
+        return txs[0].hash().toString('hex');
+      }
+    } catch (e) {
+      console.error('Failed to fetch tx hash after sendJetton:', e);
+    }
     return `${walletDoc.address}_jetton_${seqno}_${Date.now()}`;
   }
 
@@ -216,4 +236,4 @@ export class WalletService {
     const master = this.client.open(JettonMaster.create(Address.parse(jettonMasterAddress)));
     return master.getWalletAddress(Address.parse(ownerAddress));
   }
- }
+  }
