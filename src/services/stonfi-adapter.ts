@@ -5,7 +5,11 @@ import {
   Address,
 } from '@ton/ton';
 
-import { config } from '../config';
+import {
+  config,
+  NATIVE_GRAM_ADDRESS,
+  PTON_MASTER_ADDRESS,
+} from '../config';
 
 export interface SwapQuote {
   offerAddress: string;
@@ -35,80 +39,88 @@ export interface SwapTxParams {
 }
 
 /*
- * STON.fi API uses "ton" for the native blockchain asset.
+ * Canonical STON.fi native GRAM/TON address.
  *
- * The application may call it GRAM.
+ * IMPORTANT:
+ * This is used for API simulation.
  *
- * DO NOT send the pTON master address to simulateSwap()
- * when the user is swapping the native asset.
+ * Do NOT use:
+ *
+ *   "ton"
+ *   "gram"
+ *   pTON master
+ *
+ * in simulateSwap().
  */
-const NATIVE_ASSET =
-  config.nativeAsset || 'ton';
+const NATIVE_ASSET_ADDRESS =
+  NATIVE_GRAM_ADDRESS;
 
-const PTON_MASTER_ADDRESS =
-  config.ptonMasterAddress;
-
-/**
- * Normalize an asset identifier.
+/*
+ * pTON is used only by the SDK when
+ * constructing the actual transaction.
  */
-function normalizeAddress(
+const PTON_MASTER =
+  PTON_MASTER_ADDRESS;
+
+function normalizeAsset(
   address: string
 ): string {
   return address.trim();
 }
 
 /**
- * Detect native GRAM.
+ * Determines whether the supplied application
+ * asset identifier represents native GRAM.
  *
- * Supports:
+ * Supports old and new application naming:
+ *
  *   gram
  *   ton
  *   native
  *   native-gram
  *   native-ton
  *
- * This keeps compatibility with older parts
- * of the application.
+ * Also accepts the canonical STON.fi address.
  */
 function isNativeGram(
   address: string
 ): boolean {
-  const value =
-    normalizeAddress(address)
+  const normalized =
+    normalizeAsset(address)
       .toLowerCase();
 
   return (
-    value === 'gram' ||
-    value === 'ton' ||
-    value === 'native' ||
-    value === 'native-gram' ||
-    value === 'native-ton'
+    normalized === 'gram' ||
+    normalized === 'ton' ||
+    normalized === 'native' ||
+    normalized === 'native-gram' ||
+    normalized === 'native-ton' ||
+    normalized ===
+      NATIVE_ASSET_ADDRESS.toLowerCase()
   );
 }
 
 /**
- * Convert the application's native asset
- * representation to the STON.fi API representation.
+ * Convert application asset identifiers
+ * into STON.fi API asset addresses.
  *
- * IMPORTANT:
- *
- * Native GRAM/TON -> "ton"
- *
+ * GRAM -> canonical native TON address
  * Jetton -> unchanged address
  */
 function toApiAssetAddress(
   address: string
 ): string {
-  if (isNativeGram(address)) {
-    return NATIVE_ASSET;
+  if (
+    isNativeGram(address)
+  ) {
+    return NATIVE_ASSET_ADDRESS;
   }
 
-  return normalizeAddress(address);
+  return normalizeAsset(address);
 }
 
 export class STONFiAdapter {
   private readonly apiClient: StonApiClient;
-
   private readonly tonClient: TonClient;
 
   constructor() {
@@ -129,17 +141,10 @@ export class STONFiAdapter {
   }
 
   /**
-   * Get a STON.fi swap quote.
+   * Simulate a swap through STON.fi.
    *
-   * Example:
-   *
-   * GRAM -> ATF
-   *
-   * application:
-   *   gram -> ATF_ADDRESS
-   *
-   * STON.fi:
-   *   ton -> ATF_ADDRESS
+   * Native GRAM is translated to the canonical
+   * TON address before calling simulateSwap().
    */
   async getQuote(
     offerAddress: string,
@@ -148,12 +153,12 @@ export class STONFiAdapter {
     slippageTolerance: string = '0.01'
   ): Promise<SwapQuote> {
     const offer =
-      normalizeAddress(
+      normalizeAsset(
         offerAddress
       );
 
     const ask =
-      normalizeAddress(
+      normalizeAsset(
         askAddress
       );
 
@@ -181,8 +186,6 @@ export class STONFiAdapter {
     /*
      * Validate slippage.
      *
-     * STON.fi expects decimal representation:
-     *
      * 0.01 = 1%
      * 0.005 = 0.5%
      */
@@ -202,10 +205,14 @@ export class STONFiAdapter {
     }
 
     const nativeOffer =
-      isNativeGram(offer);
+      isNativeGram(
+        offer
+      );
 
     const nativeAsk =
-      isNativeGram(ask);
+      isNativeGram(
+        ask
+      );
 
     if (
       nativeOffer &&
@@ -217,16 +224,21 @@ export class STONFiAdapter {
     }
 
     /*
-     * CRITICAL FIX:
+     * THIS IS THE IMPORTANT FIX.
      *
-     * Native GRAM is sent to STON.fi as "ton".
+     * The API expects an address.
      *
-     * It is NOT replaced with:
+     * For native GRAM:
      *
-     * EQCM3B12...
+     * gram -> EQAAAAAAAA...AM9c
      *
-     * That address is pTON and is only required
-     * later when constructing the transaction.
+     * NOT:
+     *
+     * gram -> "ton"
+     *
+     * and NOT:
+     *
+     * gram -> pTON master.
      */
     const apiOfferAddress =
       toApiAssetAddress(
@@ -250,8 +262,7 @@ export class STONFiAdapter {
 
           offerUnits,
 
-          slippageTolerance:
-            slippageTolerance,
+          slippageTolerance,
         }
       );
 
@@ -276,8 +287,7 @@ export class STONFiAdapter {
 
       /*
        * @ston-fi/api 0.14.0 returns
-       * routerAddress rather than the newer
-       * embedded router object.
+       * routerAddress.
        */
       const routerAddress =
         result.routerAddress ||
@@ -291,17 +301,19 @@ export class STONFiAdapter {
       }
 
       /*
-       * v0.14 does not reliably provide the
-       * pTON address directly in the simulation.
+       * @ston-fi/api 0.29+ can return the
+       * router object directly.
        *
-       * Use configured mainnet pTON.
+       * Your project currently uses 0.14.x,
+       * so fallback to configured pTON.
        */
       const ptonMasterAddress =
+        result.router?.ptonMasterAddress ||
         result.ptonMasterAddress ||
         result.pton_master_address ||
-        PTON_MASTER_ADDRESS;
+        PTON_MASTER;
 
-      const simulatedOfferUnits =
+      const returnedOfferUnits =
         String(
           result.offerUnits ??
           result.offer_units ??
@@ -322,6 +334,13 @@ export class STONFiAdapter {
           ''
         );
 
+      const feeUnits =
+        String(
+          result.feeUnits ??
+          result.fee_units ??
+          '0'
+        );
+
       if (!askUnits) {
         throw new Error(
           'STON.fi simulation did not return askUnits'
@@ -334,13 +353,6 @@ export class STONFiAdapter {
         );
       }
 
-      const feeUnits =
-        String(
-          result.feeUnits ??
-          result.fee_units ??
-          '0'
-        );
-
       const route =
         result.route ||
         routerAddress;
@@ -349,7 +361,7 @@ export class STONFiAdapter {
         '[STON.fi] Quote received',
         {
           offerUnits:
-            simulatedOfferUnits,
+            returnedOfferUnits,
 
           askUnits,
 
@@ -371,7 +383,7 @@ export class STONFiAdapter {
           apiAskAddress,
 
         offerUnits:
-          simulatedOfferUnits,
+          returnedOfferUnits,
 
         askUnits,
 
@@ -476,13 +488,15 @@ export class STONFiAdapter {
   }
 
   /**
-   * Build the actual swap transaction.
+   * Build the transaction after a successful quote.
    *
-   * The quote MUST already have been obtained
-   * from getQuote().
+   * For native GRAM:
    *
-   * pTON is used here only for native GRAM
-   * transaction construction.
+   * API:
+   *   canonical native address
+   *
+   * SDK:
+   *   pTON proxy contract
    */
   async buildSwapTransaction(
     userWalletAddress: string,
@@ -491,12 +505,12 @@ export class STONFiAdapter {
     askAddress: string
   ): Promise<SwapTxParams> {
     const offer =
-      normalizeAddress(
+      normalizeAsset(
         offerAddress
       );
 
     const ask =
-      normalizeAddress(
+      normalizeAsset(
         askAddress
       );
 
@@ -512,21 +526,18 @@ export class STONFiAdapter {
       );
     }
 
-    if (!quote.ptonMasterAddress) {
-      throw new Error(
-        'Swap quote is missing pTON master address'
-      );
-    }
+    const ptonMasterAddress =
+      quote.ptonMasterAddress ||
+      PTON_MASTER;
 
     /*
-     * Router information required by SDK v2.
+     * Build router configuration.
      */
     const routerInfo = {
       address:
         quote.routerAddress,
 
-      ptonMasterAddress:
-        quote.ptonMasterAddress,
+      ptonMasterAddress,
 
       majorVersion: 2,
 
@@ -567,21 +578,6 @@ export class STONFiAdapter {
       );
     }
 
-    /*
-     * pTON is required by the SDK for
-     * native GRAM transactions.
-     */
-    const proxyTon =
-      dexContracts.pTON.create(
-        quote.ptonMasterAddress ||
-        PTON_MASTER_ADDRESS
-      );
-
-    /*
-     * Never recalculate the minimum output.
-     *
-     * Use exactly what STON.fi returned.
-     */
     const sharedParams = {
       userWalletAddress,
 
@@ -601,6 +597,11 @@ export class STONFiAdapter {
       nativeOffer &&
       !nativeAsk
     ) {
+      const proxyTon =
+        dexContracts.pTON.create(
+          ptonMasterAddress
+        );
+
       rawParams =
         await router.getSwapTonToJettonTxParams({
           ...sharedParams,
@@ -619,6 +620,11 @@ export class STONFiAdapter {
       !nativeOffer &&
       nativeAsk
     ) {
+      const proxyTon =
+        dexContracts.pTON.create(
+          ptonMasterAddress
+        );
+
       rawParams =
         await router.getSwapJettonToTonTxParams({
           ...sharedParams,
@@ -664,11 +670,13 @@ export class STONFiAdapter {
       );
 
     /*
-     * Convert nanoGRAM to GRAM
-     * without losing precision.
+     * Exact nanoGRAM -> GRAM
+     * conversion without floating-point
+     * precision problems.
      */
     const whole =
-      valueNano / 1_000_000_000n;
+      valueNano /
+      1_000_000_000n;
 
     const remainder =
       valueNano %
@@ -677,7 +685,10 @@ export class STONFiAdapter {
     const gasTon =
       `${whole}.${remainder
         .toString()
-        .padStart(9, '0')}`;
+        .padStart(
+          9,
+          '0'
+        )}`;
 
     return {
       to:
@@ -696,7 +707,7 @@ export class STONFiAdapter {
   }
 
   /**
-   * Get swap execution status.
+   * Check swap status.
    */
   async getSwapStatus(
     routerAddress: string,
@@ -729,4 +740,4 @@ export class STONFiAdapter {
       queryId,
     });
   }
-          }
+}
