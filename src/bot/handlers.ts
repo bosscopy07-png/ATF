@@ -595,7 +595,7 @@ async function showDepositTon(userId: number, chatId: number): Promise<void> {
     '⏱ Deposits are credited automatically in ~3s.',
   ].join('\n');
 
-  await render(userId, chatId, caption, keyboards.depositTonScreen(wallet.address));
+  await render(userId, chatId, caption, keyboards.depositTonScreen());
 }
 
 async function showDepositAtf(userId: number, chatId: number): Promise<void> {
