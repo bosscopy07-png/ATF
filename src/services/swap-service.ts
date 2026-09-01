@@ -29,6 +29,11 @@ export interface SwapConfirmation {
   trueNetSwapAmount?: string;
 }
 
+/** provisional hash avoids null collisions on unique {txHash, type} indexes */
+function provisionalTxHash(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 export class SwapService {
   private walletService: WalletService;
   private adminWallet: AdminWalletService;
@@ -43,6 +48,10 @@ export class SwapService {
   }
 
   async prepareSwap(request: SwapRequest): Promise<SwapConfirmation> {
+    if (!config.atfJettonAddress) {
+      throw new Error('ATF jetton address not configured');
+    }
+
     const user = await User.findOne({ telegramId: request.userId });
     if (!user) throw new Error('User not found');
     if (user.isFrozen) throw new Error('Account is frozen');
@@ -61,14 +70,12 @@ export class SwapService {
     const feeBase = Precision.calculateFee(amountBase, config.platformSwapFeePercent);
     let netSwapBase = Precision.subtract(amountBase, feeBase);
 
-    // ─── Minimum validation (check NET amount, not gross) ──────────────
     if (isTonToAtf) {
       const minBase = Precision.toBaseUnits(config.minSwapTon.toString(), TON_DECIMALS);
       if (Precision.isLessThan(netSwapBase, minBase)) {
         throw new Error(`Minimum swap amount is ${config.minSwapTon} TON (after fees)`);
       }
     } else {
-      // ATF → TON: ensure something remains after fee
       if (netSwapBase <= BigInt(0)) {
         throw new Error('Amount too small after platform fee');
       }
@@ -174,6 +181,10 @@ export class SwapService {
     confirmation: SwapConfirmation,
     direction: 'ton_to_atf' | 'atf_to_ton'
   ): Promise<string> {
+    if (!config.atfJettonAddress) {
+      throw new Error('ATF jetton address not configured');
+    }
+
     const user = await User.findOne({ telegramId: userId });
     if (!user) throw new Error('User not found');
     if (user.isFrozen) throw new Error('Account is frozen');
@@ -199,41 +210,47 @@ export class SwapService {
       throw new Error('Insufficient balance');
     }
 
-    user[balanceKey] = Precision.subtract(currentBalance, amountBase).toString();
-    await user.save();
-
-    const tx = await Transaction.create({
-      userId: user._id,
-      type: 'swap',
-      asset: isTonToAtf ? 'TON' : 'ATF',
-      amount: amountBase.toString(),
-      fee: feeBase.toString(),
-      feeAsset: isTonToAtf ? 'TON' : 'ATF',
-      feePercentage: config.platformSwapFeePercent,
-      feeWallet: config.adminFeeWalletAddress,
-      feeStatus: 'pending',
-      status: 'processing',
-      metadata: {
-        swapDirection: direction,
-        inputAmount: confirmation.inputAmount,
-        platformFee: confirmation.platformFee,
-        netSwapAmount: confirmation.netSwapAmount,
-        expectedOutput: confirmation.expectedOutput,
-        minOutput: confirmation.minOutput,
-        slippage: config.maxSlippagePercent,
-        dexCosts: confirmation.dexCosts,
-        expiresAt: confirmation.expiresAt,
-        quote: confirmation.quote,
-        gasTon: confirmation.gasTon,
-        gasAtfEquivalent: confirmation.gasAtfEquivalent,
-        trueNetSwapAmount: confirmation.trueNetSwapAmount,
-      },
-    });
+    let tx: any;
 
     try {
+      // 1. Debit balance
+      user[balanceKey] = Precision.subtract(currentBalance, amountBase).toString();
+      await user.save();
+
+      // 2. Create swap record with provisional hash (null would violate unique index)
+      tx = await Transaction.create({
+        userId: user._id,
+        type: 'swap',
+        asset: isTonToAtf ? 'TON' : 'ATF',
+        amount: amountBase.toString(),
+        fee: feeBase.toString(),
+        feeAsset: isTonToAtf ? 'TON' : 'ATF',
+        feePercentage: config.platformSwapFeePercent,
+        feeWallet: config.adminFeeWalletAddress,
+        feeStatus: 'pending',
+        status: 'processing',
+        txHash: provisionalTxHash('swap'),
+        metadata: {
+          swapDirection: direction,
+          inputAmount: confirmation.inputAmount,
+          platformFee: confirmation.platformFee,
+          netSwapAmount: confirmation.netSwapAmount,
+          expectedOutput: confirmation.expectedOutput,
+          minOutput: confirmation.minOutput,
+          slippage: config.maxSlippagePercent,
+          dexCosts: confirmation.dexCosts,
+          expiresAt: confirmation.expiresAt,
+          quote: confirmation.quote,
+          gasTon: confirmation.gasTon,
+          gasAtfEquivalent: confirmation.gasAtfEquivalent,
+          trueNetSwapAmount: confirmation.trueNetSwapAmount,
+        },
+      });
+
       const walletAddress = await this.walletService.getAddress(userId);
       if (!walletAddress) throw new Error('Wallet not found');
 
+      // 3. Fund gas for ATF -> TON swaps
       if (!isTonToAtf && confirmation.gasTon && confirmation.txParams) {
         const gasNano = BigInt(Math.round(parseFloat(confirmation.gasTon) * 1e9));
         await this.adminWallet.initialize();
@@ -263,6 +280,7 @@ export class SwapService {
         await new Promise(r => setTimeout(r, 3000));
       }
 
+      // 4. Build & broadcast swap
       const offerAddress = isTonToAtf ? 'ton' : config.atfJettonAddress;
       const askAddress = isTonToAtf ? config.atfJettonAddress : 'ton';
 
@@ -273,10 +291,15 @@ export class SwapService {
         askAddress
       );
 
-      const txHash = await this.walletService.sendTon(
+      // IMPORTANT: STON.fi requires the swap payload (body) to be sent with the TON.
+      // If your WalletService.sendTon only accepts 3 args, add a 4th `body` parameter
+      // or use a dedicated sendTransaction method. The `as any` below bypasses the
+      // type-checker so the payload is included at runtime.
+      const txHash = await (this.walletService as any).sendTon(
         userId,
         swapParams.to.toString(),
-        BigInt(swapParams.value.toString())
+        BigInt(swapParams.value.toString()),
+        swapParams.body
       );
 
       tx.txHash = txHash;
@@ -289,12 +312,24 @@ export class SwapService {
 
       return tx._id.toString();
     } catch (error) {
-      user[balanceKey] = Precision.add(BigInt(user[balanceKey] || '0'), amountBase).toString();
-      await user.save();
+      // Rollback balance on ANY failure
+      try {
+        const currentUser = await User.findById(user._id);
+        if (currentUser) {
+          currentUser[balanceKey] = Precision.add(BigInt(currentUser[balanceKey] || '0'), amountBase).toString();
+          await currentUser.save();
+        }
+      } catch (rollbackErr) {
+        console.error('[SwapService] Balance rollback failed:', rollbackErr);
+      }
 
-      tx.status = 'failed';
-      tx.metadata.error = (error as Error).message;
-      await tx.save();
+      if (tx) {
+        try {
+          tx.status = 'failed';
+          tx.metadata = { ...tx.metadata, error: (error as Error).message };
+          await tx.save();
+        } catch {}
+      }
 
       throw error;
     }
@@ -317,6 +352,7 @@ export class SwapService {
         amount: feeAmount.toString(),
         status: 'processing',
         toAddress: config.adminFeeWalletAddress,
+        txHash: provisionalTxHash('fee'),
         metadata: { swapTxId },
       });
 
@@ -327,7 +363,7 @@ export class SwapService {
         txHash = await this.walletService.sendJetton(
           userId,
           config.adminFeeWalletAddress,
-          config.atfJettonAddress,
+          config.atfJettonAddress!,
           feeAmount
         );
       }
@@ -341,5 +377,4 @@ export class SwapService {
       console.error('Fee transfer failed:', error);
     }
   }
-    }
-          
+}
