@@ -105,7 +105,6 @@ export class WithdrawalService {
     const walletAddress = await this.walletService.getAddress(request.userId);
     if (!walletAddress) throw new Error('Wallet not found');
 
-    // Verify on-chain balance before broadcasting
     const { ton: onChainTon } = await this.walletService.getBalance(walletAddress);
 
     if (request.asset === 'TON' && onChainTon < amountBase) {
@@ -119,7 +118,6 @@ export class WithdrawalService {
     let deducted = false;
 
     try {
-      // Debit internal balance
       user[balanceKey] = Precision.subtract(currentBalance, amountBase).toString();
       await user.save();
       deducted = true;
@@ -143,7 +141,6 @@ export class WithdrawalService {
       let txHash: string;
 
       if (request.asset === 'TON') {
-        // Send receive amount; 0.005 TON stays in wallet for gas
         txHash = await this.walletService.sendTon(request.userId, request.toAddress, sendBase);
       } else {
         txHash = await this.walletService.sendJetton(
@@ -160,7 +157,9 @@ export class WithdrawalService {
 
       return tx._id.toString();
     } catch (error) {
-      if (deducted) {
+      const broadcasted = tx?.txHash && !tx.txHash.startsWith('withdrawal-');
+
+      if (deducted && !broadcasted) {
         try {
           const currentUser = await User.findById(user._id);
           if (currentUser) {
@@ -178,7 +177,7 @@ export class WithdrawalService {
       if (tx) {
         try {
           tx.status = 'failed';
-          tx.metadata = { ...tx.metadata, error: (error as Error).message };
+          tx.metadata = { ...tx.metadata, error: (error as Error).message, broadcasted };
           await tx.save();
         } catch {}
       }
@@ -186,4 +185,4 @@ export class WithdrawalService {
       throw error;
     }
   }
-}
+          }
