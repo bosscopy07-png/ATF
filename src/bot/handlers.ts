@@ -784,7 +784,6 @@ async function switchWallet(userId: number, chatId: number, walletId: string): P
   await toast(userId, chatId, '✅ <b>Wallet Switched</b>', keyboards.backKeyboard('account'));
   setTimeout(() => showAccount(userId, chatId), 1000);
 }
-
 async function createNewWallet(userId: number, chatId: number): Promise<void> {
   try {
     const newWallet = await walletService.createWallet(userId);
@@ -798,13 +797,219 @@ async function createNewWallet(userId: number, chatId: number): Promise<void> {
     await toast(userId, chatId, `✅ <b>New Wallet Created</b>\n\nAddress: <code>${formatAddressShort(newWallet.address)}</code>\n\nSwitched to new wallet automatically.`, keyboards.backKeyboard('account'));
     setTimeout(() => showAccount(userId, chatId), 1500);
   } catch (error: any) {
-    await toast(userId, chatId, `❌ Failed to create wallet: ${error.message}`, keyboards.backKeyboah
+    await toast(userId, chatId, `❌ Failed to create wallet: ${error.message}`, keyboards.backKeyboard('account'));
+  }
+}
 
+// ─── EXPORT WALLET ───────────────────────────────────────────────────────────
+async function showExportWarning(userId: number, chatId: number): Promise<void> {
+  await render(userId, chatId, [
+    '⚠️ <b>SECURITY WARNING</b>',
+    '',
+    'Your recovery phrase grants <b>full control</b> over this wallet.',
+    'Never share it. ATFSwap support will <b>never</b> ask for it.',
+    '',
+    'Tap <b>Reveal Phrase</b> to show your backup words.',
+  ].join('\n'), keyboards.exportWarningKeyboard());
+}
 
+async function exportWallet(userId: number, chatId: number): Promise<void> {
+  try {
+    const wallet = await getActiveWallet(userId);
+    if (!wallet) {
+      await toast(userId, chatId, '❌ No wallet found.', keyboards.backKeyboard('account'));
+      return;
+    }
 
+    const { decrypt } = await import('../utils/encryption');
+    const phrase = decrypt(wallet.encryptedMnemonic, wallet.iv, wallet.tag);
 
+    await render(userId, chatId, [
+      '🔐 <b>WALLET BACKUP</b>',
+      '',
+      `<code>${phrase}</code>`,
+      '',
+      '⚠️ <i>Delete this message immediately after saving offline.</i>',
+    ].join('\n'), keyboards.backKeyboard('account'));
 
+    await AdminAction.create({
+      adminId: userId,
+      action: 'WALLET_EXPORTED',
+      target: userId.toString(),
+      result: 'success',
+    });
+  } catch (error: any) {
+    await toast(userId, chatId, `❌ Export failed: ${error.message}`, keyboards.backKeyboard('account'));
+  }
+}
 
+// ─── IMPORT WALLET (ADDS NEW, DOES NOT REPLACE) ──────────────────────────────
+async function startImportWallet(userId: number, chatId: number): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (!user) return;
+
+  user.state = 'import_mnemonic_input';
+  await user.save();
+
+  await render(userId, chatId, [
+    '🔐 <b>IMPORT WALLET</b>',
+    '',
+    'Paste your 24-word recovery phrase below.',
+    '',
+    '<i>This will add a NEW wallet. Your existing wallets stay safe.</i>',
+  ].join('\n'), keyboards.cancelKeyboard('account'));
+}
+
+async function handleImportMnemonic(userId: number, chatId: number, text: string): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (!user || user.state !== 'import_mnemonic_input') return;
+
+  const words = text.trim().split(/\s+/);
+  if (words.length !== 24) {
+    await toast(userId, chatId, '❌ Invalid phrase. Must be exactly 24 words.', keyboards.cancelKeyboard('account'));
+    return;
+  }
+
+  try {
+    const newWallet = await walletService.importWallet(userId, text.trim());
+
+    if (newWallet) {
+      user.walletIds.push(newWallet._id);
+      user.activeWalletId = newWallet._id;
+      await user.save();
+    }
+    await clearState(userId);
+
+    await render(userId, chatId, [
+      '✅ <b>Wallet Imported</b>',
+      '',
+      `Added as Wallet ${user.walletIds.length}`,
+      `Address: <code>${formatAddressShort(newWallet.address)}</code>`,
+      '',
+      '<i>Switched to imported wallet automatically.</i>',
+    ].join('\n'), keyboards.backKeyboard('account'));
+  } catch (error: any) {
+    await toast(userId, chatId, `❌ Import failed: ${error.message}`, keyboards.cancelKeyboard('account'));
+  }
+}
+
+// ─── HISTORY ─────────────────────────────────────────────────────────────────
+async function showHistory(userId: number, chatId: number, page: number): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (!user) return;
+
+  user.lastAction = 'history';
+  await user.save();
+
+  const limit = 5;
+  const skip = (page - 1) * limit;
+
+  const txs = await Transaction.find({ userId: user._id })
+    .sort({ createdAt: -1 })
+    .skip(skip)
+    .limit(limit + 1);
+
+  const hasMore = txs.length > limit;
+  const display = hasMore ? txs.slice(0, limit) : txs;
+
+  const lines = display.map(tx => {
+    const icon = tx.type === 'deposit' ? '🟢' : tx.type === 'withdrawal' ? '🔴' : '🔄';
+    const amt = Precision.fromBaseUnits(BigInt(tx.amount), tx.asset === 'TON' ? TON_DECIMALS : ATF_DECIMALS);
+    const shortHash = tx.txHash && !tx.txHash.includes('-')
+      ? `<a href="${explorerLink(tx.txHash)}">${tx.txHash.slice(0, 6)}…${tx.txHash.slice(-4)}</a>`
+      : '…';
+    const statusIcon = tx.status === 'completed' ? '✅' : tx.status === 'pending' ? '⏳' : '❌';
+    return `${icon} <b>${tx.type.toUpperCase()}</b>  <code>${Precision.formatDisplay(amt)} ${tx.asset}</code>\n   ${statusIcon} ${tx.status}  ·  ${shortHash}`;
+  });
+
+  const caption = [
+    '📊 <b>TRANSACTION HISTORY</b>',
+    '',
+    ...(lines.length ? lines : ['<i>No transactions yet.</i>']),
+    '',
+    `Page ${page}`,
+  ].filter(Boolean).join('\n');
+
+  await render(userId, chatId, caption, keyboards.historyPaginationKeyboard(page, hasMore));
+}
+
+// ─── PRICES ────────────────────────────────────────────────────────────────────
+async function showPrices(userId: number, chatId: number): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (user) {
+    user.lastAction = 'prices';
+    await user.save();
+  }
+
+  const [atfPrice, tonPrice, ngnRate] = await Promise.all([
+    priceService.getAtfPriceUsd().catch(() => null),
+    priceService.getTonPriceUsd().catch(() => null),
+    priceService.getUsdNgnRate().catch(() => null),
+  ]);
+
+  const caption = [
+    '💵 <b>LIVE MARKET PRICES</b>',
+    '',
+    atfPrice
+      ? `🪙 <b>ATF</b>    $${atfPrice.price.toFixed(6)}\n${ngnRate ? `   🇳🇬 ₦${(atfPrice.price * ngnRate.price).toFixed(2)}` : ''}`
+      : '⚠️ ATF price unavailable',
+    '',
+    tonPrice
+      ? `💎 <b>TON</b>    $${tonPrice.price.toFixed(2)}\n${ngnRate ? `   🇳🇬 ₦${(tonPrice.price * ngnRate.price).toFixed(2)}` : ''}`
+      : '⚠️ TON price unavailable',
+    '',
+    ngnRate
+      ? `💱 <b>USD/NGN</b>    ₦${ngnRate.price.toFixed(2)}`
+      : '⚠️ NGN rate unavailable',
+  ].filter(Boolean).join('\n');
+
+  await render(userId, chatId, caption, keyboards.pricesKeyboard());
+}
+
+// ─── HELP ──────────────────────────────────────────────────────────────────────
+async function showHelp(userId: number, chatId: number): Promise<void> {
+  await render(userId, chatId, [
+    'ℹ️ <b>ATF SWAP HELP</b>',
+    '',
+    '<b>What is this?</b>',
+    'A custodial TON ↔ ATF exchange inside Telegram.',
+    '',
+    '<b>Quick Start</b>',
+    '1. Deposit TON or ATF 💰',
+    '2. Swap instantly 🔄',
+    '3. Withdraw to any TON address 💸',
+    '',
+    '<b>Commands</b>',
+    '/start — Open menu',
+    '/help  — Show this message',
+    '',
+    '<b>Fees</b>',
+    `• Swap: ${config.platformSwapFeePercent}% platform fee`,
+    '• Withdrawal: network gas only',
+    '',
+    '<b>Support</b>',
+    'Contact admin if a transaction stalls for >5 minutes.',
+  ].join('\n'), keyboards.helpKeyboard());
+}
+
+// ─── REFERRAL ──────────────────────────────────────────────────────────────────
+async function showReferral(userId: number, chatId: number): Promise<void> {
+  const count = await Referral.countDocuments({ referrerId: userId });
+  const link = `https://t.me/${config.botUsername}?start=${userId}`;
+
+  await render(userId, chatId, [
+    '🎁 <b>REFERRAL PROGRAM</b>',
+    '',
+    `Invite friends and earn rewards!`,
+    '',
+    `👥 Referred: <b>${count}</b> user${count !== 1 ? 's' : ''}`,
+    '',
+    `Your link:`,
+    `<code>${link}</code>`,
+    '',
+    '<i>Share your link. When they trade, you earn.</i>',
+  ].join('\n'), keyboards.backKeyboard('back_main'));
+      }
 
 
                 // ─── ADMIN PANEL ─────────────────────────────────────────────────────────────
@@ -1395,10 +1600,25 @@ export async function handleStats(userId: number, chatId: number): Promise<void>
     const totalUsers = await User.countDocuments();
     const totalTxs = await Transaction.countDocuments();
     const totalSwaps = await Transaction.countDocuments({ type: 'swap' });
-    const totalDe
+    const totalDeposits = await Transaction.countDocuments({ type: 'deposit' });
+    const totalWithdrawals = await Transaction.countDocuments({ type: 'withdrawal' });
 
+    const caption = [
+      '📈 <b>PLATFORM STATS</b>',
+      '',
+      `👥 Total Users: <b>${totalUsers}</b>`,
+      `📊 Total Txns: <b>${totalTxs}</b>`,
+      '',
+      `🔄 Swaps: <b>${totalSwaps}</b>`,
+      `💰 Deposits: <b>${totalDeposits}</b>`,
+      `💸 Withdrawals: <b>${totalWithdrawals}</b>`,
+    ].join('\n');
 
-
+    await render(userId, chatId, caption, keyboards.backKeyboard('admin_panel'));
+  } catch {
+    await showMainMenu(userId, chatId);
+  }
+}
 
 
   // ─── START COMMAND ─────────────────────────────────────────────────────────────
