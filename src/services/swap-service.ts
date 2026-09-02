@@ -1,4 +1,3 @@
-
 import { User } from '../models/User';
 import { Transaction } from '../models/Transaction';
 import { WalletService } from './wallet-service';
@@ -194,6 +193,7 @@ export class SwapService {
     const inputDecimals = isTonToAtf ? TON_DECIMALS : ATF_DECIMALS;
     const amountBase = Precision.toBaseUnits(confirmation.inputAmount, inputDecimals);
     const feeBase = Precision.calculateFee(amountBase, config.platformSwapFeePercent);
+    const balanceKey = isTonToAtf ? 'tonBalance' : 'atfBalance';
 
     let gasAtfBase = BigInt(0);
     if (!isTonToAtf && confirmation.gasAtfEquivalent) {
@@ -215,8 +215,8 @@ export class SwapService {
     let deducted = false;
 
     try {
-      user[balanceKey(isTonToAtf)] = Precision.subtract(
-        BigInt(user[balanceKey(isTonToAtf)] || '0'),
+      user[balanceKey] = Precision.subtract(
+        BigInt(user[balanceKey] || '0'),
         amountBase
       ).toString();
       await user.save();
@@ -331,8 +331,8 @@ export class SwapService {
         try {
           const currentUser = await User.findById(user._id);
           if (currentUser) {
-            currentUser[balanceKey(isTonToAtf)] = Precision.add(
-              BigInt(currentUser[balanceKey(isTonToAtf)] || '0'),
+            currentUser[balanceKey] = Precision.add(
+              BigInt(currentUser[balanceKey] || '0'),
               amountBase
             ).toString();
             await currentUser.save();
@@ -397,9 +397,5 @@ export class SwapService {
       console.error('Fee transfer failed:', error);
     }
   }
-}
-
-function balanceKey(isTonToAtf: boolean): string {
-  return isTonToAtf ? 'tonBalance' : 'atfBalance';
-    }
+                                    }
   
