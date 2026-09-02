@@ -9,9 +9,14 @@ export interface PriceData {
   timestamp: Date;
 }
 
+interface Provider {
+  url: string;
+  extract: (data: any) => any;
+}
+
 export class PriceService {
   private static instance: PriceService;
-  private cacheTtlMs = 60000;
+  private cacheTtlMs = config.priceCacheTtlMs || 60000;
 
   private constructor() {}
 
@@ -19,43 +24,49 @@ export class PriceService {
     if (!PriceService.instance) {
       PriceService.instance = new PriceService();
     }
-
     return PriceService.instance;
   }
 
-  private async fetchWithFallback(urls: string[]): Promise<any> {
-    for (const url of urls) {
-      if (!url) continue;
+  // ─── Low-level fetch ───────────────────────────────────────────────────────
+  private async fetchFromProvider(provider: Provider): Promise<number | null> {
+    try {
+      const response = await axios.get(provider.url, {
+        timeout: 10000,
+        headers: { Accept: 'application/json' },
+      });
+      const raw = provider.extract(response.data);
+      const price = typeof raw === 'string' ? parseFloat(raw) : raw;
 
-      try {
-        const response = await axios.get(url, {
-          timeout: 10000,
-          headers: {
-            Accept: 'application/json',
-          },
-        });
+      if (Number.isFinite(price) && price > 0) {
+        return price;
+      }
+    } catch (err: any) {
+      console.warn(`[PriceService] Failed ${provider.url}: ${err.message}`);
+    }
+    return null;
+  }
 
-        return response.data;
-      } catch {
-        continue;
+  private async fetchWithProviders(
+    providers: Provider[]
+  ): Promise<{ price: number; source: string }> {
+    for (const provider of providers) {
+      if (!provider.url) continue;
+      const price = await this.fetchFromProvider(provider);
+      if (price !== null) {
+        return { price, source: provider.url };
       }
     }
-
     throw new Error('All price providers failed');
   }
 
+  // ─── Cache wrapper ─────────────────────────────────────────────────────────
   private async getCachedOrFetch(
     asset: string,
     fetchFn: () => Promise<PriceData>
   ): Promise<PriceData | null> {
-    const cached = await PriceCache.findOne({ asset }).sort({
-      timestamp: -1,
-    });
+    const cached = await PriceCache.findOne({ asset }).sort({ timestamp: -1 });
 
-    if (
-      cached &&
-      Date.now() - cached.timestamp.getTime() < this.cacheTtlMs
-    ) {
+    if (cached && Date.now() - cached.timestamp.getTime() < this.cacheTtlMs) {
       return {
         price: cached.price,
         currency: cached.currency,
@@ -66,9 +77,8 @@ export class PriceService {
 
     try {
       const data = await fetchFn();
-
-      if (!Number.isFinite(data.price)) {
-        throw new Error(`Invalid ${asset} price received`);
+      if (!Number.isFinite(data.price) || data.price <= 0) {
+        throw new Error(`Invalid ${asset} price: ${data.price}`);
       }
 
       await PriceCache.create({
@@ -80,7 +90,8 @@ export class PriceService {
       });
 
       return data;
-    } catch {
+    } catch (err: any) {
+      console.error(`[PriceService] Fetch error for ${asset}:`, err.message);
       if (cached) {
         return {
           price: cached.price,
@@ -89,233 +100,165 @@ export class PriceService {
           timestamp: cached.timestamp,
         };
       }
-
       return null;
     }
   }
 
-  /**
-   * Get ATF price in USD.
-   *
-   * Primary source:
-   * STON.fi asset API using the ATF Jetton master address.
-   */
+  // ─── ATF / USD ─────────────────────────────────────────────────────────────
   async getAtfPriceUsd(): Promise<PriceData | null> {
     return this.getCachedOrFetch('atf_usd', async () => {
-      const atfJettonAddress =
-        'EQANcW45W0Tp91bzvHayaPO6-6hf1Lm4XlWZ4rN6L5ofPWdb';
-
-      const stonfiUrl =
+      const atfAddress = config.atfJettonAddress;
+      const primaryUrl =
         config.atfPriceApiUrl ||
-        `https://api.ston.fi/v1/assets/${atfJettonAddress}`;
+        `https://api.ston.fi/v1/assets/${atfAddress}`;
 
-      const data = await this.fetchWithFallback([stonfiUrl]);
+      const providers: Provider[] = [
+        {
+          url: primaryUrl,
+          extract: (d: any) =>
+            d?.dex_price_usd ??
+            d?.third_party_price_usd ??
+            d?.price ??
+            d?.asset?.price ??
+            d?.usd,
+        },
+        {
+          url: `https://api.ston.fi/v1/assets/${atfAddress}`,
+          extract: (d: any) =>
+            d?.dex_price_usd ?? d?.third_party_price_usd ?? d?.price,
+        },
+      ];
 
-      /*
-       * STON.fi returns the DEX USD price as dex_price_usd.
-       *
-       * Keep the additional fallbacks so the service remains
-       * compatible with another configured ATF price provider.
-       */
-      const price = parseFloat(
-        data?.dex_price_usd ??
-          data?.price ??
-          data?.usd ??
-          data?.atf?.usd ??
-          data?.third_party_price_usd
-      );
-
-      if (!Number.isFinite(price)) {
-        throw new Error('Invalid ATF USD price returned by provider');
-      }
+      const { price, source } = await this.fetchWithProviders(providers);
 
       return {
         price,
         currency: 'USD',
-        source: stonfiUrl,
+        source,
         timestamp: new Date(),
       };
     });
   }
 
-  /**
-   * Get TON price in USD.
-   *
-   * Uses configured provider first.
-   * Falls back to CoinGecko.
-   */
+  // ─── TON / USD ─────────────────────────────────────────────────────────────
   async getTonPriceUsd(): Promise<PriceData | null> {
     return this.getCachedOrFetch('ton_usd', async () => {
-      if (config.tonPriceApiUrl) {
-        const data = await this.fetchWithFallback([
-          config.tonPriceApiUrl,
-        ]);
-
-        const price = parseFloat(
-          data?.price ??
-            data?.usd ??
-            data?.ton?.usd
-        );
-
-        if (!Number.isFinite(price)) {
-          throw new Error('Invalid TON USD price returned by provider');
-        }
-
-        return {
-          price,
-          currency: 'USD',
-          source: config.tonPriceApiUrl,
-          timestamp: new Date(),
-        };
-      }
-
-      const response = await axios.get(
-        'https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd',
+      const providers: Provider[] = [
+        // 1) Configured primary
         {
-          timeout: 10000,
-          headers: {
-            Accept: 'application/json',
-          },
-        }
-      );
+          url:
+            config.tonPriceApiUrl ||
+            'https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd',
+          extract: (d: any) =>
+            d?.['the-open-network']?.usd ?? d?.price ?? d?.usd,
+        },
+        // 2) CoinGecko (explicit fallback)
+        {
+          url: 'https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd',
+          extract: (d: any) => d?.['the-open-network']?.usd,
+        },
+        // 3) Binance
+        {
+          url: 'https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT',
+          extract: (d: any) => d?.price,
+        },
+        // 4) Bybit
+        {
+          url: 'https://api.bybit.com/v5/market/tickers?category=spot&symbol=TONUSDT',
+          extract: (d: any) => d?.result?.list?.[0]?.lastPrice,
+        },
+        // 5) OKX
+        {
+          url: 'https://www.okx.com/api/v5/market/ticker?instId=TON-USDT',
+          extract: (d: any) => d?.data?.[0]?.last,
+        },
+      ];
 
-      const price = Number(
-        response.data?.['the-open-network']?.usd
-      );
-
-      if (!Number.isFinite(price)) {
-        throw new Error('Invalid TON price returned by CoinGecko');
-      }
+      const { price, source } = await this.fetchWithProviders(providers);
 
       return {
         price,
         currency: 'USD',
-        source: 'coingecko',
+        source,
         timestamp: new Date(),
       };
     });
   }
 
-  /**
-   * Get USD to NGN exchange rate.
-   *
-   * Uses configured provider first.
-   * Falls back to ExchangeRate-API.
-   */
+  // ─── USD / NGN ─────────────────────────────────────────────────────────────
   async getUsdNgnRate(): Promise<PriceData | null> {
     return this.getCachedOrFetch('usd_ngn', async () => {
-      if (config.usdNgnRateApiUrl) {
-        const data = await this.fetchWithFallback([
-          config.usdNgnRateApiUrl,
-        ]);
-
-        const price = parseFloat(
-          data?.rate ??
-            data?.ngn ??
-            data?.usd_ngn
-        );
-
-        if (!Number.isFinite(price)) {
-          throw new Error(
-            'Invalid USD/NGN rate returned by provider'
-          );
-        }
-
-        return {
-          price,
-          currency: 'NGN',
-          source: config.usdNgnRateApiUrl,
-          timestamp: new Date(),
-        };
-      }
-
-      const response = await axios.get(
-        'https://api.exchangerate-api.com/v4/latest/USD',
+      const providers: Provider[] = [
+        // 1) Configured primary
         {
-          timeout: 10000,
-          headers: {
-            Accept: 'application/json',
-          },
-        }
-      );
+          url:
+            config.usdNgnRateApiUrl ||
+            'https://api.frankfurter.dev/v2/rate/USD/NGN',
+          extract: (d: any) => d?.rate ?? d?.rates?.NGN,
+        },
+        // 2) frankfurter (explicit fallback)
+        {
+          url: 'https://api.frankfurter.dev/v2/rate/USD/NGN',
+          extract: (d: any) => d?.rate ?? d?.rates?.NGN,
+        },
+        // 3) ExchangeRate-API
+        {
+          url: 'https://api.exchangerate-api.com/v4/latest/USD',
+          extract: (d: any) => d?.rates?.NGN,
+        },
+        // 4) Open ER-API
+        {
+          url: 'https://open.er-api.com/v6/latest/USD',
+          extract: (d: any) => d?.rates?.NGN,
+        },
+      ];
 
-      const price = Number(response.data?.rates?.NGN);
-
-      if (!Number.isFinite(price)) {
-        throw new Error('Invalid USD/NGN rate returned by ExchangeRate-API');
-      }
+      const { price, source } = await this.fetchWithProviders(providers);
 
       return {
         price,
         currency: 'NGN',
-        source: 'exchangerate-api',
+        source,
         timestamp: new Date(),
       };
     });
   }
 
-  /**
-   * Convert ATF price from USD to NGN.
-   */
+  // ─── Derived: ATF → NGN ────────────────────────────────────────────────────
   async getAtfPriceNgn(): Promise<number | null> {
     const [atfUsd, usdNgn] = await Promise.all([
       this.getAtfPriceUsd(),
       this.getUsdNgnRate(),
     ]);
-
-    if (!atfUsd || !usdNgn) {
-      return null;
-    }
-
+    if (!atfUsd || !usdNgn) return null;
     return atfUsd.price * usdNgn.price;
   }
 
-  /**
-   * Convert TON price from USD to NGN.
-   */
+  // ─── Derived: TON → NGN ────────────────────────────────────────────────────
   async getTonPriceNgn(): Promise<number | null> {
     const [tonUsd, usdNgn] = await Promise.all([
       this.getTonPriceUsd(),
       this.getUsdNgnRate(),
     ]);
-
-    if (!tonUsd || !usdNgn) {
-      return null;
-    }
-
+    if (!tonUsd || !usdNgn) return null;
     return tonUsd.price * usdNgn.price;
   }
 
-  /**
-   * Convert crypto amount to USD.
-   */
-  convertCryptoToUsd(
-    amount: string,
-    priceUsd: number,
-    decimals: number
-  ): string {
+  // ─── Converters ────────────────────────────────────────────────────────────
+  convertCryptoToUsd(amount: string, priceUsd: number, decimals: number): string {
     const amt = parseFloat(amount);
-
     if (!Number.isFinite(amt) || !Number.isFinite(priceUsd)) {
       return '0.00';
     }
-
     return (amt * priceUsd).toFixed(2);
   }
 
-  /**
-   * Convert USD amount to NGN.
-   */
-  convertUsdToNgn(
-    usdAmount: string,
-    ngnRate: number
-  ): string {
+  convertUsdToNgn(usdAmount: string, ngnRate: number): string {
     const amt = parseFloat(usdAmount);
-
     if (!Number.isFinite(amt) || !Number.isFinite(ngnRate)) {
       return '0';
     }
-
     return Math.round(amt * ngnRate).toLocaleString('en-NG');
   }
-}
+  }
+  
