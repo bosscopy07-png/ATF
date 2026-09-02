@@ -4,176 +4,86 @@ dotenv.config();
 
 function requireEnv(key: string): string {
   const value = process.env[key];
-
   if (!value) {
-    throw new Error(
-      `Missing required environment variable: ${key}`
-    );
+    throw new Error(`Missing required environment variable: ${key}`);
   }
-
   return value;
 }
 
-function requireEnvNumber(
-  key: string,
-  defaultValue?: number
-): number {
+function requireEnvNumber(key: string, defaultValue?: number): number {
   const value = process.env[key];
-
   if (!value) {
     if (defaultValue !== undefined) {
       return defaultValue;
     }
-
-    throw new Error(
-      `Missing required environment variable: ${key}`
-    );
+    throw new Error(`Missing required environment variable: ${key}`);
   }
-
   const num = Number(value);
-
   if (!Number.isFinite(num)) {
-    throw new Error(
-      `Invalid number for ${key}: ${value}`
-    );
+    throw new Error(`Invalid number for ${key}: ${value}`);
   }
-
   return num;
 }
 
 /*
  * STON.fi canonical native TON/GRAM asset address.
- *
- * This is what must be sent to STON.fi's API.
  */
 export const NATIVE_GRAM_ADDRESS =
   'EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c';
 
 /*
  * STON.fi pTON master.
- *
- * This is NOT the native asset address.
- * It is used by the SDK when constructing
- * native GRAM/TON swap transactions.
  */
 export const PTON_MASTER_ADDRESS =
   process.env.PTON_MASTER_ADDRESS ||
   'EQCM3B12QK1e4yZSf8GtBRT0aLMNyEsCtD_WgIhfw2JTP_0';
 
 export const config = {
-  nodeEnv:
-    process.env.NODE_ENV ||
-    'development',
+  nodeEnv: process.env.NODE_ENV || 'development',
 
-  port:
-    requireEnvNumber(
-      'PORT',
-      10000
-    ),
+  port: requireEnvNumber('PORT', 10000),
 
-  appMode:
-    (process.env.APP_MODE ||
-      'server') as
-      | 'server'
-      | 'worker',
+  appMode: (process.env.APP_MODE || 'server') as 'server' | 'worker',
 
-  mongodbUri:
-    requireEnv(
-      'MONGODB_URI'
-    ),
+  mongodbUri: requireEnv('MONGODB_URI'),
 
-  telegramBotToken:
-    requireEnv(
-      'TELEGRAM_BOT_TOKEN'
-    ),
+  telegramBotToken: requireEnv('TELEGRAM_BOT_TOKEN'),
 
-  superAdminTelegramId:
-    requireEnvNumber(
-      'SUPER_ADMIN_TELEGRAM_ID'
-    ),
+  superAdminTelegramId: requireEnvNumber('SUPER_ADMIN_TELEGRAM_ID'),
 
-  adminSessionSecret:
-    requireEnv(
-      'ADMIN_SESSION_SECRET'
-    ),
+  adminSessionSecret: requireEnv('ADMIN_SESSION_SECRET'),
 
-  encryptionKey:
-    requireEnv(
-      'ENCRYPTION_KEY'
-    ),
+  encryptionKey: requireEnv('ENCRYPTION_KEY'),
 
-  tonNetwork:
-    process.env.TON_NETWORK ||
-    'mainnet',
+  tonNetwork: process.env.TON_NETWORK || 'mainnet',
 
-  tonRpcUrl:
-    requireEnv(
-      'TON_RPC_URL'
-    ),
+  tonRpcUrl: requireEnv('TON_RPC_URL'),
 
-  tonApiKey:
-    process.env.TON_API_KEY ||
-    undefined,
+  tonApiKey: process.env.TON_API_KEY || undefined,
 
-  stonfiApiUrl:
-    process.env.STONFI_API_URL ||
-    'https://api.ston.fi',
+  stonfiApiUrl: process.env.STONFI_API_URL || 'https://api.ston.fi',
 
-  stonfiApiKey:
-    process.env.STONFI_API_KEY ||
-    undefined,
+  stonfiApiKey: process.env.STONFI_API_KEY || undefined,
 
-  /*
-   * Application-facing name is GRAM.
-   * STON.fi-facing representation is
-   * NATIVE_GRAM_ADDRESS.
-   */
-  nativeAsset:
-    process.env.NATIVE_ASSET ||
-    'gram',
+  nativeAsset: process.env.NATIVE_ASSET || 'gram',
 
-  nativeGramAddress:
-    NATIVE_GRAM_ADDRESS,
+  nativeGramAddress: NATIVE_GRAM_ADDRESS,
 
-  ptonMasterAddress:
-    PTON_MASTER_ADDRESS,
+  ptonMasterAddress: PTON_MASTER_ADDRESS,
 
-  atfJettonAddress:
-    requireEnv(
-      'ATF_JETTON_ADDRESS'
-    ),
+  atfJettonAddress: requireEnv('ATF_JETTON_ADDRESS'),
 
-  adminFeeWalletAddress:
-    requireEnv(
-      'ADMIN_FEE_WALLET_ADDRESS'
-    ),
+  adminFeeWalletAddress: requireEnv('ADMIN_FEE_WALLET_ADDRESS'),
 
-  adminWalletMnemonic:
-    process.env.ADMIN_WALLET_MNEMONIC ||
-    '',
+  adminWalletMnemonic: process.env.ADMIN_WALLET_MNEMONIC || '',
 
-  platformSwapFeePercent:
-    requireEnvNumber(
-      'PLATFORM_SWAP_FEE_PERCENT',
-      1
-    ),
+  platformSwapFeePercent: requireEnvNumber('PLATFORM_SWAP_FEE_PERCENT', 1),
 
-  minSwapTon:
-    requireEnvNumber(
-      'MIN_SWAP_TON',
-      0.1
-    ),
+  minSwapTon: requireEnvNumber('MIN_SWAP_TON', 0.1),
 
-  maxSlippagePercent:
-    requireEnvNumber(
-      'MAX_SLIPPAGE_PERCENT',
-      1.0
-    ),
+  maxSlippagePercent: requireEnvNumber('MAX_SLIPPAGE_PERCENT', 1.0),
 
-  botBrandingImageUrl:
-    requireEnv(
-      'BOT_BRANDING_IMAGE_URL'
-    ),
+  botBrandingImageUrl: requireEnv('BOT_BRANDING_IMAGE_URL'),
 
   atfPriceApiUrl:
     process.env.ATF_PRICE_API_URL ||
@@ -187,9 +97,13 @@ export const config = {
     process.env.USD_NGN_RATE_API_URL ||
     'https://api.frankfurter.dev/v2/rate/USD/NGN?providers=CBN',
 
-  renderExternalUrl:
-    process.env.RENDER_EXTERNAL_URL ||
-    '',
+  renderExternalUrl: process.env.RENDER_EXTERNAL_URL || '',
+
+  // ─── Added for bot features ─────────────────────────────
+  botUsername: process.env.BOT_USERNAME || 'your_bot_username',
+
+  supportChannelUrl:
+    process.env.SUPPORT_CHANNEL_URL || 'https://t.me/atfswap',
 };
 
 export const TON_DECIMALS = 9;
