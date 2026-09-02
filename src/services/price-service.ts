@@ -34,12 +34,16 @@ export class PriceService {
         timeout: 10000,
         headers: { Accept: 'application/json' },
       });
+      console.log(`[PriceService] Raw response from ${provider.url}:`, JSON.stringify(response.data).slice(0, 800));
       const raw = provider.extract(response.data);
+      console.log(`[PriceService] Extracted from ${provider.url}: raw=${raw}, type=${typeof raw}`);
       const price = typeof raw === 'string' ? parseFloat(raw) : raw;
 
       if (Number.isFinite(price) && price > 0) {
+        console.log(`[PriceService] Valid price from ${provider.url}: ${price}`);
         return price;
       }
+      console.warn(`[PriceService] Invalid price from ${provider.url}: ${price}`);
     } catch (err: any) {
       console.warn(`[PriceService] Failed ${provider.url}: ${err.message}`);
     }
@@ -120,12 +124,64 @@ export class PriceService {
             d?.third_party_price_usd ??
             d?.price ??
             d?.asset?.price ??
-            d?.usd,
+            d?.asset?.dex_price_usd ??
+            d?.asset?.third_party_price_usd ??
+            d?.asset?.price_usd ??
+            d?.asset?.market_price ??
+            d?.asset?.pool_price_usd ??
+            d?.price_usd ??
+            d?.market_price_usd ??
+            d?.pool_price_usd ??
+            d?.last_price ??
+            d?.current_price ??
+            d?.data?.price ??
+            d?.data?.dex_price_usd ??
+            d?.data?.asset?.price ??
+            d?.result?.price ??
+            d?.result?.dex_price_usd ??
+            d?.token?.price ??
+            d?.token?.price_usd ??
+            d?.usd ??
+            d?.value ??
+            d?.rate ??
+            d?.price_24h?.usd ??
+            d?.prices?.usd ??
+            d?.current_price?.usd ??
+            d?.priceUsd ??
+            d?.price_usd,
         },
         {
           url: `https://api.ston.fi/v1/assets/${atfAddress}`,
           extract: (d: any) =>
-            d?.dex_price_usd ?? d?.third_party_price_usd ?? d?.price,
+            d?.dex_price_usd ??
+            d?.third_party_price_usd ??
+            d?.price ??
+            d?.asset?.price ??
+            d?.asset?.dex_price_usd ??
+            d?.asset?.third_party_price_usd ??
+            d?.asset?.price_usd ??
+            d?.asset?.market_price ??
+            d?.asset?.pool_price_usd ??
+            d?.price_usd ??
+            d?.market_price_usd ??
+            d?.pool_price_usd ??
+            d?.last_price ??
+            d?.current_price ??
+            d?.data?.price ??
+            d?.data?.dex_price_usd ??
+            d?.data?.asset?.price ??
+            d?.result?.price ??
+            d?.result?.dex_price_usd ??
+            d?.token?.price ??
+            d?.token?.price_usd ??
+            d?.usd ??
+            d?.value ??
+            d?.rate ??
+            d?.price_24h?.usd ??
+            d?.prices?.usd ??
+            d?.current_price?.usd ??
+            d?.priceUsd ??
+            d?.price_usd,
         },
       ];
 
@@ -144,7 +200,6 @@ export class PriceService {
   async getTonPriceUsd(): Promise<PriceData | null> {
     return this.getCachedOrFetch('ton_usd', async () => {
       const providers: Provider[] = [
-        // 1) Configured primary
         {
           url:
             config.tonPriceApiUrl ||
@@ -152,22 +207,18 @@ export class PriceService {
           extract: (d: any) =>
             d?.['the-open-network']?.usd ?? d?.price ?? d?.usd,
         },
-        // 2) CoinGecko (explicit fallback)
         {
           url: 'https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd',
           extract: (d: any) => d?.['the-open-network']?.usd,
         },
-        // 3) Binance
         {
           url: 'https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT',
           extract: (d: any) => d?.price,
         },
-        // 4) Bybit
         {
           url: 'https://api.bybit.com/v5/market/tickers?category=spot&symbol=TONUSDT',
           extract: (d: any) => d?.result?.list?.[0]?.lastPrice,
         },
-        // 5) OKX
         {
           url: 'https://www.okx.com/api/v5/market/ticker?instId=TON-USDT',
           extract: (d: any) => d?.data?.[0]?.last,
@@ -189,24 +240,20 @@ export class PriceService {
   async getUsdNgnRate(): Promise<PriceData | null> {
     return this.getCachedOrFetch('usd_ngn', async () => {
       const providers: Provider[] = [
-        // 1) Configured primary
         {
           url:
             config.usdNgnRateApiUrl ||
             'https://api.frankfurter.dev/v2/rate/USD/NGN',
           extract: (d: any) => d?.rate ?? d?.rates?.NGN,
         },
-        // 2) frankfurter (explicit fallback)
         {
           url: 'https://api.frankfurter.dev/v2/rate/USD/NGN',
           extract: (d: any) => d?.rate ?? d?.rates?.NGN,
         },
-        // 3) ExchangeRate-API
         {
           url: 'https://api.exchangerate-api.com/v4/latest/USD',
           extract: (d: any) => d?.rates?.NGN,
         },
-        // 4) Open ER-API
         {
           url: 'https://open.er-api.com/v6/latest/USD',
           extract: (d: any) => d?.rates?.NGN,
@@ -260,5 +307,4 @@ export class PriceService {
     }
     return Math.round(amt * ngnRate).toLocaleString('en-NG');
   }
-  }
-  
+}
