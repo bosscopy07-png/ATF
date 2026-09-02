@@ -34,12 +34,10 @@ export class WalletService {
     this.signer = signer || new LocalSigner();
   }
 
+  // ─── Create a BRAND NEW wallet (never blocks) ─────────────────────────────
   async createWallet(userId: number): Promise<IWallet> {
     const user = await User.findOne({ telegramId: userId });
     if (!user) throw new Error('User not found');
-
-    const existing = await Wallet.findOne({ userId: user._id });
-    if (existing) return existing;
 
     const mnemonic = await mnemonicNew(24);
     const keyPair = await mnemonicToWalletKey(mnemonic);
@@ -57,6 +55,7 @@ export class WalletService {
     });
   }
 
+  // ─── Import wallet = ADD NEW (never replaces old) ──────────────────────────
   async importWallet(userId: number, mnemonicPhrase: string): Promise<IWallet> {
     const user = await User.findOne({ telegramId: userId });
     if (!user) throw new Error('User not found');
@@ -66,20 +65,9 @@ export class WalletService {
 
     const keyPair = await mnemonicToWalletKey(words);
     const address = this.signer.getAddress(keyPair.publicKey);
-
-    const existing = await Wallet.findOne({ userId: user._id });
     const { encrypted, iv, tag } = encrypt(mnemonicPhrase);
 
-    if (existing) {
-      existing.encryptedMnemonic = encrypted;
-      existing.iv = iv;
-      existing.tag = tag;
-      existing.address = address;
-      existing.isImported = true;
-      await existing.save();
-      return existing;
-    }
-
+    // Always create a NEW wallet document — old wallets stay safe
     return Wallet.create({
       userId: user._id,
       address,
@@ -90,10 +78,31 @@ export class WalletService {
     });
   }
 
+  // ─── Get ACTIVE wallet (or most recent fallback) ───────────────────────────
   async getWallet(userId: number): Promise<IWallet | null> {
     const user = await User.findOne({ telegramId: userId });
     if (!user) return null;
-    return Wallet.findOne({ userId: user._id });
+
+    // If user has an active wallet selected, return it
+    if (user.activeWalletId) {
+      const active = await Wallet.findById(user.activeWalletId);
+      if (active) return active;
+    }
+
+    // Fallback: return the most recently created wallet for this user
+    return Wallet.findOne({ userId: user._id }).sort({ createdAt: -1 });
+  }
+
+  // ─── Get all wallets for a user ────────────────────────────────────────────
+  async getWallets(userId: number): Promise<IWallet[]> {
+    const user = await User.findOne({ telegramId: userId });
+    if (!user) return [];
+    return Wallet.find({ userId: user._id }).sort({ createdAt: 1 });
+  }
+
+  // ─── Get wallet by Mongo _id ───────────────────────────────────────────────
+  async getWalletById(walletId: string): Promise<IWallet | null> {
+    return Wallet.findById(walletId);
   }
 
   async getKeyPair(userId: number): Promise<KeyPair> {
@@ -108,16 +117,16 @@ export class WalletService {
   async getBalance(address: string): Promise<{ ton: bigint; atf: bigint }> {
     try {
       const tonBalance = await this.client.getBalance(Address.parse(address));
-      
+
       const jettonMaster = this.client.open(JettonMaster.create(Address.parse(config.atfJettonAddress)));
       const jettonWalletAddress = await jettonMaster.getWalletAddress(Address.parse(address));
       const jettonWallet = this.client.open(JettonWallet.create(jettonWalletAddress));
-      
+
       let atfBalance = BigInt(0);
       try {
         atfBalance = await jettonWallet.getBalance();
       } catch {
-        // Wallet not deployed yet
+        // Jetton wallet not deployed yet
       }
 
       return { ton: tonBalance, atf: atfBalance };
@@ -156,7 +165,6 @@ export class WalletService {
 
     await this.client.sendExternalMessage(opened, transfer);
 
-    // Wait for inclusion and return the REAL on-chain tx hash
     await new Promise(r => setTimeout(r, 1500));
     try {
       const txs = await this.client.getTransactions(opened.address, { limit: 3 });
@@ -236,4 +244,4 @@ export class WalletService {
     const master = this.client.open(JettonMaster.create(Address.parse(jettonMasterAddress)));
     return master.getWalletAddress(Address.parse(ownerAddress));
   }
-  }
+}
