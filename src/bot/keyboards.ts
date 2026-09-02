@@ -1,4 +1,5 @@
 import TelegramBot from 'node-telegram-bot-api';
+import { config } from '../config';
 
 export function mainMenuKeyboard(isAdmin: boolean): TelegramBot.InlineKeyboardMarkup {
   const buttons: TelegramBot.InlineKeyboardButton[][] = [
@@ -61,7 +62,7 @@ export function depositKeyboard(): TelegramBot.InlineKeyboardMarkup {
 export function depositTonScreen(address: string): TelegramBot.InlineKeyboardMarkup {
   return {
     inline_keyboard: [
-      [{ text: '📋 Copy Address', callback_data: 'copy_addr_ton' }], // Client-side only or use bot command
+      [{ text: '📋 Copy Address', callback_data: 'copy_addr_ton' }],
       [{ text: '🔄 Check Deposit', callback_data: 'check_deposit_ton' }],
       [{ text: '⬅️ Back', callback_data: 'deposit' }],
     ],
@@ -104,9 +105,7 @@ export function backKeyboard(callback: string): TelegramBot.InlineKeyboardMarkup
 
 export function cancelKeyboard(callback: string): TelegramBot.InlineKeyboardMarkup {
   return {
-    inline_keyboard: [
-      [{ text: '❌ Cancel', callback_data: callback }],
-    ],
+    inline_keyboard: [[{ text: '❌ Cancel', callback_data: callback }]],
   };
 }
 
@@ -214,7 +213,7 @@ export function pricesKeyboard(): TelegramBot.InlineKeyboardMarkup {
 export function helpKeyboard(): TelegramBot.InlineKeyboardMarkup {
   return {
     inline_keyboard: [
-      [{ text: '📢 Support Channel', url: config.supportChannelUrl || 'https://t.me/atfswap' }],
+      [{ text: '📢 Support Channel', url: config.supportChannelUrl }],
       [{ text: '⬅️ Back', callback_data: 'back_main' }],
     ],
   };
@@ -222,7 +221,10 @@ export function helpKeyboard(): TelegramBot.InlineKeyboardMarkup {
 
 export function userListKeyboard(users: any[], page: number, hasMore: boolean): TelegramBot.InlineKeyboardMarkup {
   const rows = users.map(u => [
-    { text: `${u.isFrozen ? '🔒' : '🟢'} ${u.firstName || 'User'} (${u.telegramId})`, callback_data: `admin_user_${u.telegramId}` },
+    {
+      text: `${u.isFrozen ? '🔒' : '🟢'} ${u.firstName || 'User'} (${u.telegramId})`,
+      callback_data: `admin_user_${u.telegramId}`,
+    },
   ]) as TelegramBot.InlineKeyboardButton[][];
 
   const nav: TelegramBot.InlineKeyboardButton[] = [];
@@ -248,4 +250,4 @@ export function userActionKeyboard(telegramId: number, isFrozen: boolean): Teleg
       [{ text: '⬅️ Back', callback_data: 'admin_users' }],
     ],
   };
-}
+  }
