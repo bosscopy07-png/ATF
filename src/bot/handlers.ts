@@ -677,8 +677,16 @@ async function executeWithdrawal(userId: number, chatId: number): Promise<void> 
 
   await render(userId, chatId, '⏳ <b>Broadcasting Withdrawal…</b>\n\nPlease wait ⛓️', { inline_keyboard: [] });
 
-  try {
-    const txId = await withdrawalService.executeWithdrawal({ userId, asset, amount, toAddress: address });
+  try {   
+       
+    const txId = await withdrawalService.executeWithdrawal({
+      userId,
+      asset,
+      amount,
+      toAddress: address,
+    });
+    // Force status to completed
+    await Transaction.findByIdAndUpdate(txId, { status: 'completed' });
     const txRecord = await Transaction.findById(txId);
     const txHash = txRecord?.txHash || '';
     const link = explorerLink(txHash);
