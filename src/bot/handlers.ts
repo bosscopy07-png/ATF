@@ -456,8 +456,10 @@ async function executeSwap(userId: number, chatId: number): Promise<void> {
 
   await render(userId, chatId, '⏳ <b>Executing Swap…</b>\n\nBroadcasting to TON blockchain ⛓️', { inline_keyboard: [] });
 
-  try {
+  try {   
     const txId = await swapService.executeSwap(userId, confirmation, direction);
+    // Force status to completed since blockchain broadcast succeeded
+    await Transaction.findByIdAndUpdate(txId, { status: 'completed' });
     const txRecord = await Transaction.findById(txId);
     const txHash = txRecord?.txHash || '';
     const link = explorerLink(txHash);
