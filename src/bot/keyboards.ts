@@ -16,10 +16,7 @@ export function mainMenuKeyboard(isAdmin: boolean): TelegramBot.InlineKeyboardMa
       { text: '💵 Prices', callback_data: 'prices' },
       { text: 'ℹ️ Help', callback_data: 'help' },
     ],
-    [
-      { text: '⚙️ Settings', callback_data: 'settings' },
-      { text: '🎁 Referral', callback_data: 'referral' },
-    ],
+    [{ text: '🎁 Referral', callback_data: 'referral' }],
     [{ text: '🔄 Refresh', callback_data: 'refresh_main' }],
   ];
 
@@ -109,12 +106,67 @@ export function cancelKeyboard(callback: string): TelegramBot.InlineKeyboardMark
   };
 }
 
-export function settingsKeyboard(): TelegramBot.InlineKeyboardMarkup {
+export function pricesKeyboard(): TelegramBot.InlineKeyboardMarkup {
   return {
     inline_keyboard: [
-      [{ text: '🔔 Notifications', callback_data: 'settings_notif' }],
-      [{ text: '🌙 Night Mode', callback_data: 'settings_theme' }],
-      [{ text: '🔤 Language', callback_data: 'settings_lang' }],
+      [{ text: '🔄 Refresh', callback_data: 'prices' }],
+      [{ text: '⬅️ Back', callback_data: 'back_main' }],
+    ],
+  };
+}
+
+export function helpKeyboard(): TelegramBot.InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [{ text: '📢 Support Channel', url: config.supportChannelUrl }],
+      [{ text: '⬅️ Back', callback_data: 'back_main' }],
+    ],
+  };
+}
+
+export function accountKeyboard(): TelegramBot.InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [{ text: '🔐 Export Wallet', callback_data: 'export_wallet' }],
+      [{ text: '🔑 Import Wallet', callback_data: 'import_wallet' }],
+      [{ text: '💼 My Wallets', callback_data: 'my_wallets' }],
+      [{ text: '⬅️ Back', callback_data: 'back_main' }],
+    ],
+  };
+}
+
+export function exportWarningKeyboard(): TelegramBot.InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [{ text: '🔐 Reveal Phrase', callback_data: 'export_confirm' }],
+      [{ text: '❌ Cancel', callback_data: 'account' }],
+    ],
+  };
+}
+
+export function walletListKeyboard(wallets: any[], activeId: string): TelegramBot.InlineKeyboardMarkup {
+  const rows = wallets.map((w, idx) => [
+    {
+      text: `${w._id.toString() === activeId ? '✅' : '🔘'} Wallet ${idx + 1} ${w.isImported ? '(Imported)' : '(Created)'}`,
+      callback_data: `switch_wallet_${w._id.toString()}`,
+    },
+  ]) as TelegramBot.InlineKeyboardButton[][];
+
+  rows.push([{ text: '➕ Create New Wallet', callback_data: 'create_wallet' }]);
+  rows.push([{ text: '⬅️ Back', callback_data: 'account' }]);
+
+  return { inline_keyboard: rows };
+}
+
+export function historyPaginationKeyboard(page: number, hasMore: boolean): TelegramBot.InlineKeyboardMarkup {
+  const buttons: TelegramBot.InlineKeyboardButton[] = [];
+  if (page > 1) buttons.push({ text: '◀️ Prev', callback_data: `history_page_${page - 1}` });
+  if (hasMore) buttons.push({ text: '▶️ Next', callback_data: `history_page_${page + 1}` });
+
+  return {
+    inline_keyboard: [
+      buttons,
+      [{ text: '🔄 Refresh', callback_data: 'history' }],
       [{ text: '⬅️ Back', callback_data: 'back_main' }],
     ],
   };
@@ -156,19 +208,6 @@ export function adminManagementKeyboard(): TelegramBot.InlineKeyboardMarkup {
   };
 }
 
-export function historyPaginationKeyboard(page: number, hasMore: boolean): TelegramBot.InlineKeyboardMarkup {
-  const buttons: TelegramBot.InlineKeyboardButton[] = [];
-  if (page > 1) buttons.push({ text: '◀️ Prev', callback_data: `history_page_${page - 1}` });
-  if (hasMore) buttons.push({ text: '▶️ Next', callback_data: `history_page_${page + 1}` });
-
-  return {
-    inline_keyboard: [
-      buttons,
-      [{ text: '⬅️ Back', callback_data: 'back_main' }],
-    ],
-  };
-}
-
 export function adminPaginationKeyboard(prefix: string, page: number, hasMore: boolean): TelegramBot.InlineKeyboardMarkup {
   const buttons: TelegramBot.InlineKeyboardButton[] = [];
   if (page > 1) buttons.push({ text: '◀️ Prev', callback_data: `${prefix}_page_${page - 1}` });
@@ -178,43 +217,6 @@ export function adminPaginationKeyboard(prefix: string, page: number, hasMore: b
     inline_keyboard: [
       buttons,
       [{ text: '⬅️ Back', callback_data: 'admin_panel' }],
-    ],
-  };
-}
-
-export function accountKeyboard(): TelegramBot.InlineKeyboardMarkup {
-  return {
-    inline_keyboard: [
-      [{ text: '🔐 Export Wallet', callback_data: 'export_wallet' }],
-      [{ text: '🔑 Import Wallet', callback_data: 'import_wallet' }],
-      [{ text: '⬅️ Back', callback_data: 'back_main' }],
-    ],
-  };
-}
-
-export function exportWarningKeyboard(): TelegramBot.InlineKeyboardMarkup {
-  return {
-    inline_keyboard: [
-      [{ text: '🔐 Continue', callback_data: 'export_confirm' }],
-      [{ text: '❌ Cancel', callback_data: 'account' }],
-    ],
-  };
-}
-
-export function pricesKeyboard(): TelegramBot.InlineKeyboardMarkup {
-  return {
-    inline_keyboard: [
-      [{ text: '🔄 Refresh', callback_data: 'prices' }],
-      [{ text: '⬅️ Back', callback_data: 'back_main' }],
-    ],
-  };
-}
-
-export function helpKeyboard(): TelegramBot.InlineKeyboardMarkup {
-  return {
-    inline_keyboard: [
-      [{ text: '📢 Support Channel', url: config.supportChannelUrl }],
-      [{ text: '⬅️ Back', callback_data: 'back_main' }],
     ],
   };
 }
@@ -250,4 +252,4 @@ export function userActionKeyboard(telegramId: number, isFrozen: boolean): Teleg
       [{ text: '⬅️ Back', callback_data: 'admin_users' }],
     ],
   };
-  }
+    }
