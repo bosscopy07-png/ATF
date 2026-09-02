@@ -100,7 +100,7 @@ export const config = {
   renderExternalUrl: process.env.RENDER_EXTERNAL_URL || '',
 
   // ─── Added for bot features ─────────────────────────────
-  botUsername: process.env.BOT_USERNAME || 'your_bot_username',
+  botUsername: process.env.BOT_USERNAME || 'ATFswapbot',
 
   supportChannelUrl:
     process.env.SUPPORT_CHANNEL_URL || 'https://t.me/atfswap',
