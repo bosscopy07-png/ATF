@@ -13,7 +13,10 @@ export interface IUser extends Document {
   state: string;
   stateData: Record<string, any>;
   lastBotMessageId?: number;
-  lastAction?: string; // <-- ADD THIS
+  lastAction?: string;
+  lastMessageWasPhoto?: boolean;
+  walletIds: mongoose.Types.ObjectId[];
+  activeWalletId?: mongoose.Types.ObjectId;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -32,9 +35,13 @@ const UserSchema = new Schema<IUser>(
     state: { type: String, default: 'idle' },
     stateData: { type: Schema.Types.Mixed, default: {} },
     lastBotMessageId: { type: Number, required: false },
-    lastAction: { type: String, default: 'main_menu' }, // <-- ADD THIS
+    lastAction: { type: String, default: 'main_menu' },
+    lastMessageWasPhoto: { type: Boolean, default: false },
+    walletIds: [{ type: Schema.Types.ObjectId, ref: 'Wallet', default: [] }],
+    activeWalletId: { type: Schema.Types.ObjectId, ref: 'Wallet', required: false },
   },
   { timestamps: true }
 );
 
 export const User = mongoose.model<IUser>('User', UserSchema);
+    
