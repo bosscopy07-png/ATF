@@ -47,10 +47,14 @@ export class WithdrawalService {
       throw new Error('Amount must be greater than zero');
     }
 
-    const balanceKey = request.asset === 'TON' ? 'tonBalance' : 'atfBalance';
-    const currentBalance = BigInt(user[balanceKey] || '0');
+    // ── BUG FIX #3: Use LIVE on-chain balance instead of stale MongoDB balance ──
+    const walletAddress = await this.walletService.getAddress(request.userId);
+    if (!walletAddress) throw new Error('Wallet not found');
 
-    if (Precision.isLessThan(currentBalance, amountBase)) {
+    const { ton: onChainTon, atf: onChainAtf } = await this.walletService.getBalance(walletAddress);
+    const liveBalance = request.asset === 'TON' ? onChainTon : onChainAtf;
+
+    if (Precision.isLessThan(liveBalance, amountBase)) {
       throw new Error('Insufficient balance');
     }
 
@@ -83,10 +87,14 @@ export class WithdrawalService {
     const decimals = request.asset === 'TON' ? TON_DECIMALS : ATF_DECIMALS;
     const amountBase = Precision.toBaseUnits(request.amount, decimals);
 
-    const balanceKey = request.asset === 'TON' ? 'tonBalance' : 'atfBalance';
-    const currentBalance = BigInt(user[balanceKey] || '0');
+    const walletAddress = await this.walletService.getAddress(request.userId);
+    if (!walletAddress) throw new Error('Wallet not found');
 
-    if (Precision.isLessThan(currentBalance, amountBase)) {
+    // ── BUG FIX #3: Use LIVE on-chain balance instead of stale MongoDB balance ──
+    const { ton: onChainTon, atf: onChainAtf } = await this.walletService.getBalance(walletAddress);
+    const liveBalance = request.asset === 'TON' ? onChainTon : onChainAtf;
+
+    if (Precision.isLessThan(liveBalance, amountBase)) {
       throw new Error('Insufficient balance');
     }
 
@@ -102,11 +110,6 @@ export class WithdrawalService {
       throw new Error('Amount too small to cover network costs');
     }
 
-    const walletAddress = await this.walletService.getAddress(request.userId);
-    if (!walletAddress) throw new Error('Wallet not found');
-
-    const { ton: onChainTon } = await this.walletService.getBalance(walletAddress);
-
     if (request.asset === 'TON' && onChainTon < amountBase) {
       throw new Error('On-chain TON balance insufficient. Funds may be pending or already spent.');
     }
@@ -118,7 +121,11 @@ export class WithdrawalService {
     let deducted = false;
 
     try {
-      user[balanceKey] = Precision.subtract(currentBalance, amountBase).toString();
+      const balanceKey = request.asset === 'TON' ? 'tonBalance' : 'atfBalance';
+      user[balanceKey] = Precision.subtract(
+        BigInt(user[balanceKey] || '0'),
+        amountBase
+      ).toString();
       await user.save();
       deducted = true;
 
@@ -151,8 +158,9 @@ export class WithdrawalService {
         );
       }
 
+      // ── BUG FIX #4: Mark transaction as COMPLETED after successful broadcast ──
       tx.txHash = txHash;
-      tx.status = 'processing';
+      tx.status = 'completed';
       await tx.save();
 
       return tx._id.toString();
@@ -163,6 +171,7 @@ export class WithdrawalService {
         try {
           const currentUser = await User.findById(user._id);
           if (currentUser) {
+            const balanceKey = request.asset === 'TON' ? 'tonBalance' : 'atfBalance';
             currentUser[balanceKey] = Precision.add(
               BigInt(currentUser[balanceKey] || '0'),
               amountBase
