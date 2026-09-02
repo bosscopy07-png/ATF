@@ -1,3 +1,4 @@
+
 import { User } from '../models/User';
 import { Transaction } from '../models/Transaction';
 import { WalletService } from './wallet-service';
@@ -58,9 +59,14 @@ export class SwapService {
     const outputDecimals = isTonToAtf ? ATF_DECIMALS : TON_DECIMALS;
     const amountBase = Precision.toBaseUnits(request.amount, inputDecimals);
 
-    const balanceKey = isTonToAtf ? 'tonBalance' : 'atfBalance';
-    const currentBalance = BigInt(user[balanceKey] || '0');
-    if (Precision.isLessThan(currentBalance, amountBase)) {
+    // ── BUG FIX #2: Use LIVE on-chain balance instead of stale MongoDB balance ──
+    const walletAddress = await this.walletService.getAddress(request.userId);
+    if (!walletAddress) throw new Error('Wallet not found');
+
+    const { ton: onChainTon, atf: onChainAtf } = await this.walletService.getBalance(walletAddress);
+    const liveBalance = isTonToAtf ? onChainTon : onChainAtf;
+
+    if (Precision.isLessThan(liveBalance, amountBase)) {
       throw new Error('Insufficient balance');
     }
 
@@ -83,9 +89,6 @@ export class SwapService {
     let trueNetSwapBase = netSwapBase;
 
     if (!isTonToAtf) {
-      const walletAddress = await this.walletService.getAddress(request.userId);
-      if (!walletAddress) throw new Error('Wallet not found');
-
       const prelimQuote = await this.stonfi.getQuote(
         config.atfJettonAddress,
         'ton',
@@ -135,7 +138,6 @@ export class SwapService {
       (config.maxSlippagePercent / 100).toString()
     );
 
-    const walletAddress = await this.walletService.getAddress(request.userId);
     let txParams: any;
     if (walletAddress) {
       txParams = await this.stonfi.buildSwapTransaction(walletAddress, quote, offerAddress, askAddress);
@@ -198,10 +200,14 @@ export class SwapService {
       gasAtfBase = Precision.toBaseUnits(confirmation.gasAtfEquivalent, ATF_DECIMALS);
     }
 
-    const balanceKey = isTonToAtf ? 'tonBalance' : 'atfBalance';
-    const currentBalance = BigInt(user[balanceKey] || '0');
+    // ── BUG FIX #2: Use LIVE on-chain balance instead of stale MongoDB balance ──
+    const walletAddress = await this.walletService.getAddress(userId);
+    if (!walletAddress) throw new Error('Wallet not found');
 
-    if (Precision.isLessThan(currentBalance, amountBase)) {
+    const { ton: onChainTon, atf: onChainAtf } = await this.walletService.getBalance(walletAddress);
+    const liveBalance = isTonToAtf ? onChainTon : onChainAtf;
+
+    if (Precision.isLessThan(liveBalance, amountBase)) {
       throw new Error('Insufficient balance');
     }
 
@@ -209,7 +215,10 @@ export class SwapService {
     let deducted = false;
 
     try {
-      user[balanceKey] = Precision.subtract(currentBalance, amountBase).toString();
+      user[balanceKey(isTonToAtf)] = Precision.subtract(
+        BigInt(user[balanceKey(isTonToAtf)] || '0'),
+        amountBase
+      ).toString();
       await user.save();
       deducted = true;
 
@@ -241,9 +250,6 @@ export class SwapService {
           trueNetSwapAmount: confirmation.trueNetSwapAmount,
         },
       });
-
-      const walletAddress = await this.walletService.getAddress(userId);
-      if (!walletAddress) throw new Error('Wallet not found');
 
       if (!isTonToAtf && confirmation.gasTon) {
         const gasNano = BigInt(Math.round(parseFloat(confirmation.gasTon) * 1e9));
@@ -285,9 +291,9 @@ export class SwapService {
       );
 
       if (isTonToAtf) {
-        const { ton: onChainTon } = await this.walletService.getBalance(walletAddress);
+        const { ton: onChainTonCheck } = await this.walletService.getBalance(walletAddress);
         const requiredTon = BigInt(swapParams.value.toString());
-        if (onChainTon < requiredTon) {
+        if (onChainTonCheck < requiredTon) {
           throw new Error(
             `Wallet needs ~${Precision.fromBaseUnits(requiredTon, TON_DECIMALS)} TON for this swap ` +
             `(includes gas). Excess is returned. Deposit more TON.`
@@ -302,10 +308,17 @@ export class SwapService {
         swapParams.body
       );
 
+      // ── BUG FIX #4: Mark transaction as COMPLETED after successful broadcast ──
       tx.txHash = txHash;
-      tx.status = 'processing';
+      tx.status = 'completed';
       tx.toAddress = swapParams.to;
       await tx.save();
+
+      // Also update fee status to completed
+      await Transaction.updateOne(
+        { 'metadata.swapTxId': tx._id.toString(), type: 'fee_transfer' },
+        { $set: { status: 'completed' } }
+      );
 
       this.transferFee(userId, feeBase, isTonToAtf ? 'TON' : 'ATF', tx._id.toString())
         .catch(err => console.error('Fee transfer async error:', err));
@@ -318,8 +331,8 @@ export class SwapService {
         try {
           const currentUser = await User.findById(user._id);
           if (currentUser) {
-            currentUser[balanceKey] = Precision.add(
-              BigInt(currentUser[balanceKey] || '0'),
+            currentUser[balanceKey(isTonToAtf)] = Precision.add(
+              BigInt(currentUser[balanceKey(isTonToAtf)] || '0'),
               amountBase
             ).toString();
             await currentUser.save();
@@ -374,14 +387,19 @@ export class SwapService {
         );
       }
 
+      // ── BUG FIX #4: Mark fee transfer as COMPLETED after successful broadcast ──
       feeTx.txHash = txHash;
-      feeTx.status = 'processing';
+      feeTx.status = 'completed';
       await feeTx.save();
 
-      await Transaction.findByIdAndUpdate(swapTxId, { feeStatus: 'processing', feeTxHash: txHash });
+      await Transaction.findByIdAndUpdate(swapTxId, { feeStatus: 'completed', feeTxHash: txHash });
     } catch (error) {
       console.error('Fee transfer failed:', error);
     }
   }
-         }
-   
+}
+
+function balanceKey(isTonToAtf: boolean): string {
+  return isTonToAtf ? 'tonBalance' : 'atfBalance';
+    }
+  
