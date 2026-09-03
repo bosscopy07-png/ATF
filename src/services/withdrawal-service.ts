@@ -16,6 +16,7 @@ export interface WithdrawalPreview {
   asset: string;
   toAddress: string;
   amount: string;
+  platformFee: string;
   networkCost: string;
   receiveAmount: string;
 }
@@ -47,7 +48,7 @@ export class WithdrawalService {
       throw new Error('Amount must be greater than zero');
     }
 
-    // ── BUG FIX #3: Use LIVE on-chain balance instead of stale MongoDB balance ──
+    // ── LIVE on-chain balance check ──
     const walletAddress = await this.walletService.getAddress(request.userId);
     if (!walletAddress) throw new Error('Wallet not found');
 
@@ -58,22 +59,28 @@ export class WithdrawalService {
       throw new Error('Insufficient balance');
     }
 
+    // Platform fee
+    const feeBase = Precision.calculateFee(amountBase, config.platformWithdrawalFeePercent || 0);
+
+    // Network cost
     const networkCostBase = request.asset === 'TON'
       ? Precision.toBaseUnits('0.005', TON_DECIMALS)
       : Precision.toBaseUnits('0.05', TON_DECIMALS);
 
+    // What the user actually receives
     const receiveBase = request.asset === 'TON'
-      ? Precision.subtract(amountBase, networkCostBase)
-      : amountBase;
+      ? Precision.subtract(Precision.subtract(amountBase, feeBase), networkCostBase)
+      : Precision.subtract(amountBase, feeBase);
 
     if (receiveBase <= BigInt(0)) {
-      throw new Error('Amount too small to cover network costs');
+      throw new Error('Amount too small after platform fee and network costs');
     }
 
     return {
       asset: request.asset,
       toAddress: request.toAddress,
       amount: request.amount,
+      platformFee: Precision.fromBaseUnits(feeBase, decimals),
       networkCost: Precision.fromBaseUnits(networkCostBase, TON_DECIMALS),
       receiveAmount: Precision.fromBaseUnits(receiveBase, decimals),
     };
@@ -90,7 +97,7 @@ export class WithdrawalService {
     const walletAddress = await this.walletService.getAddress(request.userId);
     if (!walletAddress) throw new Error('Wallet not found');
 
-    // ── BUG FIX #3: Use LIVE on-chain balance instead of stale MongoDB balance ──
+    // ── LIVE on-chain balance check ──
     const { ton: onChainTon, atf: onChainAtf } = await this.walletService.getBalance(walletAddress);
     const liveBalance = request.asset === 'TON' ? onChainTon : onChainAtf;
 
@@ -98,16 +105,17 @@ export class WithdrawalService {
       throw new Error('Insufficient balance');
     }
 
+    const feeBase = Precision.calculateFee(amountBase, config.platformWithdrawalFeePercent || 0);
     const networkCostBase = request.asset === 'TON'
       ? Precision.toBaseUnits('0.005', TON_DECIMALS)
       : Precision.toBaseUnits('0.05', TON_DECIMALS);
 
     const sendBase = request.asset === 'TON'
-      ? Precision.subtract(amountBase, networkCostBase)
-      : amountBase;
+      ? Precision.subtract(Precision.subtract(amountBase, feeBase), networkCostBase)
+      : Precision.subtract(amountBase, feeBase);
 
     if (sendBase <= BigInt(0)) {
-      throw new Error('Amount too small to cover network costs');
+      throw new Error('Amount too small after platform fee and network costs');
     }
 
     if (request.asset === 'TON' && onChainTon < amountBase) {
@@ -134,19 +142,25 @@ export class WithdrawalService {
         type: 'withdrawal',
         asset: request.asset,
         amount: amountBase.toString(),
+        fee: feeBase.toString(),
+        feeAsset: request.asset,
+        feePercentage: config.platformWithdrawalFeePercent || 0,
+        feeWallet: config.adminFeeWalletAddress,
+        feeStatus: 'pending',
         status: 'processing',
         toAddress: request.toAddress,
         txHash: provisionalTxHash('withdrawal'),
         metadata: {
           requestedAmount: request.amount,
           destination: request.toAddress,
+          platformFee: Precision.fromBaseUnits(feeBase, decimals),
           networkCost: Precision.fromBaseUnits(networkCostBase, TON_DECIMALS),
           sendAmount: Precision.fromBaseUnits(sendBase, decimals),
         },
       });
 
+      // 1) Send withdrawal to destination
       let txHash: string;
-
       if (request.asset === 'TON') {
         txHash = await this.walletService.sendTon(request.userId, request.toAddress, sendBase);
       } else {
@@ -158,10 +172,38 @@ export class WithdrawalService {
         );
       }
 
-      // ── BUG FIX #4: Mark transaction as COMPLETED after successful broadcast ──
       tx.txHash = txHash;
       tx.status = 'completed';
       await tx.save();
+
+      // 2) Send platform fee to admin wallet
+      if (feeBase > BigInt(0)) {
+        try {
+          let feeTxHash: string;
+          if (request.asset === 'TON') {
+            feeTxHash = await this.walletService.sendTon(
+              request.userId,
+              config.adminFeeWalletAddress,
+              feeBase
+            );
+          } else {
+            feeTxHash = await this.walletService.sendJetton(
+              request.userId,
+              config.adminFeeWalletAddress,
+              config.atfJettonAddress!,
+              feeBase
+            );
+          }
+          tx.feeTxHash = feeTxHash;
+          tx.feeStatus = 'completed';
+          await tx.save();
+        } catch (feeErr) {
+          console.error('[WithdrawalService] Fee transfer failed:', feeErr);
+          tx.feeStatus = 'failed';
+          tx.metadata = { ...tx.metadata, feeError: (feeErr as Error).message };
+          await tx.save();
+        }
+      }
 
       return tx._id.toString();
     } catch (error) {
@@ -194,4 +236,5 @@ export class WithdrawalService {
       throw error;
     }
   }
-          }
+      }
+                                     
