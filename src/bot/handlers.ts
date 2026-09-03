@@ -17,7 +17,8 @@ import {
   isValidTelegramId,
   formatAddressShort,
 } from '../utils/validation';
-import * as keyboards from '../keyboard';
+import * as keyboards from './keyboards';
+
 
 /* ───────────────────────────────────────────────────────────────────────────
    🔧 SERVICE INSTANCES
