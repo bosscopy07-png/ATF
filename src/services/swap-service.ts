@@ -25,8 +25,6 @@ export interface SwapConfirmation {
   quote: any;
   txParams?: any;
   gasTon?: string;
-  gasAtfEquivalent?: string;
-  trueNetSwapAmount?: string;
 }
 
 function provisionalTxHash(prefix: string): string {
@@ -58,7 +56,7 @@ export class SwapService {
     const outputDecimals = isTonToAtf ? ATF_DECIMALS : TON_DECIMALS;
     const amountBase = Precision.toBaseUnits(request.amount, inputDecimals);
 
-    // ── BUG FIX #2: Use LIVE on-chain balance instead of stale MongoDB balance ──
+    // ── LIVE on-chain balance check ──
     const walletAddress = await this.walletService.getAddress(request.userId);
     if (!walletAddress) throw new Error('Wallet not found');
 
@@ -69,8 +67,9 @@ export class SwapService {
       throw new Error('Insufficient balance');
     }
 
+    // Platform fee deducted from INPUT asset only
     const feeBase = Precision.calculateFee(amountBase, config.platformSwapFeePercent);
-    let netSwapBase = Precision.subtract(amountBase, feeBase);
+    const netSwapBase = Precision.subtract(amountBase, feeBase);
 
     if (isTonToAtf) {
       const minBase = Precision.toBaseUnits(config.minSwapTon.toString(), TON_DECIMALS);
@@ -83,9 +82,8 @@ export class SwapService {
       }
     }
 
+    // ── ATF→TON: estimate gas TON needed (display only, not deducted from swap) ──
     let gasTon: string | undefined;
-    let gasAtfEquivalentBase = BigInt(0);
-    let trueNetSwapBase = netSwapBase;
 
     if (!isTonToAtf) {
       const prelimQuote = await this.stonfi.getQuote(
@@ -103,33 +101,12 @@ export class SwapService {
       );
 
       gasTon = txParams.gasTon;
-      const gasTonBase = txParams.value;
-
-      const [tonPrice, atfPrice] = await Promise.all([
-        this.priceService.getTonPriceUsd(),
-        this.priceService.getAtfPriceUsd(),
-      ]);
-
-      if (!tonPrice || !atfPrice) {
-        throw new Error('Price unavailable for gas estimation');
-      }
-
-      const gasUsd = parseFloat(gasTon) * tonPrice.price;
-      const gasAtfFloat = gasUsd / atfPrice.price;
-      gasAtfEquivalentBase = Precision.toBaseUnits(gasAtfFloat.toFixed(ATF_DECIMALS), ATF_DECIMALS);
-
-      trueNetSwapBase = Precision.subtract(netSwapBase, gasAtfEquivalentBase);
-
-      if (trueNetSwapBase <= BigInt(0)) {
-        throw new Error('Amount too small after platform fee and network costs');
-      }
-
-      netSwapBase = trueNetSwapBase;
     }
 
     const offerAddress = isTonToAtf ? 'ton' : config.atfJettonAddress;
     const askAddress = isTonToAtf ? config.atfJettonAddress : 'ton';
 
+    // Quote built for FULL netSwapBase (after platform fee only)
     const quote = await this.stonfi.getQuote(
       offerAddress,
       askAddress,
@@ -148,7 +125,7 @@ export class SwapService {
     const outputDisplay = Precision.fromBaseUnits(BigInt(quote.askUnits), outputDecimals);
     const minOutputDisplay = Precision.fromBaseUnits(BigInt(quote.minAskUnits), outputDecimals);
 
-    const rateValue = parseFloat(outputDisplay) / parseFloat(netDisplay);
+    const rateValue = parseFloat(netDisplay) > 0 ? parseFloat(outputDisplay) / parseFloat(netDisplay) : 0;
     const rate = isTonToAtf
       ? `1 TON ≈ ${rateValue.toFixed(2)} ATF`
       : `1 ATF ≈ ${rateValue.toFixed(6)} TON`;
@@ -165,12 +142,6 @@ export class SwapService {
       quote,
       txParams,
       gasTon,
-      gasAtfEquivalent: gasAtfEquivalentBase > BigInt(0)
-        ? Precision.fromBaseUnits(gasAtfEquivalentBase, ATF_DECIMALS)
-        : undefined,
-      trueNetSwapAmount: !isTonToAtf
-        ? Precision.fromBaseUnits(trueNetSwapBase, ATF_DECIMALS)
-        : undefined,
     };
   }
 
@@ -195,12 +166,7 @@ export class SwapService {
     const feeBase = Precision.calculateFee(amountBase, config.platformSwapFeePercent);
     const balanceKey = isTonToAtf ? 'tonBalance' : 'atfBalance';
 
-    let gasAtfBase = BigInt(0);
-    if (!isTonToAtf && confirmation.gasAtfEquivalent) {
-      gasAtfBase = Precision.toBaseUnits(confirmation.gasAtfEquivalent, ATF_DECIMALS);
-    }
-
-    // ── BUG FIX #2: Use LIVE on-chain balance instead of stale MongoDB balance ──
+    // ── LIVE on-chain balance check ──
     const walletAddress = await this.walletService.getAddress(userId);
     if (!walletAddress) throw new Error('Wallet not found');
 
@@ -215,6 +181,7 @@ export class SwapService {
     let deducted = false;
 
     try {
+      // Deduct full input amount from user's DB balance
       user[balanceKey] = Precision.subtract(
         BigInt(user[balanceKey] || '0'),
         amountBase
@@ -246,11 +213,10 @@ export class SwapService {
           expiresAt: confirmation.expiresAt,
           quote: confirmation.quote,
           gasTon: confirmation.gasTon,
-          gasAtfEquivalent: confirmation.gasAtfEquivalent,
-          trueNetSwapAmount: confirmation.trueNetSwapAmount,
         },
       });
 
+      // ── ATF→TON: Admin sends gas TON to user's wallet ──
       if (!isTonToAtf && confirmation.gasTon) {
         const gasNano = BigInt(Math.round(parseFloat(confirmation.gasTon) * 1e9));
         await this.adminWallet.initialize();
@@ -267,16 +233,18 @@ export class SwapService {
           type: 'fee_transfer',
           asset: 'TON',
           amount: gasNano.toString(),
-          status: 'processing',
+          status: 'completed',
           toAddress: walletAddress,
           txHash: gasTxHash,
           metadata: {
-            purpose: 'swap_gas_funding',
+            purpose: 'gas_advance',
+            description: 'Gas TON advanced by admin for ATF→TON swap',
             fromAdmin: true,
             swapTxId: tx._id.toString(),
           },
         });
 
+        // Wait for balance to settle on-chain
         await new Promise(r => setTimeout(r, 3000));
       }
 
@@ -290,6 +258,7 @@ export class SwapService {
         askAddress
       );
 
+      // TON→ATF: ensure user has enough TON for the swap + gas
       if (isTonToAtf) {
         const { ton: onChainTonCheck } = await this.walletService.getBalance(walletAddress);
         const requiredTon = BigInt(swapParams.value.toString());
@@ -301,6 +270,7 @@ export class SwapService {
         }
       }
 
+      // Execute the swap on-chain
       const txHash = await this.walletService.sendTon(
         userId,
         swapParams.to,
@@ -308,18 +278,23 @@ export class SwapService {
         swapParams.body
       );
 
-      // ── BUG FIX #4: Mark transaction as COMPLETED after successful broadcast ──
+      // Mark as COMPLETED after successful broadcast
       tx.txHash = txHash;
       tx.status = 'completed';
       tx.toAddress = swapParams.to;
       await tx.save();
 
-      // Also update fee status to completed
-      await Transaction.updateOne(
-        { 'metadata.swapTxId': tx._id.toString(), type: 'fee_transfer' },
-        { $set: { status: 'completed' } }
-      );
+      // ── RECOVER GAS: Send the advanced TON back to admin ──
+      if (!isTonToAtf && confirmation.gasTon) {
+        this.recoverGasTon(
+          userId,
+          user._id,
+          confirmation.gasTon,
+          tx._id.toString()
+        ).catch(err => console.error('[SwapService] Gas recovery failed:', err));
+      }
 
+      // Transfer platform fee to admin wallet (async)
       this.transferFee(userId, feeBase, isTonToAtf ? 'TON' : 'ATF', tx._id.toString())
         .catch(err => console.error('Fee transfer async error:', err));
 
@@ -354,6 +329,53 @@ export class SwapService {
     }
   }
 
+  // ─── Send advanced gas TON back to admin after swap succeeds ───
+  private async recoverGasTon(
+    userId: number,
+    userObjectId: any,
+    gasTon: string,
+    swapTxId: string
+  ): Promise<void> {
+    // Give the swap time to settle on-chain before recovering
+    await new Promise(r => setTimeout(r, 8000));
+
+    const gasNano = BigInt(Math.round(parseFloat(gasTon) * 1e9));
+
+    try {
+      const recoveryTxHash = await this.walletService.sendTon(
+        userId,
+        config.adminFeeWalletAddress,
+        gasNano
+      );
+
+      await Transaction.create({
+        userId: userObjectId,
+        type: 'fee_transfer',
+        asset: 'TON',
+        amount: gasNano.toString(),
+        status: 'completed',
+        toAddress: config.adminFeeWalletAddress,
+        txHash: recoveryTxHash,
+        metadata: {
+          purpose: 'gas_recovery',
+          description: 'Recovery of gas TON advanced by admin for ATF→TON swap',
+          swapTxId,
+          gasTon,
+        },
+      });
+
+      // Link recovery to original swap tx
+      await Transaction.findByIdAndUpdate(swapTxId, {
+        $set: { 'metadata.gasRecovered': true, 'metadata.gasRecoveryTxHash': recoveryTxHash },
+      });
+
+      console.log(`[SwapService] Gas recovery completed: ${recoveryTxHash}`);
+    } catch (error) {
+      console.error('[SwapService] Gas recovery failed:', error);
+      // Don't throw — swap already succeeded, this is just cleanup
+    }
+  }
+
   private async transferFee(
     userId: number,
     feeAmount: bigint,
@@ -366,7 +388,7 @@ export class SwapService {
 
       const feeTx = await Transaction.create({
         userId: user._id,
-        type: 'fee_transfer',
+        type: 'fee',
         asset,
         amount: feeAmount.toString(),
         status: 'processing',
@@ -387,7 +409,6 @@ export class SwapService {
         );
       }
 
-      // ── BUG FIX #4: Mark fee transfer as COMPLETED after successful broadcast ──
       feeTx.txHash = txHash;
       feeTx.status = 'completed';
       await feeTx.save();
@@ -397,5 +418,5 @@ export class SwapService {
       console.error('Fee transfer failed:', error);
     }
   }
-                                    }
-  
+          }
+        
