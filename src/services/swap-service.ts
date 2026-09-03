@@ -31,17 +31,157 @@ function provisionalTxHash(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+// ─── Queue item for ATF→TON swaps ───────────────────────────────────────────
+interface QueuedSwap {
+  userId: number;
+  confirmation: SwapConfirmation;
+  direction: 'ton_to_atf' | 'atf_to_ton';
+  resolve: (value: string) => void;
+  reject: (reason: any) => void;
+  enqueuedAt: number;
+}
+
+// ─── Smart queue: batches ATF→TON swaps based on admin TON balance ─────────
+class AtfToTonQueue {
+  private queue: QueuedSwap[] = [];
+  private isRunning = false;
+  private adminWallet: AdminWalletService;
+  private executor: (userId: number, confirmation: SwapConfirmation, direction: 'ton_to_atf' | 'atf_to_ton') => Promise<string>;
+
+  constructor(
+    executor: (userId: number, confirmation: SwapConfirmation, direction: 'ton_to_atf' | 'atf_to_ton') => Promise<string>
+  ) {
+    this.adminWallet = new AdminWalletService();
+    this.executor = executor;
+  }
+
+  async enqueue(
+    userId: number,
+    confirmation: SwapConfirmation,
+    direction: 'ton_to_atf' | 'atf_to_ton'
+  ): Promise<string> {
+    return new Promise((resolve, reject) => {
+      this.queue.push({
+        userId,
+        confirmation,
+        direction,
+        resolve,
+        reject,
+        enqueuedAt: Date.now(),
+      });
+      this.process();
+    });
+  }
+
+  private async process() {
+    if (this.isRunning) return;
+    this.isRunning = true;
+
+    try {
+      while (this.queue.length > 0) {
+        // Reject expired items (5 min timeout)
+        const now = Date.now();
+        while (this.queue.length > 0 && now - this.queue[0].enqueuedAt > 5 * 60 * 1000) {
+          const expired = this.queue.shift()!;
+          expired.reject(new Error('Swap queue timeout. Admin gas treasury busy. Please try again.'));
+        }
+
+        if (this.queue.length === 0) break;
+
+        await this.adminWallet.initialize();
+        const adminBalance = await this.adminWallet.getBalance();
+
+        // Gas required per swap + 0.05 TON safety buffer
+        const firstItem = this.queue[0];
+        const gasPerSwap = firstItem.confirmation.gasTon
+          ? BigInt(Math.round(parseFloat(firstItem.confirmation.gasTon) * 1e9))
+          : BigInt(Math.round(0.3 * 1e9));
+        const buffer = BigInt(Math.round(0.05 * 1e9));
+        const requiredPerSwap = gasPerSwap + buffer;
+
+        if (adminBalance < requiredPerSwap) {
+          console.log(
+            `[SwapQueue] Admin balance ${Precision.fromBaseUnits(adminBalance, 9)} TON < ${Precision.fromBaseUnits(requiredPerSwap, 9)} TON required. Waiting...`
+          );
+          await new Promise(r => setTimeout(r, 3000));
+          continue;
+        }
+
+        // Calculate batch size: how many can we fund concurrently?
+        let batchSize = 0;
+        let totalRequired = BigInt(0);
+        for (let i = 0; i < this.queue.length; i++) {
+          const itemGas = this.queue[i].confirmation.gasTon
+            ? BigInt(Math.round(parseFloat(this.queue[i].confirmation.gasTon!) * 1e9))
+            : gasPerSwap;
+          const itemRequired = itemGas + buffer;
+          if (totalRequired + itemRequired > adminBalance) break;
+          totalRequired += itemRequired;
+          batchSize++;
+        }
+
+        batchSize = Math.max(1, batchSize);
+        const batch = this.queue.splice(0, batchSize);
+
+        console.log(
+          `[SwapQueue] Processing batch of ${batchSize} swap(s). Queue remaining: ${this.queue.length}. Admin: ${Precision.fromBaseUnits(adminBalance, 9)} TON`
+        );
+
+        await Promise.all(
+          batch.map(async (item) => {
+            try {
+              const result = await this.executor(item.userId, item.confirmation, item.direction);
+              item.resolve(result);
+            } catch (err) {
+              item.reject(err);
+            }
+          })
+        );
+
+        // Brief pause for gas recoveries to settle before next batch check
+        if (this.queue.length > 0) {
+          await new Promise(r => setTimeout(r, 2000));
+        }
+      }
+    } catch (err) {
+      console.error('[SwapQueue] Fatal queue error:', err);
+    } finally {
+      this.isRunning = false;
+      if (this.queue.length > 0) {
+        this.process();
+      }
+    }
+  }
+}
+
+// ─── Swap Service ───────────────────────────────────────────────────────────
 export class SwapService {
   private walletService: WalletService;
   private adminWallet: AdminWalletService;
   private stonfi: STONFiAdapter;
   private priceService: PriceService;
+  private atfQueue: AtfToTonQueue;
 
   constructor() {
     this.walletService = new WalletService();
     this.adminWallet = new AdminWalletService();
     this.stonfi = new STONFiAdapter();
     this.priceService = PriceService.getInstance();
+    this.atfQueue = new AtfToTonQueue((userId, confirmation, direction) =>
+      this.executeSwapDirect(userId, confirmation, direction)
+    );
+  }
+
+  // Public entry point — routes ATF→TON through queue, TON→ATF goes direct
+  async executeSwap(
+    userId: number,
+    confirmation: SwapConfirmation,
+    direction: 'ton_to_atf' | 'atf_to_ton'
+  ): Promise<string> {
+    if (direction === 'atf_to_ton') {
+      return this.atfQueue.enqueue(userId, confirmation, direction);
+    }
+    return this.executeSwapDirect(userId, confirmation, direction);
   }
 
   async prepareSwap(request: SwapRequest): Promise<SwapConfirmation> {
@@ -145,7 +285,8 @@ export class SwapService {
     };
   }
 
-  async executeSwap(
+  // ─── Direct execution (used by queue for ATF→TON and directly for TON→ATF) ───
+  private async executeSwapDirect(
     userId: number,
     confirmation: SwapConfirmation,
     direction: 'ton_to_atf' | 'atf_to_ton'
@@ -418,5 +559,5 @@ export class SwapService {
       console.error('Fee transfer failed:', error);
     }
   }
-          }
-        
+        }
+                                       
