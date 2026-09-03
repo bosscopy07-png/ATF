@@ -499,7 +499,7 @@ async function executeSwap(userId: number, chatId: number): Promise<void> {
     ].filter(Boolean).join('\n');
 
     await clearState(userId);
-    await render(userId, chatId, caption, keyboards.backKeyboard('main'), { withImage: true });
+    await render(userId, chatId, caption, keyboards.backKeyboard('back_main'), { withImage: true });
   } catch (error: any) {
     await toast(userId, chatId, `❌ <b>Swap Failed</b>\n\n${error.message}`, keyboards.backKeyboard('swap'));
   }
