@@ -911,7 +911,7 @@ export class WalletService {
   // SEND TON
   // ===========================================================================
 
-async sendTon(
+  async sendTon(
     userId: number,
     toAddress: string,
     amount: bigint,
@@ -922,73 +922,46 @@ async sendTon(
       keyPair,
       contract,
       version,
-    } = await this.getWalletContext(
-      userId
-    );
+    } = await this.getWalletContext(userId);
 
-    const destination =
-      Address.parse(toAddress);
+    const destination = Address.parse(toAddress);
+    const opened = this.client.open(contract);
+    const seqno = await opened.getSeqno();
 
-    /**
-     * Re-open the correct wallet contract.
-     */
-    const opened =
-      this.client.open(contract);
-
-    const seqno =
-      await opened.getSeqno();
-
-    const message =
-      internal({
-        to: destination,
-        value: amount,
-        bounce: false,
-        body,
-      });
+    const message = internal({
+      to: destination,
+      value: amount,
+      bounce: false,
+      body,
+    });
 
     let transfer: Cell;
 
     if (version === 'v5r1') {
-      transfer =
-        contract.createTransfer({
-          seqno,
-          secretKey: keyPair.secretKey,
-          messages: [message],
-          sendMode:
-            SendMode.PAY_GAS_SEPARATELY |
-            SendMode.IGNORE_ERRORS,
-          timeout:
-            Math.floor(
-              Date.now() / 1000
-            ) + 60,
-        });
+      transfer = (contract as WalletContractV5R1).createTransfer({
+        seqno,
+        secretKey: keyPair.secretKey,
+        messages: [message],
+        sendMode:
+          SendMode.PAY_GAS_SEPARATELY |
+          SendMode.IGNORE_ERRORS,
+        timeout: Math.floor(Date.now() / 1000) + 60,
+      });
     } else {
-      transfer =
-        contract.createTransfer({
-          seqno,
-          secretKey: keyPair.secretKey,
-          messages: [message],
-        });
+      transfer = (contract as WalletContractV4).createTransfer({
+        seqno,
+        secretKey: keyPair.secretKey,
+        messages: [message],
+      });
     }
 
-    await this.client.sendExternalMessage(
-      opened,
-      transfer
-    );
-
-    /**
-     * Don't immediately assume the transfer failed just because
-     * the provider hasn't indexed it yet.
-     */
-    return this.waitForTransaction(
-      opened,
-      walletDoc.address,
-      seqno
-    );
+    await this.client.sendExternalMessage(opened, transfer);
+    return this.waitForTransaction(opened, walletDoc.address, seqno);
   }
+  
 
   // ===========================================
-async sendJetton(
+  async sendJetton(
     userId: number,
     toAddress: string,
     jettonMasterAddress: string,
@@ -999,117 +972,60 @@ async sendJetton(
       keyPair,
       contract,
       version,
-    } = await this.getWalletContext(
-      userId
+    } = await this.getWalletContext(userId);
+
+    const ownerAddress = Address.parse(walletDoc.address);
+    const destination = Address.parse(toAddress);
+    const userJettonWallet = await this.deriveJettonWallet(
+      walletDoc.address,
+      jettonMasterAddress
     );
 
-    const ownerAddress =
-      Address.parse(
-        walletDoc.address
-      );
+    const transferBody = beginCell()
+      .storeUint(0x0f8a7ea5, 32)
+      .storeUint(BigInt(Math.floor(Date.now() / 1000)), 64)
+      .storeCoins(amount)
+      .storeAddress(destination)
+      .storeAddress(ownerAddress)
+      .storeBit(0)
+      .storeCoins(toNano('0.001'))
+      .storeBit(0)
+      .endCell();
 
-    const destination =
-      Address.parse(toAddress);
+    const opened = this.client.open(contract);
+    const seqno = await opened.getSeqno();
 
-    /**
-     * Calculate the user's Jetton wallet from the master.
-     */
-    const userJettonWallet =
-      await this.deriveJettonWallet(
-        walletDoc.address,
-        jettonMasterAddress
-      );
-
-    /**
-     * Standard Jetton transfer body.
-     */
-    const transferBody =
-      beginCell()
-        .storeUint(
-          0x0f8a7ea5,
-          32
-        )
-        .storeUint(
-          BigInt(
-            Math.floor(
-              Date.now() / 1000
-            )
-          ),
-          64
-        )
-        .storeCoins(amount)
-        .storeAddress(destination)
-        .storeAddress(ownerAddress)
-
-        // custom_payload = null
-        .storeBit(0)
-
-        // forward_ton_amount
-        .storeCoins(
-          toNano('0.001')
-        )
-
-        // forward_payload = empty
-        .storeBit(0)
-        .endCell();
-
-    /**
-     * Send the Jetton transfer message from the user's
-     * actual wallet contract.
-     *
-     * V4 uses V4.
-     * W5 uses V5.
-     */
-    const opened =
-      this.client.open(contract);
-
-    const seqno =
-      await opened.getSeqno();
-
-    const message =
-      internal({
-        to: userJettonWallet,
-        value: toNano('0.05'),
-        bounce: true,
-        body: transferBody,
-      });
+    const message = internal({
+      to: userJettonWallet,
+      value: toNano('0.05'),
+      bounce: true,
+      body: transferBody,
+    });
 
     let transfer: Cell;
 
     if (version === 'v5r1') {
-      transfer =
-        contract.createTransfer({
-          seqno,
-          secretKey: keyPair.secretKey,
-          messages: [message],
-          sendMode:
-            SendMode.PAY_GAS_SEPARATELY |
-            SendMode.IGNORE_ERRORS,
-          timeout:
-            Math.floor(
-              Date.now() / 1000
-            ) + 60,
-        });
+      transfer = (contract as WalletContractV5R1).createTransfer({
+        seqno,
+        secretKey: keyPair.secretKey,
+        messages: [message],
+        sendMode:
+          SendMode.PAY_GAS_SEPARATELY |
+          SendMode.IGNORE_ERRORS,
+        timeout: Math.floor(Date.now() / 1000) + 60,
+      });
     } else {
-      transfer =
-        contract.createTransfer({
-          seqno,
-          secretKey: keyPair.secretKey,
-          messages: [message],
-        });
+      transfer = (contract as WalletContractV4).createTransfer({
+        seqno,
+        secretKey: keyPair.secretKey,
+        messages: [message],
+      });
     }
 
-    await this.client.sendExternalMessage(
-      opened,
-      transfer
-    );
-
-    return this.waitForTransaction(
-      opened,
-      walletDoc.address,
-      seqno
-    );
-  }
+    await this.client.sendExternalMessage(opened, transfer);
+    return this.waitForTransaction(opened, walletDoc.address, seqno);
+        }
+  
 
   // ===========================================================================
   // JETTON WALLET
