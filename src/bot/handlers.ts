@@ -1215,7 +1215,7 @@ async function showReferral(userId: number, chatId: number): Promise<void> {
     `<code>${link}</code>`,
     ``,
     `<i>Share your link. When they trade, you earn!</i>`,
-  ].join('\n'), keyboards.backKeyboard('main'), { withImage: true });
+  ].join('\n'), keyboards.backKeyboard('back_main'), { withImage: true });
 }
 
 /* ───────────────────────────────────────────────────────────────────────────
