@@ -56,6 +56,8 @@ export const config = {
   minSwapTon: requireEnvNumber('MIN_SWAP_TON', 0.1),
   maxSlippagePercent: requireEnvNumber('MAX_SLIPPAGE_PERCENT', 1.0),
   botBrandingImageUrl: requireEnv('BOT_BRANDING_IMAGE_URL'),
+  platformWithdrawalFeePercent: 1.0, 
+  platformDepositFeePercent: 1.0,   
   renderExternalUrl: process.env.RENDER_EXTERNAL_URL || '',
 
   // ─── Bot identity ─────────────────────────────────────────
