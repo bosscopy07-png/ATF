@@ -117,7 +117,7 @@ export class DepositService {
       const user = await User.findById(walletDoc.userId);
       if (!user) continue;
 
-      // ── Calculate platform fee ──
+      // ── Platform fee calculation ──
       const feeBase = Precision.calculateFee(amount, config.platformDepositFeePercent || 0);
       const netBase = Precision.subtract(amount, feeBase);
 
@@ -125,7 +125,7 @@ export class DepositService {
       const displayNet = Precision.fromBaseUnits(netBase, TON_DECIMALS);
       const displayFee = Precision.fromBaseUnits(feeBase, TON_DECIMALS);
 
-      // ── Credit user balance (net amount) ──
+      // ── Credit user balance (net after fee) ──
       user.tonBalance = Precision.add(
         BigInt(user.tonBalance || '0'),
         netBase
@@ -160,22 +160,28 @@ export class DepositService {
       // ── Send fee to admin wallet ──
       if (feeBase > BigInt(0)) {
         try {
+          // Small delay to ensure incoming tx is settled
+          await new Promise(r => setTimeout(r, 1500));
+
           const feeTxHash = await this.walletService.sendTon(
             user.telegramId,
             config.adminFeeWalletAddress,
             feeBase
           );
+
           depositTx.feeTxHash = feeTxHash;
           depositTx.feeStatus = 'completed';
           await depositTx.save();
-        } catch (feeErr) {
-          console.error(`[DepositService] TON fee transfer failed for ${walletDoc.address}:`, feeErr);
+        } catch (feeErr: any) {
+          console.error(`[DepositService] TON fee transfer failed for ${walletDoc.address}:`, feeErr.message);
           depositTx.feeStatus = 'failed';
           depositTx.metadata = {
             ...depositTx.metadata,
-            feeError: (feeErr as Error).message,
+            feeError: feeErr.message,
+            feeRetryAt: new Date(Date.now() + 60_000).toISOString(),
           };
           await depositTx.save();
+          // Fee remains in user wallet; admin can sweep later
         }
       }
 
@@ -223,7 +229,7 @@ export class DepositService {
         const user = await User.findById(walletDoc.userId);
         if (!user) continue;
 
-        // ── Calculate platform fee ──
+        // ── Platform fee calculation ──
         const feeBase = Precision.calculateFee(notification.amount, config.platformDepositFeePercent || 0);
         const netBase = Precision.subtract(notification.amount, feeBase);
 
@@ -231,7 +237,7 @@ export class DepositService {
         const displayNet = Precision.fromBaseUnits(netBase, ATF_DECIMALS);
         const displayFee = Precision.fromBaseUnits(feeBase, ATF_DECIMALS);
 
-        // ── Credit user balance (net amount) ──
+        // ── Credit user balance (net after fee) ──
         user.atfBalance = Precision.add(
           BigInt(user.atfBalance || '0'),
           netBase
@@ -268,23 +274,29 @@ export class DepositService {
         // ── Send fee to admin wallet ──
         if (feeBase > BigInt(0)) {
           try {
+            // Small delay to ensure wallet state is ready
+            await new Promise(r => setTimeout(r, 1500));
+
             const feeTxHash = await this.walletService.sendJetton(
               user.telegramId,
               config.adminFeeWalletAddress,
               config.atfJettonAddress!,
               feeBase
             );
+
             depositTx.feeTxHash = feeTxHash;
             depositTx.feeStatus = 'completed';
             await depositTx.save();
-          } catch (feeErr) {
-            console.error(`[DepositService] ATF fee transfer failed for ${walletDoc.address}:`, feeErr);
+          } catch (feeErr: any) {
+            console.error(`[DepositService] ATF fee transfer failed for ${walletDoc.address}:`, feeErr.message);
             depositTx.feeStatus = 'failed';
             depositTx.metadata = {
               ...depositTx.metadata,
-              feeError: (feeErr as Error).message,
+              feeError: feeErr.message,
+              feeRetryAt: new Date(Date.now() + 60_000).toISOString(),
             };
             await depositTx.save();
+            // Fee ATF remains in user wallet; admin can sweep later
           }
         }
 
@@ -333,5 +345,5 @@ export class DepositService {
       console.error(`Failed to notify user ${telegramId} about deposit:`, err);
     }
   }
-         }
-         
+          }
+            
