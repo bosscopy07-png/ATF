@@ -1646,9 +1646,151 @@ async function showAdminWithdrawals(userId: number, chatId: number, page: number
   }
 }
 
-async function showAdminSwaps(userId: number, chatId: numbe
+async function showAdminSwaps(userId: number, chatId: number, page: number): Promise<void> {
+  try {
+    await requireAdmin(userId);
+    const limit = 5;
+    const skip = (page - 1) * limit;
 
+    const txs = await Transaction.find({ type: 'swap' }).sort({ createdAt: -1 }).skip(skip).limit(limit + 1);
+    const hasMore = txs.length > limit;
+    const display = hasMore ? txs.slice(0, limit) : txs;
 
+    const lines = display.map((tx: any) => {
+      const amt = Precision.fromBaseUnits(BigInt(tx.amount), tx.asset === 'TON' ? TON_DECIMALS : ATF_DECIMALS);
+      return `🔄 <code>${tx.userId}</code> — <code>${Precision.formatDisplay(amt)} ${tx.asset}</code>`;
+    });
+
+    const caption = ['🔄 <b>SWAPS</b>', '', ...lines, '', `Page ${page}`].filter(Boolean).join('\n');
+    await render(userId, chatId, caption, keyboards.adminPaginationKeyboard('admin_swaps', page, hasMore), { withImage: true });
+  } catch {
+    await showMainMenu(userId, chatId);
+  }
+}
+
+async function showAdminTokenConfig(userId: number, chatId: number): Promise<void> {
+  try {
+    await requireAdmin(userId);
+    const caption = [
+      `🔷 <b>TOKEN CONFIG</b>`,
+      ``,
+      `ATF Jetton: <code>${formatAddressShort(config.atfJettonAddress)}</code>`,
+      `Decimals: <b>${ATF_DECIMALS}</b>`,
+      ``,
+      `<i>Edit via environment variables.</i>`,
+    ].join('\n');
+
+    await render(userId, chatId, caption, keyboards.backKeyboard('admin_panel'), { withImage: true });
+  } catch {
+    await showMainMenu(userId, chatId);
+  }
+}
+
+async function showAdminDexConfig(userId: number, chatId: number): Promise<void> {
+  try {
+    await requireAdmin(userId);
+    const caption = [
+      `🔀 <b>DEX CONFIG</b>`,
+      ``,
+      `STON.fi API: <code>${config.stonfiApiUrl}</code>`,
+      `Slippage: <b>${config.maxSlippagePercent}%</b>`,
+      ``,
+      `<i>Edit via environment variables.</i>`,
+    ].join('\n');
+
+    await render(userId, chatId, caption, keyboards.backKeyboard('admin_panel'), { withImage: true });
+  } catch {
+    await showMainMenu(userId, chatId);
+  }
+}
+
+async function showAdminFeeConfig(userId: number, chatId: number): Promise<void> {
+  try {
+    await requireAdmin(userId);
+    const caption = [
+      `💰 <b>FEE CONFIG</b>`,
+      ``,
+      `Swap Fee: <b>${config.platformSwapFeePercent}%</b>`,
+      `Fee Wallet: <code>${formatAddressShort(config.adminFeeWalletAddress)}</code>`,
+      ``,
+      `<i>Edit via environment variables.</i>`,
+    ].join('\n');
+
+    await render(userId, chatId, caption, keyboards.backKeyboard('admin_panel'), { withImage: true });
+  } catch {
+    await showMainMenu(userId, chatId);
+  }
+}
+
+async function showAdminPriceProviders(userId: number, chatId: number): Promise<void> {
+  try {
+    await requireAdmin(userId);
+    const caption = [
+      `📡 <b>PRICE PROVIDERS</b>`,
+      ``,
+      `TON/USD: <code>${config.tonPriceApiUrl || 'auto-fallback'}</code>`,
+      `ATF/USD: <code>${config.atfPriceApiUrl || 'auto-fallback'}</code>`,
+      `USD/NGN: <code>${config.usdNgnRateApiUrl || 'auto-fallback'}</code>`,
+      ``,
+      `<i>Edit via environment variables.</i>`,
+    ].join('\n');
+
+    await render(userId, chatId, caption, keyboards.backKeyboard('admin_panel'), { withImage: true });
+  } catch {
+    await showMainMenu(userId, chatId);
+  }
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+   📢 BROADCAST MESSAGE (Super Admin)
+   ─────────────────────────────────────────────────────────────────────────── */
+async function startBroadcast(userId: number, chatId: number): Promise<void> {
+  try {
+    await requireSuperAdmin(userId);
+    const user = await User.findOne({ telegramId: userId });
+    if (!user) return;
+
+    user.state = 'broadcast_input';
+    await user.save();
+
+    await render(userId, chatId, `📢 <b>BROADCAST MESSAGE</b>\n\nType the message to send to ALL users:`, keyboards.cancelKeyboard('admin_panel'), { withImage: true });
+  } catch {
+    await showAdminPanel(userId, chatId);
+  }
+}
+
+async function handleBroadcast(userId: number, chatId: number, text: string): Promise<void> {
+  try {
+    await requireSuperAdmin(userId);
+  } catch {
+    await showMainMenu(userId, chatId);
+    return;
+  }
+
+  const users = await User.find().select('telegramId');
+  let sent = 0;
+  let failed = 0;
+
+  for (const u of users) {
+    try {
+      await botInstance.sendMessage(u.telegramId, `📢 <b>Announcement</b>\n\n${text}`, { parse_mode: 'HTML' });
+      sent++;
+    } catch {
+      failed++;
+    }
+    if (sent % 20 === 0) await new Promise(r => setTimeout(r, 1000));
+  }
+
+  await clearState(userId);
+  await toast(userId, chatId, `✅ <b>Broadcast Complete</b>\n\nSent: <b>${sent}</b>\nFailed: <b>${failed}</b>`, keyboards.backKeyboard('admin_panel'));
+
+  await AdminAction.create({
+    adminId: userId,
+    action: 'BROADCAST_SENT',
+    target: 'all_users',
+    result: 'success',
+  });
+      }
 
                               /* ───────────────────────────────────────────────────────────────────────────
    📈 PLATFORM STATS
