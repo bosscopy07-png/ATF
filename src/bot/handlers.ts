@@ -17,20 +17,25 @@ import {
   isValidTelegramId,
   formatAddressShort,
 } from '../utils/validation';
-import * as keyboards from './keyboards';
+import * as keyboards from '../keyboard';
 
+/* ───────────────────────────────────────────────────────────────────────────
+   🔧 SERVICE INSTANCES
+   ─────────────────────────────────────────────────────────────────────────── */
 const swapService = new SwapService();
 const withdrawalService = new WithdrawalService();
 const walletService = new WalletService();
-const priceService = PriceService.getInstance();
+const priceService = new PriceService();
 
 let botInstance: TelegramBot;
 
-export function setBot(bot: TelegramBot) {
+export function setBot(bot: TelegramBot): void {
   botInstance = bot;
 }
 
-// ─── SINGLE-MESSAGE RENDER ENGINE ────────────────────────────────────────────
+/* ───────────────────────────────────────────────────────────────────────────
+   🎨 SINGLE-MESSAGE RENDER ENGINE
+   ─────────────────────────────────────────────────────────────────────────── */
 async function render(
   userId: number,
   chatId: number,
@@ -55,38 +60,26 @@ async function render(
         if (err.message?.includes('message is not modified')) return;
         try { await botInstance.deleteMessage(chatId, msgId); } catch {}
       }
-    } else if (msgId) {
-      try { await botInstance.deleteMessage(chatId, msgId); } catch {}
     }
 
-    const sent = await botInstance.sendPhoto(chatId, config.botBrandingImageUrl, {
-      caption: text,
-      parse_mode: 'HTML',
-      reply_markup: keyboard,
-    });
-
-    if (user) {
-      user.lastBotMessageId = sent.message_id;
-      user.lastMessageWasPhoto = true;
-      await user.save();
-    }
-    return;
+    try {
+      const sent = await botInstance.sendPhoto(chatId, config.botBrandingImageUrl, {
+        caption: text,
+        parse_mode: 'HTML',
+        reply_markup: keyboard,
+      });
+      if (user) {
+        user.lastBotMessageId = sent.message_id;
+        user.lastMessageWasPhoto = true;
+        await user.save();
+      }
+      return;
+    } catch {}
   }
 
   if (msgId) {
     if (user?.lastMessageWasPhoto) {
-      try {
-        await botInstance.editMessageCaption(text, {
-          chat_id: chatId,
-          message_id: msgId,
-          parse_mode: 'HTML',
-          reply_markup: keyboard,
-        });
-        return;
-      } catch (err: any) {
-        if (err.message?.includes('message is not modified')) return;
-        try { await botInstance.deleteMessage(chatId, msgId); } catch {}
-      }
+      try { await botInstance.deleteMessage(chatId, msgId); } catch {}
     } else {
       try {
         await botInstance.editMessageText(text, {
@@ -104,25 +97,22 @@ async function render(
     }
   }
 
-  const sent = await botInstance.sendMessage(chatId, text, {
-    parse_mode: 'HTML',
-    reply_markup: keyboard,
-    disable_web_page_preview: true,
-  });
-
-  if (user) {
-    user.lastBotMessageId = sent.message_id;
-    user.lastMessageWasPhoto = false;
-    await user.save();
-  }
+  try {
+    const sent = await botInstance.sendMessage(chatId, text, {
+      parse_mode: 'HTML',
+      reply_markup: keyboard,
+      disable_web_page_preview: true,
+    });
+    if (user) {
+      user.lastBotMessageId = sent.message_id;
+      user.lastMessageWasPhoto = false;
+      await user.save();
+    }
+  } catch {}
 }
 
 async function toast(userId: number, chatId: number, text: string, keyboard: any): Promise<void> {
   return render(userId, chatId, text, keyboard);
-}
-
-async function delUserMsg(chatId: number, messageId: number): Promise<void> {
-  try { await botInstance.deleteMessage(chatId, messageId); } catch {}
 }
 
 async function clearState(userId: number): Promise<void> {
@@ -134,7 +124,9 @@ async function clearState(userId: number): Promise<void> {
   }
 }
 
-// ─── User Lifecycle ──────────────────────────────────────────────────────────
+/* ───────────────────────────────────────────────────────────────────────────
+   👤 USER LIFECYCLE
+   ─────────────────────────────────────────────────────────────────────────── */
 async function getOrCreateUser(msg: TelegramBot.Message): Promise<any> {
   const telegramId = msg.from?.id;
   if (!telegramId) throw new Error('No telegram ID');
@@ -205,7 +197,9 @@ function explorerLink(txHash: string): string {
   return `https://tonscan.org/tx/${txHash}`;
 }
 
-// ─── Wallet Helpers ──────────────────────────────────────────────────────────
+/* ───────────────────────────────────────────────────────────────────────────
+   💼 WALLET HELPERS
+   ─────────────────────────────────────────────────────────────────────────── */
 async function getActiveWallet(userId: number): Promise<any> {
   const user = await User.findOne({ telegramId: userId });
   if (!user) return null;
@@ -221,6 +215,7 @@ async function getActiveWallet(userId: number): Promise<any> {
     await user.save();
     return wallets[wallets.length - 1];
   }
+
   return null;
 }
 
@@ -228,7 +223,9 @@ async function getUserWallets(userId: number): Promise<any[]> {
   return walletService.getWallets(userId);
 }
 
-// ─── Restore Last Action ─────────────────────────────────────────────────────
+/* ───────────────────────────────────────────────────────────────────────────
+   🔄 RESTORE LAST ACTION
+   ─────────────────────────────────────────────────────────────────────────── */
 async function restoreLastAction(userId: number, chatId: number): Promise<void> {
   const user = await User.findOne({ telegramId: userId });
   if (!user) {
@@ -236,16 +233,9 @@ async function restoreLastAction(userId: number, chatId: number): Promise<void> 
     return;
   }
 
-  if (user.state.includes('input') || user.state.includes('confirm')) {
+  if (user.state !== 'idle') {
     await clearState(userId);
-    await render(
-      userId,
-      chatId,
-      '👋 <b>Welcome back!</b>\n\nYour previous session was reset.',
-      keyboards.mainMenuKeyboard(user.isAdmin || user.isSuperAdmin),
-      { withImage: true }
-    );
-    setTimeout(() => showMainMenu(userId, chatId), 1200);
+    await render(userId, chatId, '🔙 <b>Welcome back!</b>\n\nYour previous session was reset.', keyboards.mainMenuKeyboard(user.isAdmin || user.isSuperAdmin));
     return;
   }
 
@@ -259,13 +249,14 @@ async function restoreLastAction(userId: number, chatId: number): Promise<void> 
     case 'admin_panel': await showAdminPanel(userId, chatId); break;
     default: await showMainMenu(userId, chatId);
   }
-    }
-  // ─── MAIN MENU ─────────────────────────────────────────────────────────────────
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+   🏠 MAIN MENU
+   ─────────────────────────────────────────────────────────────────────────── */
 export async function showMainMenu(userId: number, chatId: number): Promise<void> {
   const user = await User.findOne({ telegramId: userId });
-  if (!user) {
-    return;
-  }
+  if (!user) return;
 
   user.lastAction = 'main_menu';
   await user.save();
@@ -279,9 +270,7 @@ export async function showMainMenu(userId: number, chatId: number): Promise<void
       const onChain = await walletService.getBalance(wallet.address);
       tonBalance = Precision.fromBaseUnits(onChain.ton, TON_DECIMALS);
       atfBalance = Precision.fromBaseUnits(onChain.atf, ATF_DECIMALS);
-    } catch {
-      /* fallback */
-    }
+    } catch { /* fallback */ }
   }
 
   const [atfPrice, tonPrice, ngnRate] = await Promise.all([
@@ -290,49 +279,46 @@ export async function showMainMenu(userId: number, chatId: number): Promise<void
     priceService.getUsdNgnRate().catch(() => null),
   ]);
 
-  const tonUsd = tonPrice
-    ? priceService.convertCryptoToUsd(tonBalance, tonPrice.price, TON_DECIMALS)
-    : null;
-
-  const atfUsd = atfPrice
-    ? priceService.convertCryptoToUsd(atfBalance, atfPrice.price, ATF_DECIMALS)
-    : null;
-
+  const tonUsd = tonPrice ? priceService.convertCryptoToUsd(tonBalance, tonPrice.price, TON_DECIMALS) : null;
+  const atfUsd = atfPrice ? priceService.convertCryptoToUsd(atfBalance, atfPrice.price, ATF_DECIMALS) : null;
   const totalUsd = (parseFloat(tonUsd || '0') + parseFloat(atfUsd || '0')).toFixed(2);
   const totalNgn = ngnRate ? priceService.convertUsdToNgn(totalUsd, ngnRate.price) : null;
 
   const priceLine = atfPrice && tonPrice
-    ? `💎 TON <code>$${tonPrice.price.toFixed(2)}</code>  ·  🪙 ATF <code>$${atfPrice.price.toFixed(6)}</code>`
+    ? `📊 ATF <code>$${atfPrice.price.toFixed(6)}</code>  ·  TON <code>$${tonPrice.price.toFixed(2)}</code>`
     : '';
 
   const caption = [
-    `╔═══════════════════╗`,
-    `║   ⚡ ATF SWAP ⚡   ║`,
-    `╚═══════════════════╝`,
-    '',
-    `💎 <b>TON</b>      <code>${Precision.formatDisplay(tonBalance)}</code> TON`,
-    tonUsd ? `   <i>≈ $${tonUsd}</i>` : '',
-    '',
-    `🪙 <b>ATF</b>      <code>${Precision.formatDisplay(atfBalance)}</code> ATF`,
-    atfUsd ? `   <i>≈ $${atfUsd}</i>` : '',
-    ngnRate && atfUsd ? `   <i>≈ ₦${priceService.convertUsdToNgn(atfUsd, ngnRate.price)}</i>` : '',
-    '',
-    `━━━━━━━━━━━━━━━━━━━━━━━`,
-    totalUsd !== '0.00' ? `💼 Portfolio  <b>$${totalUsd}</b> ${totalNgn ? `· ₦${totalNgn}` : ''}` : '',
+    `╔══════════════════════╗`,
+    `║   🚀  ATF SWAP       ║`,
+    `╚══════════════════════╝`,
+    ``,
+    `💎 <b>TON</b>  <code>${Precision.formatDisplay(tonBalance)}</code> TON`,
+    tonUsd ? `<i>≈ $${tonUsd}</i>` : '',
+    ngnRate && tonUsd ? `<i>≈ ₦${priceService.convertUsdToNgn(tonUsd, ngnRate.price)}</i>` : '',
+    ``,
+    `🔷 <b>ATF</b>  <code>${Precision.formatDisplay(atfBalance)}</code> ATF`,
+    atfUsd ? `<i>≈ $${atfUsd}</i>` : '',
+    ngnRate && atfUsd ? `<i>≈ ₦${priceService.convertUsdToNgn(atfUsd, ngnRate.price)}</i>` : '',
+    ``,
+    `━━━━━━━━━━━━━━━━━━━━━━`,
+    totalUsd !== '0.00' ? `💰 Total <b>$${totalUsd}</b> ${totalNgn ? `· ₦${totalNgn}` : ''}` : '',
+    ``,
     priceLine,
-    '',
-    wallet && !wallet.isImported
-      ? `⚠️ <i>Tap "👤 Account" to back up your wallet</i>`
-      : '',
-    '',
-    `<i>Select an action below 👇</i>`,
+    ``,
+    wallet ? `👛 Wallet: <code>${formatAddressShort(wallet.address)}</code>` : '',
+    wallet?.isImported ? '<i>🔑 Imported Account</i>' : '<i>🆕 Created wallet</i>',
+    ``,
+    `<i>Tap an action below 👇</i>`,
   ].filter(Boolean).join('\n');
 
   const isAdmin = user.isAdmin === true || user.isSuperAdmin === true;
   await render(userId, chatId, caption, keyboards.mainMenuKeyboard(isAdmin), { withImage: true });
 }
 
-// ─── SWAP FLOW ───────────────────────────────────────────────────────────────
+/* ───────────────────────────────────────────────────────────────────────────
+   🔄 SWAP FLOW
+   ─────────────────────────────────────────────────────────────────────────── */
 async function showSwapPair(userId: number, chatId: number): Promise<void> {
   const user = await User.findOne({ telegramId: userId });
   if (user) {
@@ -341,11 +327,11 @@ async function showSwapPair(userId: number, chatId: number): Promise<void> {
   }
 
   await render(userId, chatId, [
-    '🔄 <b>INSTANT SWAP</b>',
-    '',
-    'Choose your trading pair:',
-    '',
-    '<i>Zero slippage protection enabled ✅</i>',
+    `⚡ <b>INSTANT SWAP</b>`,
+    ``,
+    `Choose your trading pair:`,
+    ``,
+    `<i>Zero slippage protection enabled ✅</i>`,
   ].join('\n'), keyboards.swapPairKeyboard());
 }
 
@@ -360,18 +346,16 @@ async function startSwapInput(userId: number, chatId: number, direction: 'ton_to
       const onChain = await walletService.getBalance(wallet.address);
       const raw = direction === 'ton_to_atf' ? onChain.ton : onChain.atf;
       balance = Precision.fromBaseUnits(raw, direction === 'ton_to_atf' ? TON_DECIMALS : ATF_DECIMALS);
-    } catch {
-      /* ignore */
-    }
+    } catch { /* ignore */ }
   }
 
   const caption = [
-    direction === 'ton_to_atf' ? '💎 <b>TON → ATF</b>' : '🪙 <b>ATF → TON</b>',
-    '',
+    direction === 'ton_to_atf' ? `🔄 <b>TON → ATF</b>` : `🔄 <b>ATF → TON</b>`,
+    ``,
     `Enter the amount to swap.`,
-    '',
+    ``,
     direction === 'ton_to_atf' ? `📌 Min: <b>${config.minSwapTon} TON</b>` : '',
-    `💰 Balance: <code>${Precision.formatDisplay(balance)} ${direction === 'ton_to_atf' ? 'TON' : 'ATF'}</code>`,
+    `💳 Balance: <code>${Precision.formatDisplay(balance)} ${direction === 'ton_to_atf' ? 'TON' : 'ATF'}</code>`,
   ].filter(Boolean).join('\n');
 
   user.state = `swap_input_${direction}`;
@@ -386,55 +370,55 @@ async function handleSwapInput(userId: number, chatId: number, text: string): Pr
   if (!user) return;
 
   const direction = user.state.replace('swap_input_', '') as 'ton_to_atf' | 'atf_to_ton';
-
   if (!isValidAmount(text)) {
     await toast(userId, chatId, '❌ Enter a valid positive number.', keyboards.backKeyboard('swap'));
     return;
   }
 
   try {
-    const confirmation = await swapService.prepareSwap({ userId, direction, amount: text });
+    const confirmation = await swapService.getSwapConfirmation(userId, text.trim(), direction);
     user.state = `swap_confirm_${direction}`;
-    user.stateData = { confirmation, inputAmount: text };
+    user.stateData = { confirmation, inputAmount: text.trim() };
     await user.save();
 
     const [atfPrice, tonPrice] = await Promise.all([
-      priceService.getAtfPriceUsd(),
-      priceService.getTonPriceUsd(),
+      priceService.getAtfPriceUsd().catch(() => null),
+      priceService.getTonPriceUsd().catch(() => null),
     ]);
 
-    let receiveUsd = '';
-    if (direction === 'ton_to_atf' && atfPrice) {
+    const isTonToAtf = direction === 'ton_to_atf';
+    let receiveUsd: string | null = null;
+    if (isTonToAtf && atfPrice) {
       receiveUsd = priceService.convertCryptoToUsd(confirmation.expectedOutput, atfPrice.price, ATF_DECIMALS);
-    } else if (direction === 'atf_to_ton' && tonPrice) {
+    } else if (!isTonToAtf && tonPrice) {
       receiveUsd = priceService.convertCryptoToUsd(confirmation.expectedOutput, tonPrice.price, TON_DECIMALS);
     }
 
-    const isTonToAtf = direction === 'ton_to_atf';
     const caption = [
-      '🔄 <b>SWAP QUOTE</b>',
-      '',
-      `<b>You Pay:</b>     <code>${Precision.formatDisplay(confirmation.inputAmount)} ${isTonToAtf ? 'TON' : 'ATF'}</code>`,
+      `📋 <b>SWAP QUOTE</b>`,
+      ``,
+      `<b>You Pay:</b> <code>${Precision.formatDisplay(confirmation.inputAmount)} ${isTonToAtf ? 'TON' : 'ATF'}</code>`,
       `<b>Platform Fee:</b> <code>${Precision.formatDisplay(confirmation.platformFee)} ${isTonToAtf ? 'TON' : 'ATF'}</code>`,
-      `<b>Swap Net:</b>     <code>${Precision.formatDisplay(confirmation.netSwapAmount)} ${isTonToAtf ? 'TON' : 'ATF'}</code>`,
-      '',
-      `<b>You Receive:</b>  <code>${Precision.formatDisplay(confirmation.expectedOutput)} ${isTonToAtf ? 'ATF' : 'TON'}</code>`,
-      receiveUsd ? `   <i>≈ $${receiveUsd}</i>` : '',
-      `<b>Minimum:</b>     <code>${Precision.formatDisplay(confirmation.minOutput)} ${isTonToAtf ? 'ATF' : 'TON'}</code>`,
+      `<b>Swap Net:</b> <code>${Precision.formatDisplay(confirmation.netSwapAmount)} ${isTonToAtf ? 'TON' : 'ATF'}</code>`,
+      ``,
+      `<b>You Receive:</b> <code>${Precision.formatDisplay(confirmation.expectedOutput)} ${isTonToAtf ? 'ATF' : 'TON'}</code>`,
+      receiveUsd ? `<i>≈ $${receiveUsd}</i>` : '',
+      `<b>Minimum:</b> <code>${Precision.formatDisplay(confirmation.minOutput)} ${isTonToAtf ? 'ATF' : 'TON'}</code>`,
       isTonToAtf ? `<b>Network Cost:</b> <code>${Precision.formatDisplay(confirmation.dexCosts)} TON</code>` : '',
-      '',
+      ``,
       `<b>Rate:</b> ${confirmation.rate}`,
       `⏳ Expires in <b>${Math.max(0, Math.floor((confirmation.expiresAt.getTime() - Date.now()) / 1000))}s</b>`,
     ].filter(Boolean).join('\n');
 
     await render(userId, chatId, caption, keyboards.confirmSwapKeyboard());
   } catch (error: any) {
-    const msg = error.message?.includes('Minimum')
-      ? `❌ Minimum swap is <b>${config.minSwapTon} TON</b>`
-      : error.message?.includes('gas treasury')
-      ? `⏳ ${error.message}`
-      : `❌ ${error.message}`;
-    await toast(userId, chatId, msg, keyboards.backKeyboard('swap'));
+    let msg = error.message || 'Swap failed';
+    if (error.message?.includes('Minimum')) {
+      msg = `📌 Minimum swap is <b>${config.minSwapTon} TON</b>`;
+    } else if (error.message?.includes('gas') || error.message?.includes('treasury')) {
+      msg = `⛽ <b>Insufficient gas</b>\n\nPlease top up your TON balance.`;
+    }
+    await toast(userId, chatId, `❌ ${msg}`, keyboards.backKeyboard('swap'));
   }
 }
 
@@ -446,45 +430,44 @@ async function executeSwap(userId: number, chatId: number): Promise<void> {
   }
 
   const direction = user.state.replace('swap_confirm_', '') as 'ton_to_atf' | 'atf_to_ton';
-  const { confirmation } = user.stateData;
-
-  if (!confirmation || new Date() > new Date(confirmation.expiresAt)) {
+  const { confirmation } = user.stateData || {};
+  if (!confirmation || new Date() > confirmation.expiresAt) {
     await clearState(userId);
-    await toast(userId, chatId, '❌ Quote expired. Start again.', keyboards.backKeyboard('swap'));
+    await toast(userId, chatId, '⏳ Quote expired. Start again.', keyboards.backKeyboard('swap'));
     return;
   }
 
-  await render(userId, chatId, '⏳ <b>Executing Swap…</b>\n\nBroadcasting to TON blockchain ⛓️', { inline_keyboard: [] });
+  await render(userId, chatId, `🔄 <b>Executing Swap...</b>\n\nBroadcasting to TON blockchain ⛓️`, { inline_keyboard: [] });
 
-  try {   
+  try {
     const txId = await swapService.executeSwap(userId, confirmation, direction);
-    // Force status to completed since blockchain broadcast succeeded
     await Transaction.findByIdAndUpdate(txId, { status: 'completed' });
     const txRecord = await Transaction.findById(txId);
     const txHash = txRecord?.txHash || '';
     const link = explorerLink(txHash);
-
     const isTonToAtf = direction === 'ton_to_atf';
+
     const caption = [
-      '✅ <b>Swap Executed</b>',
-      '',
-      `<b>Sent:</b>     ${Precision.formatDisplay(confirmation.inputAmount)} ${isTonToAtf ? 'TON' : 'ATF'}`,
-      `<b>Receive:</b>  ${Precision.formatDisplay(confirmation.expectedOutput)} ${isTonToAtf ? 'ATF' : 'TON'}`,
-      `<b>Speed:</b>    ~3–6s`,
-      `<b>Asset:</b>    ${isTonToAtf ? 'ATF' : 'TON'}`,
+      `✅ <b>Swap Executed</b>`,
+      ``,
+      `<b>Sent:</b> ${Precision.formatDisplay(confirmation.inputAmount)} ${isTonToAtf ? 'TON' : 'ATF'}`,
+      `<b>Receive:</b> ${Precision.formatDisplay(confirmation.expectedOutput)} ${isTonToAtf ? 'ATF' : 'TON'}`,
+      `<b>Speed:</b> ~3–6s`,
+      `<b>Asset:</b> ${isTonToAtf ? 'ATF' : 'TON'}`,
       link ? `🔗 <a href="${link}">View on Explorer</a>` : '',
-      '',
-      '<i>Transaction done. Kindly check your wallet ✅</i>',
+      ``,
+      `<i>Transaction done. Kindly check your wallet ✅</i>`,
     ].filter(Boolean).join('\n');
 
     await clearState(userId);
-    await render(userId, chatId, caption, keyboards.backKeyboard('back_main'));
+    await render(userId, chatId, caption, keyboards.backKeyboard('main'));
   } catch (error: any) {
     await toast(userId, chatId, `❌ <b>Swap Failed</b>\n\n${error.message}`, keyboards.backKeyboard('swap'));
   }
 }
-
-// ─── DEPOSIT FLOW ──────────────────────────────────────────────────────────
+/* ───────────────────────────────────────────────────────────────────────────
+   📥 DEPOSIT FLOW
+   ─────────────────────────────────────────────────────────────────────────── */
 async function showDepositMenu(userId: number, chatId: number): Promise<void> {
   const user = await User.findOne({ telegramId: userId });
   if (user) {
@@ -493,11 +476,11 @@ async function showDepositMenu(userId: number, chatId: number): Promise<void> {
   }
 
   await render(userId, chatId, [
-    '💰 <b>DEPOSIT</b>',
-    '',
-    'Select asset to deposit:',
-    '',
-    '<i>All deposits are auto-credited ✅</i>',
+    `📥 <b>DEPOSIT</b>`,
+    ``,
+    `Select asset to deposit:`,
+    ``,
+    `<i>All deposits are auto-credited ✅</i>`,
   ].join('\n'), keyboards.depositKeyboard());
 }
 
@@ -509,15 +492,15 @@ async function showDepositTon(userId: number, chatId: number): Promise<void> {
   }
 
   await render(userId, chatId, [
-    '💎 <b>DEPOSIT TON</b>',
-    '',
+    `📥 <b>DEPOSIT TON</b>`,
+    ``,
     `Send TON to your custodial address:`,
-    '',
+    ``,
     `<code>${wallet.address}</code>`,
-    '',
-    '⚠️ <i>Only send native TON to this address.</i>',
-    '',
-    '⏱ Deposits are credited automatically in ~3s.',
+    ``,
+    `⚠️ <i>Only send native TON to this address.</i>`,
+    ``,
+    `✅ Deposits are credited automatically in ~3s.`,
   ].join('\n'), keyboards.depositTonScreen(wallet.address));
 }
 
@@ -529,17 +512,17 @@ async function showDepositAtf(userId: number, chatId: number): Promise<void> {
   }
 
   await render(userId, chatId, [
-    '🪙 <b>DEPOSIT ATF</b>',
-    '',
+    `📥 <b>DEPOSIT ATF</b>`,
+    ``,
     `Send ATF Jetton to:`,
-    '',
+    ``,
     `<code>${wallet.address}</code>`,
-    '',
+    ``,
     `Token: <b>ATF</b>`,
-    '⚠️ <i>Only send the official ATF Jetton.</i>',
-    '',
-    '⏱ Deposits are credited automatically in ~3s.',
-  ].join('\n'), keyboards.depositAtfScreen());
+    `⚠️ <i>Only send the official ATF Jetton.</i>`,
+    ``,
+    `✅ Deposits are credited automatically in ~3s.`,
+  ].join('\n'), keyboards.depositAtfScreen(wallet.address));
 }
 
 async function checkDepositStatus(userId: number, chatId: number, asset: 'TON' | 'ATF'): Promise<void> {
@@ -549,8 +532,8 @@ async function checkDepositStatus(userId: number, chatId: number, asset: 'TON' |
     return;
   }
 
-  await render(userId, chatId, `🔄 <b>Checking ${asset} Deposits…</b>\n\nScanning blockchain 🔍`, {
-    inline_keyboard: [[{ text: '⬅️ Back', callback_data: `deposit_${asset.toLowerCase()}` }]],
+  await render(userId, chatId, `🔍 <b>Checking ${asset} deposits...</b>\n\nScanning blockchain ⛓️`, {
+    inline_keyboard: [[{ text: '🔙 Back', callback_data: `deposit_${asset.toLowerCase()}` }]],
   });
 
   try {
@@ -559,18 +542,19 @@ async function checkDepositStatus(userId: number, chatId: number, asset: 'TON' |
       ? Precision.fromBaseUnits(onChain.ton, TON_DECIMALS)
       : Precision.fromBaseUnits(onChain.atf, ATF_DECIMALS);
 
-    await toast(
-      userId,
-      chatId,
-      `✅ <b>${asset} Balance Updated</b>\n\nCurrent: <code>${Precision.formatDisplay(balance)} ${asset}</code>`,
-      keyboards.backKeyboard('deposit')
-    );
+    await toast(userId, chatId, [
+      `✅ <b>${asset} Balance Updated</b>`,
+      ``,
+      `Current: <code>${Precision.formatDisplay(balance)} ${asset}</code>`,
+    ].join('\n'), keyboards.backKeyboard('deposit'));
   } catch (error: any) {
     await toast(userId, chatId, `❌ Check failed: ${error.message}`, keyboards.backKeyboard('deposit'));
   }
 }
 
-// ─── WITHDRAWAL FLOW ─────────────────────────────────────────────────────────
+/* ───────────────────────────────────────────────────────────────────────────
+   📤 WITHDRAWAL FLOW
+   ─────────────────────────────────────────────────────────────────────────── */
 async function showWithdrawMenu(userId: number, chatId: number): Promise<void> {
   const user = await User.findOne({ telegramId: userId });
   if (user) {
@@ -579,11 +563,11 @@ async function showWithdrawMenu(userId: number, chatId: number): Promise<void> {
   }
 
   await render(userId, chatId, [
-    '💸 <b>WITHDRAW</b>',
-    '',
-    'Select asset to withdraw:',
-    '',
-    '<i>Double-check your destination address!</i>',
+    `📤 <b>WITHDRAW</b>`,
+    ``,
+    `Select asset to withdraw:`,
+    ``,
+    `<i>Double-check your destination address!</i>`,
   ].join('\n'), keyboards.withdrawAssetKeyboard());
 }
 
@@ -596,11 +580,11 @@ async function startWithdrawal(userId: number, chatId: number, asset: 'TON' | 'A
   await user.save();
 
   await render(userId, chatId, [
-    `💸 <b>WITHDRAW ${asset}</b>`,
-    '',
-    'Enter the destination TON address.',
-    '',
-    '<i>Example: EQD... or UQD...</i>',
+    `📤 <b>WITHDRAW ${asset}</b>`,
+    ``,
+    `Enter the destination TON address.`,
+    ``,
+    `<i>Example: EQD... or UQD...</i>`,
   ].join('\n'), keyboards.cancelKeyboard('withdraw'));
 }
 
@@ -609,7 +593,6 @@ async function handleWithdrawAddress(userId: number, chatId: number, text: strin
   if (!user || !user.state.startsWith('withdraw_address_')) return;
 
   const asset = user.state.replace('withdraw_address_', '') as 'TON' | 'ATF';
-
   if (!isValidTonAddress(text)) {
     await toast(userId, chatId, '❌ Invalid TON address. Try again.', keyboards.cancelKeyboard('withdraw'));
     return;
@@ -620,10 +603,10 @@ async function handleWithdrawAddress(userId: number, chatId: number, text: strin
   await user.save();
 
   await render(userId, chatId, [
-    `💸 <b>WITHDRAW ${asset}</b>`,
-    '',
+    `📤 <b>WITHDRAW ${asset}</b>`,
+    ``,
     `Destination: <code>${formatAddressShort(text)}</code>`,
-    '',
+    ``,
     `Enter ${asset} amount:`,
   ].join('\n'), keyboards.cancelKeyboard('withdraw'));
 }
@@ -633,7 +616,6 @@ async function handleWithdrawAmount(userId: number, chatId: number, text: string
   if (!user || !user.state.startsWith('withdraw_amount_')) return;
 
   const asset = user.state.replace('withdraw_amount_', '') as 'TON' | 'ATF';
-
   if (!isValidAmount(text)) {
     await toast(userId, chatId, '❌ Invalid amount.', keyboards.cancelKeyboard('withdraw'));
     return;
@@ -643,22 +625,22 @@ async function handleWithdrawAmount(userId: number, chatId: number, text: string
     const prep = await withdrawalService.prepareWithdrawal({
       userId,
       asset,
-      amount: text,
+      amount: text.trim(),
       toAddress: user.stateData.address,
     });
 
     user.state = `withdraw_confirm_${asset}`;
-    user.stateData = { ...user.stateData, amount: text, prep };
+    user.stateData = { address: user.stateData.address, amount: text.trim(), prep };
     await user.save();
 
     await render(userId, chatId, [
-      '💸 <b>CONFIRM WITHDRAWAL</b>',
-      '',
-      `<b>Asset:</b>      ${asset}`,
-      `<b>To:</b>         <code>${formatAddressShort(prep.toAddress)}</code>`,
-      `<b>Amount:</b>     ${Precision.formatDisplay(prep.amount)} ${asset}`,
+      `📋 <b>CONFIRM WITHDRAWAL</b>`,
+      ``,
+      `<b>Asset:</b> ${asset}`,
+      `<b>To:</b> <code>${formatAddressShort(prep.toAddress)}</code>`,
+      `<b>Amount:</b> <code>${Precision.formatDisplay(prep.amount)} ${asset}</code>`,
       `<b>Network Fee:</b> ≈ ${prep.networkCost} TON`,
-      `<b>Receive:</b>    ${Precision.formatDisplay(prep.receiveAmount)} ${asset}`,
+      `<b>Net Receive:</b> <code>${Precision.formatDisplay(prep.receiveAmount)} ${asset}</code>`,
     ].join('\n'), keyboards.confirmWithdrawalKeyboard());
   } catch (error: any) {
     await toast(userId, chatId, `❌ ${error.message}`, keyboards.cancelKeyboard('withdraw'));
@@ -675,17 +657,16 @@ async function executeWithdrawal(userId: number, chatId: number): Promise<void> 
   const asset = user.state.replace('withdraw_confirm_', '') as 'TON' | 'ATF';
   const { address, amount } = user.stateData;
 
-  await render(userId, chatId, '⏳ <b>Broadcasting Withdrawal…</b>\n\nPlease wait ⛓️', { inline_keyboard: [] });
+  await render(userId, chatId, `📡 <b>Broadcasting Withdrawal...</b>\n\nPlease wait ⏳`, { inline_keyboard: [] });
 
-  try {   
-       
+  try {
     const txId = await withdrawalService.executeWithdrawal({
       userId,
       asset,
       amount,
       toAddress: address,
     });
-    // Force status to completed
+
     await Transaction.findByIdAndUpdate(txId, { status: 'completed' });
     const txRecord = await Transaction.findById(txId);
     const txHash = txRecord?.txHash || '';
@@ -693,21 +674,23 @@ async function executeWithdrawal(userId: number, chatId: number): Promise<void> 
 
     await clearState(userId);
     await render(userId, chatId, [
-      '✅ <b>Withdrawal Sent</b>',
-      '',
-      `<b>Amount:</b>  ${amount} ${asset}`,
-      `<b>Speed:</b>   ~3s`,
-      `<b>Asset:</b>   ${asset}`,
+      `✅ <b>Withdrawal Sent</b>`,
+      ``,
+      `<b>Amount:</b> ${amount} ${asset}`,
+      `<b>Speed:</b> ~3s`,
+      `<b>Asset:</b> ${asset}`,
       link ? `🔗 <a href="${link}">View on Explorer</a>` : '',
-      '',
-      '<i>Transaction done. Kindly check your wallet ✅</i>',
-    ].filter(Boolean).join('\n'), keyboards.backKeyboard('back_main'));
+      ``,
+      `<i>Transaction done. Kindly check your wallet ✅</i>`,
+    ].filter(Boolean).join('\n'), keyboards.backKeyboard('main'));
   } catch (error: any) {
     await toast(userId, chatId, `❌ <b>Withdrawal Failed</b>\n\n${error.message}`, keyboards.cancelKeyboard('withdraw'));
   }
 }
 
-// ─── ACCOUNT / DASHBOARD ─────────────────────────────────────────────────────
+/* ───────────────────────────────────────────────────────────────────────────
+   👤 ACCOUNT / DASHBOARD
+   ─────────────────────────────────────────────────────────────────────────── */
 async function showAccount(userId: number, chatId: number): Promise<void> {
   const user = await User.findOne({ telegramId: userId });
   if (!user) return;
@@ -724,9 +707,7 @@ async function showAccount(userId: number, chatId: number): Promise<void> {
       const onChain = await walletService.getBalance(wallet.address);
       tonBalance = Precision.fromBaseUnits(onChain.ton, TON_DECIMALS);
       atfBalance = Precision.fromBaseUnits(onChain.atf, ATF_DECIMALS);
-    } catch {
-      /* ignore */
-    }
+    } catch { /* ignore */ }
   }
 
   const [tonPrice, atfPrice, ngnRate] = await Promise.all([
@@ -740,41 +721,49 @@ async function showAccount(userId: number, chatId: number): Promise<void> {
   const totalUsd = (parseFloat(tonUsd || '0') + parseFloat(atfUsd || '0')).toFixed(2);
   const totalNgn = ngnRate ? priceService.convertUsdToNgn(totalUsd, ngnRate.price) : null;
 
+  const versionTag = wallet?.walletVersion
+    ? `🔧 ${wallet.walletVersion.toUpperCase()}`
+    : wallet?.isImported
+    ? '🔑 Imported wallet'
+    : '🆕 Created wallet';
+
   const caption = [
-    '👤 <b>MY DASHBOARD</b>',
-    '',
-    `💎 TON      <code>${Precision.formatDisplay(tonBalance)}</code>`,
-    tonUsd ? `   <i>≈ $${tonUsd}</i>` : '',
-    '',
-    `🪙 ATF      <code>${Precision.formatDisplay(atfBalance)}</code>`,
-    atfUsd ? `   <i>≈ $${atfUsd}</i>` : '',
-    ngnRate && atfUsd ? `   <i>≈ ₦${priceService.convertUsdToNgn(atfUsd, ngnRate.price)}</i>` : '',
-    '',
-    '━━━━━━━━━━━━━━━━━━━━━━━',
-    totalUsd !== '0.00' ? `💼 Total  <b>$${totalUsd}</b> ${totalNgn ? `· ₦${totalNgn}` : ''}` : '',
-    '',
-    atfPrice ? `📈 ATF <code>$${atfPrice.price.toFixed(6)}</code>` : '',
-    '',
-    wallet ? `🔑 Wallet: <code>${formatAddressShort(wallet.address)}</code>` : '',
-    wallet?.isImported ? '✅ <i>Imported wallet</i>' : '✅ <i>Created wallet</i>',
+    `👤 <b>MY DASHBOARD</b>`,
+    ``,
+    `💎 TON  <code>${Precision.formatDisplay(tonBalance)}</code>`,
+    tonUsd ? `<i>≈ $${tonUsd}</i>` : '',
+    ``,
+    `🔷 ATF  <code>${Precision.formatDisplay(atfBalance)}</code>`,
+    atfUsd ? `<i>≈ $${atfUsd}</i>` : '',
+    ngnRate && atfUsd ? `<i>≈ ₦${priceService.convertUsdToNgn(atfUsd, ngnRate.price)}</i>` : '',
+    ``,
+    `━━━━━━━━━━━━━━━━━━━━━━`,
+    totalUsd !== '0.00' ? `💰 Total <b>$${totalUsd}</b> ${totalNgn ? `· ₦${totalNgn}` : ''}` : '',
+    ``,
+    atfPrice ? `📊 ATF <code>$${atfPrice.price.toFixed(6)}</code>` : '',
+    ``,
+    wallet ? `👛 Wallet: <code>${formatAddressShort(wallet.address)}</code>` : '',
+    versionTag,
   ].filter(Boolean).join('\n');
 
   await render(userId, chatId, caption, keyboards.accountKeyboard());
 }
 
-// ─── MULTI-WALLET SYSTEM ─────────────────────────────────────────────────────
+/* ───────────────────────────────────────────────────────────────────────────
+   👛 MULTI-WALLET SYSTEM
+   ─────────────────────────────────────────────────────────────────────────── */
 async function showWalletList(userId: number, chatId: number): Promise<void> {
   const user = await User.findOne({ telegramId: userId });
   if (!user) return;
 
   const wallets = await getUserWallets(userId);
-  const activeId = user.activeWalletId?.toString() || '';
+  const activeId = user.activeWalletId;
 
   await render(userId, chatId, [
-    '💼 <b>MY WALLETS</b>',
-    '',
+    `👛 <b>MY WALLETS</b>`,
+    ``,
     `You have <b>${wallets.length}</b> wallet${wallets.length !== 1 ? 's' : ''}.`,
-    'Tap to switch active wallet:',
+    `Tap to switch active wallet:`,
   ].join('\n'), keyboards.walletListKeyboard(wallets, activeId));
 }
 
@@ -784,7 +773,7 @@ async function switchWallet(userId: number, chatId: number, walletId: string): P
 
   const hasWallet = user.walletIds.some((id: any) => id.toString() === walletId);
   if (!hasWallet) {
-    await toast(userId, chatId, '❌ Wallet not found.', keyboards.backKeyboard('my_wallets'));
+    await toast(userId, chatId, '❌ Wallet not found.', keyboards.backKeyboard('account'));
     return;
   }
 
@@ -794,6 +783,7 @@ async function switchWallet(userId: number, chatId: number, walletId: string): P
   await toast(userId, chatId, '✅ <b>Wallet Switched</b>', keyboards.backKeyboard('account'));
   setTimeout(() => showAccount(userId, chatId), 1000);
 }
+
 async function createNewWallet(userId: number, chatId: number): Promise<void> {
   try {
     const newWallet = await walletService.createWallet(userId);
@@ -804,22 +794,31 @@ async function createNewWallet(userId: number, chatId: number): Promise<void> {
       await user.save();
     }
 
-    await toast(userId, chatId, `✅ <b>New Wallet Created</b>\n\nAddress: <code>${formatAddressShort(newWallet.address)}</code>\n\nSwitched to new wallet automatically.`, keyboards.backKeyboard('account'));
+    await toast(userId, chatId, [
+      `✅ <b>New Wallet Created</b>`,
+      ``,
+      `Address: <code>${formatAddressShort(newWallet.address)}</code>`,
+      ``,
+      `Switched to new wallet automatically.`,
+    ].join('\n'), keyboards.backKeyboard('account'));
+
     setTimeout(() => showAccount(userId, chatId), 1500);
   } catch (error: any) {
     await toast(userId, chatId, `❌ Failed to create wallet: ${error.message}`, keyboards.backKeyboard('account'));
   }
 }
 
-// ─── EXPORT WALLET ───────────────────────────────────────────────────────────
+/* ───────────────────────────────────────────────────────────────────────────
+   🔐 WALLET EXPORT
+   ─────────────────────────────────────────────────────────────────────────── */
 async function showExportWarning(userId: number, chatId: number): Promise<void> {
   await render(userId, chatId, [
-    '⚠️ <b>SECURITY WARNING</b>',
-    '',
-    'Your recovery phrase grants <b>full control</b> over this wallet.',
-    'Never share it. ATFSwap support will <b>never</b> ask for it.',
-    '',
-    'Tap <b>Reveal Phrase</b> to show your backup words.',
+    `🛡️ <b>SECURITY WARNING</b>`,
+    ``,
+    `Your recovery phrase grants <b>full control</b> over this wallet.`,
+    `Never share it. ATFSwap support will <b>never</b> ask for it.`,
+    ``,
+    `Tap <b>Reveal Phrase</b> to show your backup words.`,
   ].join('\n'), keyboards.exportWarningKeyboard());
 }
 
@@ -832,14 +831,14 @@ async function exportWallet(userId: number, chatId: number): Promise<void> {
     }
 
     const { decrypt } = await import('../utils/encryption');
-    const phrase = decrypt(wallet.encryptedMnemonic, wallet.iv, wallet.tag);
+    const phrase = decrypt(wallet.encryptedMnemonic);
 
     await render(userId, chatId, [
-      '🔐 <b>WALLET BACKUP</b>',
-      '',
+      `🔐 <b>WALLET BACKUP</b>`,
+      ``,
       `<code>${phrase}</code>`,
-      '',
-      '⚠️ <i>Delete this message immediately after saving offline.</i>',
+      ``,
+      `🗑️ <i>Delete this message immediately after copying.</i>`,
     ].join('\n'), keyboards.backKeyboard('account'));
 
     await AdminAction.create({
@@ -853,965 +852,625 @@ async function exportWallet(userId: number, chatId: number): Promise<void> {
   }
 }
 
-// ─── IMPORT WALLET (ADDS NEW, DOES NOT REPLACE) ──────────────────────────────
+/* ───────────────────────────────────────────────────────────────────────────
+   🔑 WALLET IMPORT  (V4R2 / W5R1)
+   ─────────────────────────────────────────────────────────────────────────── */
+type WalletVersion = 'v4r2' | 'v5r1';
+
+/** Ephemeral memory-only cache for auto-detect ambiguous case.
+ *  NEVER logged. NEVER persisted. Expires after 90 seconds. */
+const autoDetectMnemonicCache = new Map<number, { mnemonic: string; timer: NodeJS.Timeout }>();
+
+function setAutoDetectMnemonic(userId: number, mnemonic: string): void {
+  const existing = autoDetectMnemonicCache.get(userId);
+  if (existing) clearTimeout(existing.timer);
+
+  const timer = setTimeout(() => {
+    autoDetectMnemonicCache.delete(userId);
+  }, 90000);
+
+  autoDetectMnemonicCache.set(userId, { mnemonic, timer });
+}
+
+function getAndClearAutoDetectMnemonic(userId: number): string | null {
+  const entry = autoDetectMnemonicCache.get(userId);
+  if (!entry) return null;
+  clearTimeout(entry.timer);
+  autoDetectMnemonicCache.delete(userId);
+  return entry.mnemonic;
+}
+
 async function startImportWallet(userId: number, chatId: number): Promise<void> {
   const user = await User.findOne({ telegramId: userId });
   if (!user) return;
 
-  user.state = 'import_mnemonic_input';
+  user.state = 'import_version_select';
+  user.stateData = {};
   await user.save();
 
   await render(userId, chatId, [
-    '🔐 <b>IMPORT WALLET</b>',
-    '',
-    'Paste your 24-word recovery phrase below.',
-    '',
-    '<i>This will add a NEW wallet. Your existing wallets stay safe.</i>',
-  ].join('\n'), keyboards.cancelKeyboard('account'));
+    `🔐 <b>IMPORT WALLET</b>`,
+    ``,
+    `Select the wallet version:`,
+    ``,
+    `<i>Your existing wallets will not be replaced.</i>`,
+  ].join('\n'), keyboards.importVersionKeyboard());
 }
 
-async function handleImportMnemonic(userId: number, chatId: number, text: string): Promise<void> {
+async function handleImportVersionSelect(
+  userId: number,
+  chatId: number,
+  strategy: 'auto' | WalletVersion
+): Promise<void> {
   const user = await User.findOne({ telegramId: userId });
-  if (!user || user.state !== 'import_mnemonic_input') return;
+  if (!user || user.state !== 'import_version_select') return;
 
-  const words = text.trim().split(/\s+/);
-  if (words.length !== 24) {
-    await toast(userId, chatId, '❌ Invalid phrase. Must be exactly 24 words.', keyboards.cancelKeyboard('account'));
-    return;
+  if (strategy === 'auto') {
+    user.stateData = { importStrategy: 'auto' };
+  } else {
+    user.stateData = { importStrategy: 'manual', importVersion: strategy };
   }
 
-  try {
-    const newWallet = await walletService.importWallet(userId, text.trim());
+      user.state = 'import_mnemonic_input';
+    await user.save();
 
-    if (newWallet) {
-      user.walletIds.push(newWallet._id);
-      user.activeWalletId = newWallet._id;
-      await user.save();
+    await render(userId, chatId, [
+      `🔐 <b>IMPORT WALLET</b>`,
+      ``,
+      `Paste your 24-word recovery phrase below.`,
+      ``,
+      `<i>This will add a NEW wallet. Your existing wallets will not be replaced.</i>`,
+    ].join('\n'), keyboards.cancelKeyboard('account'));
+  }
+
+  async function handleImportMnemonic(userId: number, chatId: number, text: string): Promise<void> {
+    const user = await User.findOne({ telegramId: userId });
+    if (!user || user.state !== 'import_mnemonic_input') return;
+
+    const words = text.trim().split(/\s+/);
+    if (words.length !== 24) {
+      await toast(userId, chatId, '❌ Invalid phrase. Please enter exactly 24 words.', keyboards.cancelKeyboard('account'));
+      return;
     }
+
+    const mnemonic = text.trim();
+    const strategy = user.stateData?.importStrategy as 'auto' | undefined;
+    const manualVersion = user.stateData?.importVersion as WalletVersion | undefined;
+
+    try {
+      let selectedVersion: WalletVersion;
+
+      if (strategy === 'auto') {
+        /* ── Auto-detect via WalletService ── */
+        const detected = await walletService.detectImportVersions(mnemonic);
+        const hasV4 = !!detected?.v4r2;
+        const hasV5 = !!detected?.v5r1;
+
+        if (hasV4 && hasV5) {
+          /* Ambiguous: ask user to pick */
+          setAutoDetectMnemonic(userId, mnemonic);
+          user.state = 'import_version_confirm';
+          await user.save();
+
+          await render(userId, chatId, [
+            `🔍 <b>AUTO-DETECT RESULT</b>`,
+            ``,
+            `Both <b>V4R2</b> and <b>W5R1</b> were found for this phrase.`,
+            ``,
+            `Please choose which wallet to import:`,
+          ].join('\n'), keyboards.importVersionConfirmKeyboard());
+          return;
+        } else if (hasV4) {
+          selectedVersion = 'v4r2';
+        } else if (hasV5) {
+          selectedVersion = 'v5r1';
+        } else {
+          await toast(userId, chatId, [
+            `❌ <b>No Wallet Detected</b>`,
+            ``,
+            `No supported wallet version was found for this phrase.`,
+            `Please check your words and try again.`,
+          ].join('\n'), keyboards.cancelKeyboard('account'));
+          return;
+        }
+      } else if (manualVersion) {
+        selectedVersion = manualVersion;
+      } else {
+        await toast(userId, chatId, '❌ Import configuration error. Please start over.', keyboards.backKeyboard('account'));
+        return;
+      }
+
+      await finalizeWalletImport(userId, chatId, mnemonic, selectedVersion);
+    } catch (error: any) {
+      await toast(userId, chatId, `❌ Import failed: ${error.message}`, keyboards.cancelKeyboard('account'));
+    }
+  }
+
+  async function handleImportVersionConfirm(userId: number, chatId: number, version: WalletVersion): Promise<void> {
+    const user = await User.findOne({ telegramId: userId });
+    if (!user || user.state !== 'import_version_confirm') return;
+
+    const mnemonic = getAndClearAutoDetectMnemonic(userId);
+    if (!mnemonic) {
+      await toast(userId, chatId, '⏳ Session expired. Please start again.', keyboards.backKeyboard('account'));
+      await clearState(userId);
+      return;
+    }
+
+    try {
+      await finalizeWalletImport(userId, chatId, mnemonic, version);
+    } catch (error: any) {
+      await toast(userId, chatId, `❌ Import failed: ${error.message}`, keyboards.cancelKeyboard('account'));
+    }
+  }
+
+  async function finalizeWalletImport(
+    userId: number,
+    chatId: number,
+    mnemonic: string,
+    version: WalletVersion
+  ): Promise<void> {
+    const user = await User.findOne({ telegramId: userId });
+    if (!user) return;
+
+    /* Duplicate protection */
+    const existingWallets = await getUserWallets(userId);
+    const newWallet = await walletService.importWallet(userId, mnemonic, version);
+
+    const isDuplicate = existingWallets.some((w: any) => w.address === newWallet.address);
+    if (isDuplicate) {
+      /* Switch to existing instead of duplicating */
+      const existing = existingWallets.find((w: any) => w.address === newWallet.address);
+      if (existing) {
+        user.activeWalletId = existing._id;
+        await user.save();
+        await clearState(userId);
+
+        const versionTag = existing.walletVersion
+          ? existing.walletVersion.toUpperCase()
+          : 'Legacy / Unknown';
+
+        await render(userId, chatId, [
+          `ℹ️ <b>Wallet Already Exists</b>`,
+          ``,
+          `This wallet is already in your list.`,
+          ``,
+          `Address: <code>${formatAddressShort(existing.address)}</code>`,
+          `Type: <b>${versionTag}</b>`,
+          ``,
+          `Switched to existing wallet automatically.`,
+        ].join('\n'), keyboards.backKeyboard('account'));
+      }
+      return;
+    }
+
+    user.walletIds.push(newWallet._id);
+    user.activeWalletId = newWallet._id;
+    await user.save();
     await clearState(userId);
 
+    const versionTag = newWallet.walletVersion
+      ? newWallet.walletVersion.toUpperCase()
+      : 'Legacy / Unknown';
+
     await render(userId, chatId, [
-      '✅ <b>Wallet Imported</b>',
-      '',
-      `Added as Wallet ${user.walletIds.length}`,
-      `Address: <code>${formatAddressShort(newWallet.address)}</code>`,
-      '',
-      '<i>Switched to imported wallet automatically.</i>',
+      `✅ <b>Wallet Imported</b>`,
+      ``,
+      `Wallet ${user.walletIds.length}`,
+      ``,
+      `Address:`,
+      `<code>${formatAddressShort(newWallet.address)}</code>`,
+      ``,
+      `Wallet Type:`,
+      `<b>${versionTag}</b>`,
+      ``,
+      `Switched to imported wallet automatically.`,
     ].join('\n'), keyboards.backKeyboard('account'));
-  } catch (error: any) {
-    await toast(userId, chatId, `❌ Import failed: ${error.message}`, keyboards.cancelKeyboard('account'));
-  }
-}
-
-// ─── HISTORY ─────────────────────────────────────────────────────────────────
-async function showHistory(userId: number, chatId: number, page: number): Promise<void> {
-  const user = await User.findOne({ telegramId: userId });
-  if (!user) return;
-
-  user.lastAction = 'history';
-  await user.save();
-
-  const limit = 5;
-  const skip = (page - 1) * limit;
-
-  const txs = await Transaction.find({ userId: user._id })
-    .sort({ createdAt: -1 })
-    .skip(skip)
-    .limit(limit + 1);
-
-  const hasMore = txs.length > limit;
-  const display = hasMore ? txs.slice(0, limit) : txs;
-
-  const lines = display.map(tx => {
-    const icon = tx.type === 'deposit' ? '🟢' : tx.type === 'withdrawal' ? '🔴' : '🔄';
-    const amt = Precision.fromBaseUnits(BigInt(tx.amount), tx.asset === 'TON' ? TON_DECIMALS : ATF_DECIMALS);
-    const shortHash = tx.txHash && !tx.txHash.includes('-')
-      ? `<a href="${explorerLink(tx.txHash)}">${tx.txHash.slice(0, 6)}…${tx.txHash.slice(-4)}</a>`
-      : '…';
-    const statusIcon = tx.status === 'completed' ? '✅' : tx.status === 'pending' ? '⏳' : '❌';
-    return `${icon} <b>${tx.type.toUpperCase()}</b>  <code>${Precision.formatDisplay(amt)} ${tx.asset}</code>\n   ${statusIcon} ${tx.status}  ·  ${shortHash}`;
-  });
-
-  const caption = [
-    '📊 <b>TRANSACTION HISTORY</b>',
-    '',
-    ...(lines.length ? lines : ['<i>No transactions yet.</i>']),
-    '',
-    `Page ${page}`,
-  ].filter(Boolean).join('\n');
-
-  await render(userId, chatId, caption, keyboards.historyPaginationKeyboard(page, hasMore));
-}
-
-// ─── PRICES ────────────────────────────────────────────────────────────────────
-async function showPrices(userId: number, chatId: number): Promise<void> {
-  const user = await User.findOne({ telegramId: userId });
-  if (user) {
-    user.lastAction = 'prices';
-    await user.save();
   }
 
-  const [atfPrice, tonPrice, ngnRate] = await Promise.all([
-    priceService.getAtfPriceUsd().catch(() => null),
-    priceService.getTonPriceUsd().catch(() => null),
-    priceService.getUsdNgnRate().catch(() => null),
-  ]);
-
-  const caption = [
-    '💵 <b>LIVE MARKET PRICES</b>',
-    '',
-    atfPrice
-      ? `🪙 <b>ATF</b>    $${atfPrice.price.toFixed(6)}\n${ngnRate ? `   🇳🇬 ₦${(atfPrice.price * ngnRate.price).toFixed(2)}` : ''}`
-      : '⚠️ ATF price unavailable',
-    '',
-    tonPrice
-      ? `💎 <b>TON</b>    $${tonPrice.price.toFixed(2)}\n${ngnRate ? `   🇳🇬 ₦${(tonPrice.price * ngnRate.price).toFixed(2)}` : ''}`
-      : '⚠️ TON price unavailable',
-    '',
-    ngnRate
-      ? `💱 <b>USD/NGN</b>    ₦${ngnRate.price.toFixed(2)}`
-      : '⚠️ NGN rate unavailable',
-  ].filter(Boolean).join('\n');
-
-  await render(userId, chatId, caption, keyboards.pricesKeyboard());
-}
-
-// ─── HELP ──────────────────────────────────────────────────────────────────────
-async function showHelp(userId: number, chatId: number): Promise<void> {
-  await render(userId, chatId, [
-    'ℹ️ <b>ATF SWAP HELP</b>',
-    '',
-    '<b>What is this?</b>',
-    'A custodial TON ↔ ATF exchange inside Telegram.',
-    '',
-    '<b>Quick Start</b>',
-    '1. Deposit TON or ATF 💰',
-    '2. Swap instantly 🔄',
-    '3. Withdraw to any TON address 💸',
-    '',
-    '<b>Commands</b>',
-    '/start — Open menu',
-    '/help  — Show this message',
-    '',
-    '<b>Fees</b>',
-    `• Swap: ${config.platformSwapFeePercent}% platform fee`,
-    '• Withdrawal: network gas only',
-    '',
-    '<b>Support</b>',
-    'Contact admin if a transaction stalls for >5 minutes.',
-  ].join('\n'), keyboards.helpKeyboard());
-}
-
-// ─── REFERRAL ──────────────────────────────────────────────────────────────────
-async function showReferral(userId: number, chatId: number): Promise<void> {
-  const count = await Referral.countDocuments({ referrerId: userId });
-  const link = `https://t.me/${config.botUsername}?start=${userId}`;
-
-  await render(userId, chatId, [
-    '🎁 <b>REFERRAL PROGRAM</b>',
-    '',
-    `Invite friends and earn rewards!`,
-    '',
-    `👥 Referred: <b>${count}</b> user${count !== 1 ? 's' : ''}`,
-    '',
-    `Your link:`,
-    `<code>${link}</code>`,
-    '',
-    '<i>Share your link. When they trade, you earn.</i>',
-  ].join('\n'), keyboards.backKeyboard('back_main'));
-      }
-
-
-                // ─── ADMIN PANEL ─────────────────────────────────────────────────────────────
-async function showAdminPanel(userId: number, chatId: number): Promise<void> {
-  try {
-    const user = await requireAdmin(userId);
-    user.lastAction = 'admin_panel';
-    await user.save();
-
-    await render(userId, chatId, [
-      '⚙️ <b>ADMIN PANEL</b>',
-      '',
-      `Welcome, ${user.firstName || 'Admin'} 👋`,
-      '',
-      'Select a section:',
-    ].join('\n'), keyboards.adminPanelKeyboard(user.isSuperAdmin));
-  } catch {
-    await showMainMenu(userId, chatId);
-  }
-}
-
-async function showAdminManagement(userId: number, chatId: number): Promise<void> {
-  try {
-    await requireSuperAdmin(userId);
-    await render(userId, chatId, '👑 <b>ADMIN MANAGEMENT</b>', keyboards.adminManagementKeyboard());
-  } catch {
-    await showAdminPanel(userId, chatId);
-  }
-}
-
-async function startGiveAdmin(userId: number, chatId: number): Promise<void> {
-  try {
-    await requireSuperAdmin(userId);
+  /* ───────────────────────────────────────────────────────────────────────────
+     📜 HISTORY
+     ─────────────────────────────────────────────────────────────────────────── */
+  async function showHistory(userId: number, chatId: number, page: number): Promise<void> {
     const user = await User.findOne({ telegramId: userId });
     if (!user) return;
 
-    user.state = 'admin_give_input';
+    user.lastAction = 'history';
     await user.save();
 
-    await render(userId, chatId, '👑 <b>GIVE ADMIN</b>\n\nEnter Telegram ID:', keyboards.cancelKeyboard('admin_management'));
-  } catch {
-    await showAdminPanel(userId, chatId);
-  }
-}
-
-async function handleGiveAdmin(userId: number, chatId: number, text: string): Promise<void> {
-  try {
-    await requireSuperAdmin(userId);
-  } catch {
-    await showMainMenu(userId, chatId);
-    return;
-  }
-
-  if (!isValidTelegramId(text)) {
-    await toast(userId, chatId, '❌ Invalid Telegram ID.', keyboards.cancelKeyboard('admin_management'));
-    return;
-  }
-
-  const targetId = parseInt(text, 10);
-  const target = await User.findOne({ telegramId: targetId });
-
-  if (!target) {
-    await toast(userId, chatId, '❌ User not found. They must start the bot first.', keyboards.cancelKeyboard('admin_management'));
-    return;
-  }
-
-  if (target.isAdmin) {
-    await toast(userId, chatId, 'ℹ️ Already an admin.', keyboards.cancelKeyboard('admin_management'));
-    return;
-  }
-
-  target.isAdmin = true;
-  await target.save();
-
-  await AdminAction.create({
-    adminId: userId,
-    action: 'ADMIN_CREATED',
-    target: targetId.toString(),
-    oldValue: 'false',
-    newValue: 'true',
-    result: 'success',
-  });
-
-  await clearState(userId);
-  await toast(userId, chatId, `✅ <b>Admin Granted</b>\n\n<code>${targetId}</code> is now an administrator.`, keyboards.backKeyboard('admin_management'));
-}
-
-async function startRemoveAdmin(userId: number, chatId: number): Promise<void> {
-  try {
-    await requireSuperAdmin(userId);
-    const user = await User.findOne({ telegramId: userId });
-    if (!user) return;
-
-    user.state = 'admin_remove_input';
-    await user.save();
-
-    await render(userId, chatId, '👑 <b>REMOVE ADMIN</b>\n\nEnter Telegram ID:', keyboards.cancelKeyboard('admin_management'));
-  } catch {
-    await showAdminPanel(userId, chatId);
-  }
-}
-
-async function handleRemoveAdmin(userId: number, chatId: number, text: string): Promise<void> {
-  try {
-    await requireSuperAdmin(userId);
-  } catch {
-    await showMainMenu(userId, chatId);
-    return;
-  }
-
-  if (!isValidTelegramId(text)) {
-    await toast(userId, chatId, '❌ Invalid Telegram ID.', keyboards.cancelKeyboard('admin_management'));
-    return;
-  }
-
-  const targetId = parseInt(text, 10);
-
-  if (targetId === Number(config.superAdminTelegramId)) {
-    await toast(userId, chatId, '❌ Cannot remove Super Admin.', keyboards.cancelKeyboard('admin_management'));
-    return;
-  }
-
-  const target = await User.findOne({ telegramId: targetId });
-  if (!target || !target.isAdmin) {
-    await toast(userId, chatId, '❌ User is not an admin.', keyboards.cancelKeyboard('admin_management'));
-    return;
-  }
-
-  target.isAdmin = false;
-  await target.save();
-
-  await AdminAction.create({
-    adminId: userId,
-    action: 'ADMIN_REMOVED',
-    target: targetId.toString(),
-    oldValue: 'true',
-    newValue: 'false',
-    result: 'success',
-  });
-
-  await clearState(userId);
-  await toast(userId, chatId, `✅ <b>Admin Removed</b>\n\n<code>${targetId}</code> is no longer an administrator.`, keyboards.backKeyboard('admin_management'));
-}
-
-async function showAdminList(userId: number, chatId: number): Promise<void> {
-  try {
-    await requireSuperAdmin(userId);
-    const admins = await User.find({ isAdmin: true }).select('telegramId firstName username');
-    const lines = admins.map(a => `• <code>${a.telegramId}</code> ${a.firstName || ''} ${a.username ? `(@${a.username})` : ''}`);
-
-    await render(userId, chatId, ['👥 <b>ADMIN LIST</b>', '', ...lines].join('\n'), keyboards.backKeyboard('admin_management'));
-  } catch {
-    await showAdminPanel(userId, chatId);
-  }
-}
-
-async function showUserList(userId: number, chatId: number, page: number): Promise<void> {
-  try {
-    await requireAdmin(userId);
-    const limit = 10;
+    const limit = 5;
     const skip = (page - 1) * limit;
 
-    const users = await User.find()
+    const txs = await Transaction.find({ userId: user._id })
       .sort({ createdAt: -1 })
       .skip(skip)
-      .limit(limit + 1)
-      .select('telegramId firstName username isFrozen createdAt');
+      .limit(limit + 1);
 
-    const hasMore = users.length > limit;
-    const display = hasMore ? users.slice(0, limit) : users;
+    const hasMore = txs.length > limit;
+    const display = hasMore ? txs.slice(0, limit) : txs;
 
-    await render(userId, chatId, [
-      '👥 <b>USERS</b>',
-      '',
-      `Total: ${await User.countDocuments()}`,
-      `Page ${page}`,
-    ].join('\n'), keyboards.userListKeyboard(display, page, hasMore));
-  } catch {
-    await showMainMenu(userId, chatId);
-  }
-}
-
-async function showUserDetail(userId: number, chatId: number, targetId: number): Promise<void> {
-  try {
-    await requireAdmin(userId);
-    const target = await User.findOne({ telegramId: targetId });
-    if (!target) {
-      await toast(userId, chatId, '❌ User not found.', keyboards.backKeyboard('admin_users'));
-      return;
-    }
-
-    const wallet = await walletService.getWallet(targetId);
-    let tonBalance = '0';
-    let atfBalance = '0';
-
-    if (wallet?.address) {
-      try {
-        const onChain = await walletService.getBalance(wallet.address);
-        tonBalance = Precision.fromBaseUnits(onChain.ton, TON_DECIMALS);
-        atfBalance = Precision.fromBaseUnits(onChain.atf, ATF_DECIMALS);
-      } catch {
-        /* ignore */
-      }
-    }
-
-    const caption = [
-      '👤 <b>USER DETAIL</b>',
-      '',
-      `ID: <code>${target.telegramId}</code>`,
-      `Name: ${target.firstName || 'N/A'} ${target.lastName || ''}`,
-      `Username: ${target.username ? `@${target.username}` : 'N/A'}`,
-      `Status: ${target.isFrozen ? '🔒 Frozen' : '🟢 Active'}`,
-      '',
-      `💎 TON: <code>${Precision.formatDisplay(tonBalance)}</code>`,
-      `🪙 ATF: <code>${Precision.formatDisplay(atfBalance)}</code>`,
-      '',
-      `Created: ${target.createdAt.toLocaleDateString()}`,
-    ].join('\n');
-
-    await render(userId, chatId, caption, keyboards.userActionKeyboard(targetId, target.isFrozen));
-  } catch {
-    await showMainMenu(userId, chatId);
-  }
-}
-
-async function showAdminUserBalance(userId: number, chatId: number, targetId: number): Promise<void> {
-  try {
-    await requireAdmin(userId);
-    const wallet = await walletService.getWallet(targetId);
-    if (!wallet?.address) {
-      await toast(userId, chatId, '❌ No wallet found for this user.', keyboards.backKeyboard(`admin_user_${targetId}`));
-      return;
-    }
-
-    const onChain = await walletService.getBalance(wallet.address);
-    const ton = Precision.fromBaseUnits(onChain.ton, TON_DECIMALS);
-    const atf = Precision.fromBaseUnits(onChain.atf, ATF_DECIMALS);
-
-    const caption = [
-      '💰 <b>ON-CHAIN BALANCE</b>',
-      '',
-      `User: <code>${targetId}</code>`,
-      '',
-      `💎 TON: <code>${Precision.formatDisplay(ton)}</code>`,
-      `🪙 ATF: <code>${Precision.formatDisplay(atf)}</code>`,
-      '',
-      `Wallet: <code>${formatAddressShort(wallet.address)}</code>`,
-    ].join('\n');
-
-    await render(userId, chatId, caption, keyboards.backKeyboard(`admin_user_${targetId}`));
-  } catch (error: any) {
-    await toast(userId, chatId, `❌ ${error.message}`, keyboards.backKeyboard('admin_users'));
-  }
-}
-
-async function showAdminUserTransactions(userId: number, chatId: number, targetId: number): Promise<void> {
-  try {
-    await requireAdmin(userId);
-    const target = await User.findOne({ telegramId: targetId });
-    if (!target) {
-      await toast(userId, chatId, '❌ User not found.', keyboards.backKeyboard('admin_users'));
-      return;
-    }
-
-    const txs = await Transaction.find({ userId: target._id })
-      .sort({ createdAt: -1 })
-      .limit(10);
-
-    const lines = txs.map(tx => {
-      const icon = tx.type === 'deposit' ? '🟢' : tx.type === 'withdrawal' ? '🔴' : '🔄';
+    const lines = display.map((tx: any) => {
+      const icon = tx.type === 'deposit' ? '📥' : tx.type === 'withdrawal' ? '📤' : '🔄';
       const amt = Precision.fromBaseUnits(BigInt(tx.amount), tx.asset === 'TON' ? TON_DECIMALS : ATF_DECIMALS);
-      return `${icon} <b>${tx.type.toUpperCase()}</b> <code>${Precision.formatDisplay(amt)} ${tx.asset}</code> — ${tx.status}`;
+      const shortHash = tx.txHash && !tx.txHash.includes('-')
+        ? `<a href="${explorerLink(tx.txHash)}">${tx.txHash.slice(0, 6)}...${tx.txHash.slice(-4)}</a>`
+        : '...';
+      const statusIcon = tx.status === 'completed' ? '✅' : tx.status === 'pending' ? '⏳' : '❌';
+      return `${icon} <b>${tx.type.toUpperCase()}</b> <code>${Precision.formatDisplay(amt)} ${tx.asset}</code>\n   ${statusIcon} ${tx.status} · ${shortHash}`;
     });
 
     const caption = [
-      `📊 <b>USER TRANSACTIONS</b>`,
-      '',
-      `User: <code>${targetId}</code>`,
-      '',
-      ...(lines.length ? lines : ['<i>No transactions found.</i>']),
+      `📜 <b>TRANSACTION HISTORY</b>`,
+      ``,
+      ...(lines.length ? lines : ['<i>No transactions yet.</i>']),
+      ``,
+      `Page ${page}`,
     ].join('\n');
 
-    await render(userId, chatId, caption, keyboards.backKeyboard(`admin_user_${targetId}`));
-  } catch {
-    await showMainMenu(userId, chatId);
+    await render(userId, chatId, caption, keyboards.historyPaginationKeyboard(page, hasMore));
   }
-}
 
-async function toggleFreeze(userId: number, chatId: number, targetId: number, action: string): Promise<void> {
-  try {
-    await requireAdmin(userId);
+  /* ───────────────────────────────────────────────────────────────────────────
+     💹 PRICES
+     ─────────────────────────────────────────────────────────────────────────── */
+  async function showPrices(userId: number, chatId: number): Promise<void> {
+    const user = await User.findOne({ telegramId: userId });
+    if (user) {
+      user.lastAction = 'prices';
+      await user.save();
+    }
+
+    const [atfPrice, tonPrice, ngnRate] = await Promise.all([
+      priceService.getAtfPriceUsd().catch(() => null),
+      priceService.getTonPriceUsd().catch(() => null),
+      priceService.getUsdNgnRate().catch(() => null),
+    ]);
+
+    const caption = [
+      `💹 <b>LIVE MARKET PRICES</b>`,
+      ``,
+      atfPrice
+        ? `🔷 <b>ATF</b> $${atfPrice.price.toFixed(6)}\n${ngnRate ? `<i>≈ ₦${(atfPrice.price * ngnRate.price).toFixed(2)}</i>` : ''}`
+        : '❌ ATF price unavailable',
+      ``,
+      tonPrice
+        ? `💎 <b>TON</b> $${tonPrice.price.toFixed(2)}\n${ngnRate ? `<i>≈ ₦${(tonPrice.price * ngnRate.price).toFixed(2)}</i>` : ''}`
+        : '❌ TON price unavailable',
+      ``,
+      ngnRate
+        ? `💱 <b>USD/NGN</b> ₦${ngnRate.price.toFixed(2)}`
+        : '❌ NGN rate unavailable',
+    ].filter(Boolean).join('\n');
+
+    await render(userId, chatId, caption, keyboards.pricesKeyboard());
+  }
+
+  /* ───────────────────────────────────────────────────────────────────────────
+     ❓ HELP
+     ─────────────────────────────────────────────────────────────────────────── */
+  async function showHelp(userId: number, chatId: number): Promise<void> {
+    await render(userId, chatId, [
+      `❓ <b>ATF SWAP HELP</b>`,
+      ``,
+      `<b>What is this?</b>`,
+      `A custodial TON ↔ ATF exchange inside Telegram.`,
+      ``,
+      `<b>Quick Start</b>`,
+      `1. Deposit TON or ATF 📥`,
+      `2. Swap instantly 🔄`,
+      `3. Withdraw to any TON address 📤`,
+      ``,
+      `<b>Commands</b>`,
+      `/start — Open menu`,
+      `/help — Show this message`,
+      ``,
+      `<b>Fees</b>`,
+      `• Swap: ${config.platformSwapFeePercent}% platform fee`,
+      `• Withdrawal: network gas only`,
+      ``,
+      `<b>Support</b>`,
+      `Contact admin if a transaction stalls for >5 minutes.`,
+    ].join('\n'), keyboards.helpKeyboard());
+  }
+
+  /* ───────────────────────────────────────────────────────────────────────────
+     🤝 REFERRAL PROGRAM
+     ─────────────────────────────────────────────────────────────────────────── */
+  async function showReferral(userId: number, chatId: number): Promise<void> {
+    const count = await Referral.countDocuments({ referrerId: userId });
+    const link = `https://t.me/${config.botUsername}?start=${userId}`;
+
+    await render(userId, chatId, [
+      `🤝 <b>REFERRAL PROGRAM</b>`,
+      ``,
+      `Invite friends and earn rewards!`,
+      ``,
+      `👥 Referred: <b>${count}</b> user${count !== 1 ? 's' : ''}`,
+      ``,
+      `Your link:`,
+      `<code>${link}</code>`,
+      ``,
+      `<i>Share your link. When they trade, you earn!</i>`,
+    ].join('\n'), keyboards.backKeyboard('main'));
+  }
+
+  /* ───────────────────────────────────────────────────────────────────────────
+     🛡️ ADMIN PANEL
+     ─────────────────────────────────────────────────────────────────────────── */
+  async function showAdminPanel(userId: number, chatId: number): Promise<void> {
+    try {
+      const user = await requireAdmin(userId);
+      user.lastAction = 'admin_panel';
+      await user.save();
+
+      await render(userId, chatId, [
+        `🛡️ <b>ADMIN PANEL</b>`,
+        ``,
+        `Welcome, ${user.firstName || 'Admin'}!`,
+        ``,
+        `Select a section:`,
+      ].join('\n'), keyboards.adminPanelKeyboard(user.isSuperAdmin));
+    } catch {
+      await showMainMenu(userId, chatId);
+    }
+  }
+
+  async function showAdminManagement(userId: number, chatId: number): Promise<void> {
+    try {
+      await requireSuperAdmin(userId);
+      await render(userId, chatId, `👥 <b>ADMIN MANAGEMENT</b>`, keyboards.adminManagementKeyboard());
+    } catch {
+      await showAdminPanel(userId, chatId);
+    }
+  }
+
+  async function startGiveAdmin(userId: number, chatId: number): Promise<void> {
+    try {
+      await requireSuperAdmin(userId);
+      const user = await User.findOne({ telegramId: userId });
+      if (!user) return;
+
+      user.state = 'admin_give_input';
+      await user.save();
+
+      await render(userId, chatId, `👤 <b>GIVE ADMIN</b>\n\nEnter Telegram ID:`, keyboards.cancelKeyboard('admin_management'));
+    } catch {
+      await showAdminPanel(userId, chatId);
+    }
+  }
+
+  async function handleGiveAdmin(userId: number, chatId: number, text: string): Promise<void> {
+    try {
+      await requireSuperAdmin(userId);
+    } catch {
+      await showMainMenu(userId, chatId);
+      return;
+    }
+
+    if (!isValidTelegramId(text)) {
+      await toast(userId, chatId, '❌ Invalid Telegram ID.', keyboards.cancelKeyboard('admin_management'));
+      return;
+    }
+
+    const targetId = parseInt(text, 10);
     const target = await User.findOne({ telegramId: targetId });
     if (!target) {
-      await toast(userId, chatId, '❌ User not found.', keyboards.backKeyboard('admin_users'));
+      await toast(userId, chatId, '❌ User not found. They must start the bot first.', keyboards.cancelKeyboard('admin_management'));
       return;
     }
 
-    if (target.isSuperAdmin) {
-      await toast(userId, chatId, '❌ Cannot modify Super Admin.', keyboards.backKeyboard('admin_users'));
+    if (target.isAdmin) {
+      await toast(userId, chatId, 'ℹ️ Already an admin.', keyboards.cancelKeyboard('admin_management'));
       return;
     }
 
-    const wasFrozen = target.isFrozen;
-    target.isFrozen = action === 'freeze';
+    target.isAdmin = true;
     await target.save();
 
     await AdminAction.create({
       adminId: userId,
-      action: target.isFrozen ? 'USER_FROZEN' : 'USER_UNFROZEN',
+      action: 'ADMIN_CREATED',
       target: targetId.toString(),
-      oldValue: wasFrozen.toString(),
-      newValue: target.isFrozen.toString(),
+      oldValue: 'false',
+      newValue: 'true',
       result: 'success',
     });
 
-    await toast(
-      userId,
-      chatId,
-      `✅ User <code>${targetId}</code> is now ${target.isFrozen ? '🔒 frozen' : '🔓 active'}.`,
-      keyboards.backKeyboard('admin_users')
-    );
-  } catch {
-    await showMainMenu(userId, chatId);
-  }
-}
-
-async function showAuditLogs(userId: number, chatId: number): Promise<void> {
-  try {
-    await requireAdmin(userId);
-    const logs = await AdminAction.find().sort({ createdAt: -1 }).limit(15).lean();
-    const lines = logs.map(l => {
-      const date = new Date(l.createdAt).toLocaleString();
-      return `${date}  <b>${l.action}</b> by <code>${l.adminId}</code>${l.target ? ` → ${l.target}` : ''}`;
-    });
-
-    await render(
-      userId,
-      chatId,
-      ['📋 <b>AUDIT LOGS</b> (Last 15)', '', ...lines].join('\n'),
-      keyboards.backKeyboard('admin_panel')
-    );
-  } catch {
-    await showMainMenu(userId, chatId);
-  }
-}
-
-async function showSystemSettings(userId: number, chatId: number): Promise<void> {
-  try {
-    await requireAdmin(userId);
-    const caption = [
-      '🔧 <b>SYSTEM SETTINGS</b>',
-      '',
-      `Fee Wallet: <code>${formatAddressShort(config.adminFeeWalletAddress)}</code>`,
-      `Platform Fee: <b>${config.platformSwapFeePercent}%</b>`,
-      `Min Swap: <b>${config.minSwapTon} TON</b>`,
-      `Max Slippage: <b>${config.maxSlippagePercent}%</b>`,
-      `Network: <b>${config.tonNetwork || 'mainnet'}</b>`,
-      '',
-      '<i>Settings are configured via environment variables.</i>',
-    ].join('\n');
-
-    await render(userId, chatId, caption, keyboards.backKeyboard('admin_panel'));
-  } catch {
-    await showMainMenu(userId, chatId);
-  }
-}
-
-// ─── Admin Transaction Views ─────────────────────────────────────────────────
-async function showAdminTransactions(userId: number, chatId: number, page: number): Promise<void> {
-  try {
-    await requireAdmin(userId);
-    const limit = 5;
-    const skip = (page - 1) * limit;
-    const txs = await Transaction.find().sort({ createdAt: -1 }).skip(skip).limit(limit + 1);
-    const hasMore = txs.length > limit;
-    const display = hasMore ? txs.slice(0, limit) : txs;
-
-    const lines = display.map(tx => {
-      const icon = tx.type === 'deposit' ? '🟢' : tx.type === 'withdrawal' ? '🔴' : '🔄';
-      const amt = Precision.fromBaseUnits(BigInt(tx.amount), tx.asset === 'TON' ? TON_DECIMALS : ATF_DECIMALS);
-      return `${icon} <code>${tx.userId}</code> — <b>${tx.type}</b> <code>${Precision.formatDisplay(amt)} ${tx.asset}</code>`;
-    });
-
-    const caption = ['📊 <b>ALL TRANSACTIONS</b>', '', ...lines, '', `Page ${page}`].filter(Boolean).join('\n');
-    await render(userId, chatId, caption, keyboards.adminPaginationKeyboard('admin_transactions', page, hasMore));
-  } catch {
-    await showMainMenu(userId, chatId);
-  }
-}
-
-async function showAdminDeposits(userId: number, chatId: number, page: number): Promise<void> {
-  try {
-    await requireAdmin(userId);
-    const limit = 5;
-    const skip = (page - 1) * limit;
-    const txs = await Transaction.find({ type: 'deposit' }).sort({ createdAt: -1 }).skip(skip).limit(limit + 1);
-    const hasMore = txs.length > limit;
-    const display = hasMore ? txs.slice(0, limit) : txs;
-
-    const lines = display.map(tx => {
-      const amt = Precision.fromBaseUnits(BigInt(tx.amount), tx.asset === 'TON' ? TON_DECIMALS : ATF_DECIMALS);
-      return `🟢 <code>${tx.userId}</code> — <code>${Precision.formatDisplay(amt)} ${tx.asset}</code>`;
-    });
-
-    const caption = ['💰 <b>DEPOSITS</b>', '', ...lines, '', `Page ${page}`].filter(Boolean).join('\n');
-    await render(userId, chatId, caption, keyboards.adminPaginationKeyboard('admin_deposits', page, hasMore));
-  } catch {
-    await showMainMenu(userId, chatId);
-  }
-}
-
-async function showAdminWithdrawals(userId: number, chatId: number, page: number): Promise<void> {
-  try {
-    await requireAdmin(userId);
-    const limit = 5;
-    const skip = (page - 1) * limit;
-    const txs = await Transaction.find({ type: 'withdrawal' }).sort({ createdAt: -1 }).skip(skip).limit(limit + 1);
-    const hasMore = txs.length > limit;
-    const display = hasMore ? txs.slice(0, limit) : txs;
-
-    const lines = display.map(tx => {
-      const amt = Precision.fromBaseUnits(BigInt(tx.amount), tx.asset === 'TON' ? TON_DECIMALS : ATF_DECIMALS);
-      return `🔴 <code>${tx.userId}</code> — <code>${Precision.formatDisplay(amt)} ${tx.asset}</code>`;
-    });
-
-    const caption = ['💸 <b>WITHDRAWALS</b>', '', ...lines, '', `Page ${page}`].filter(Boolean).join('\n');
-    await render(userId, chatId, caption, keyboards.adminPaginationKeyboard('admin_withdrawals', page, hasMore));
-  } catch {
-    await showMainMenu(userId, chatId);
-  }
-}
-
-async function showAdminSwaps(userId: number, chatId: number, page: number): Promise<void> {
-  try {
-    await requireAdmin(userId);
-    const limit = 5;
-    const skip = (page - 1) * limit;
-    const txs = await Transaction.find({ type: 'swap' }).sort({ createdAt: -1 }).skip(skip).limit(limit + 1);
-    const hasMore = txs.length > limit;
-    const display = hasMore ? txs.slice(0, limit) : txs;
-
-    const lines = display.map(tx => {
-      const amt = Precision.fromBaseUnits(BigInt(tx.amount), tx.asset === 'TON' ? TON_DECIMALS : ATF_DECIMALS);
-      return `🔄 <code>${tx.userId}</code> — <code>${Precision.formatDisplay(amt)} ${tx.asset}</code>`;
-    });
-
-    const caption = ['🔄 <b>SWAPS</b>', '', ...lines, '', `Page ${page}`].filter(Boolean).join('\n');
-    await render(userId, chatId, caption, keyboards.adminPaginationKeyboard('admin_swaps', page, hasMore));
-  } catch {
-    await showMainMenu(userId, chatId);
-  }
-}
-
-async function showAdminTokenConfig(userId: number, chatId: number): Promise<void> {
-  try {
-    await requireAdmin(userId);
-    const caption = [
-      '🪙 <b>TOKEN CONFIG</b>',
-      '',
-      `ATF Jetton: <code>${formatAddressShort(config.atfJettonAddress)}</code>`,
-      `Decimals: <b>${ATF_DECIMALS}</b>`,
-      '',
-      '<i>Edit via environment variables.</i>',
-    ].join('\n');
-    await render(userId, chatId, caption, keyboards.backKeyboard('admin_panel'));
-  } catch {
-    await showMainMenu(userId, chatId);
-  }
-}
-
-async function showAdminDexConfig(userId: number, chatId: number): Promise<void> {
-  try {
-    await requireAdmin(userId);
-    const caption = [
-      '⚙️ <b>DEX CONFIG</b>',
-      '',
-      `STON.fi API: <code>${config.stonfiApiUrl}</code>`,
-      `Slippage: <b>${config.maxSlippagePercent}%</b>`,
-      '',
-      '<i>Edit via environment variables.</i>',
-    ].join('\n');
-    await render(userId, chatId, caption, keyboards.backKeyboard('admin_panel'));
-  } catch {
-    await showMainMenu(userId, chatId);
-  }
-}
-
-async function showAdminFeeConfig(userId: number, chatId: number): Promise<void> {
-  try {
-    await requireAdmin(userId);
-    const caption = [
-      '💵 <b>FEE CONFIG</b>',
-      '',
-      `Swap Fee: <b>${config.platformSwapFeePercent}%</b>`,
-      `Fee Wallet: <code>${formatAddressShort(config.adminFeeWalletAddress)}</code>`,
-      '',
-      '<i>Edit via environment variables.</i>',
-    ].join('\n');
-    await render(userId, chatId, caption, keyboards.backKeyboard('admin_panel'));
-  } catch {
-    await showMainMenu(userId, chatId);
-  }
-}
-
-async function showAdminPriceProviders(userId: number, chatId: number): Promise<void> {
-  try {
-    await requireAdmin(userId);
-    const caption = [
-      '💹 <b>PRICE PROVIDERS</b>',
-      '',
-      `TON/USD: <code>${config.tonPriceApiUrl || 'auto-fallback'}</code>`,
-      `ATF/USD: <code>${config.atfPriceApiUrl || 'auto-fallback'}</code>`,
-      `USD/NGN: <code>${config.usdNgnRateApiUrl || 'auto-fallback'}</code>`,
-      '',
-      '<i>Edit via environment variables.</i>',
-    ].join('\n');
-    await render(userId, chatId, caption, keyboards.backKeyboard('admin_panel'));
-  } catch {
-    await showMainMenu(userId, chatId);
-  }
-}
-
-// ─── Broadcast Message (Super Admin) ─────────────────────────────────────────
-async function startBroadcast(userId: number, chatId: number): Promise<void> {
-  try {
-    await requireSuperAdmin(userId);
-    const user = await User.findOne({ telegramId: userId });
-    if (!user) return;
-
-    user.state = 'broadcast_input';
-    await user.save();
-
-    await render(
-      userId,
-      chatId,
-      '📢 <b>BROADCAST MESSAGE</b>\n\nType the message to send to ALL users:',
-      keyboards.cancelKeyboard('admin_panel')
-    );
-  } catch {
-    await showAdminPanel(userId, chatId);
-  }
-}
-
-async function handleBroadcast(userId: number, chatId: number, text: string): Promise<void> {
-  try {
-    await requireSuperAdmin(userId);
-  } catch {
-    await showMainMenu(userId, chatId);
-    return;
+    await clearState(userId);
+    await toast(userId, chatId, `✅ <b>Admin Granted</b>\n\n<code>${targetId}</code> is now an administrator.`, keyboards.backKeyboard('admin_management'));
   }
 
-  await render(userId, chatId, '⏳ <b>Sending broadcast…</b>\n\nPlease wait.', { inline_keyboard: [] });
-
-  const users = await User.find().select('telegramId');
-  let sent = 0;
-  let failed = 0;
-
-  for (const u of users) {
+  async function startRemoveAdmin(userId: number, chatId: number): Promise<void> {
     try {
-      await botInstance.sendMessage(u.telegramId, `📢 <b>Announcement</b>\n\n${text}`, { parse_mode: 'HTML' });
-      sent++;
+      await requireSuperAdmin(userId);
+      const user = await User.findOne({ telegramId: userId });
+      if (!user) return;
+
+      user.state = 'admin_remove_input';
+      await user.save();
+
+      await render(userId, chatId, `🚫 <b>REMOVE ADMIN</b>\n\nEnter Telegram ID:`, keyboards.cancelKeyboard('admin_management'));
     } catch {
-      failed++;
+      await showAdminPanel(userId, chatId);
     }
-    if (sent % 20 === 0) await new Promise(r => setTimeout(r, 1000));
   }
 
-  await clearState(userId);
-  await toast(
-    userId,
-    chatId,
-    `✅ <b>Broadcast Complete</b>\n\nSent: ${sent}\nFailed: ${failed}`,
-    keyboards.backKeyboard('admin_panel')
-  );
+  async function handleRemoveAdmin(userId: number, chatId: number, text: string): Promise<void> {
+    try {
+      await requireSuperAdmin(userId);
+    } catch {
+      await showMainMenu(userId, chatId);
+      return;
+    }
 
-  await AdminAction.create({
-    adminId: userId,
-    action: 'BROADCAST_SENT',
-    target: 'all_users',
-    result: 'success',
-  });
-}
+    if (!isValidTelegramId(text)) {
+      await toast(userId, chatId, '❌ Invalid Telegram ID.', keyboards.cancelKeyboard('admin_management'));
+      return;
+    }
 
-// ─── Stats ───────────────────────────────────────────────────────────────────
-export async function handleStats(userId: number, chatId: number): Promise<void> {
-  try {
-    await requireAdmin(userId);
-    const totalUsers = await User.countDocuments();
-    const totalTxs = await Transaction.countDocuments();
-    const totalSwaps = await Transaction.countDocuments({ type: 'swap' });
-    const totalDeposits = await Transaction.countDocuments({ type: 'deposit' });
-    const totalWithdrawals = await Transaction.countDocuments({ type: 'withdrawal' });
+    const targetId = parseInt(text, 10);
+    if (targetId === Number(config.superAdminTelegramId)) {
+      await toast(userId, chatId, '⛔ Cannot remove super admin.', keyboards.cancelKeyboard('admin_management'));
+      return;
+    }
 
-    const caption = [
-      '📈 <b>PLATFORM STATS</b>',
-      '',
-      `👥 Total Users: <b>${totalUsers}</b>`,
-      `📊 Total Txns: <b>${totalTxs}</b>`,
-      '',
-      `🔄 Swaps: <b>${totalSwaps}</b>`,
-      `💰 Deposits: <b>${totalDeposits}</b>`,
-      `💸 Withdrawals: <b>${totalWithdrawals}</b>`,
-    ].join('\n');
+    const target = await User.findOne({ telegramId: targetId });
+    if (!target || !target.isAdmin) {
+      await toast(userId, chatId, '❌ User is not an admin.', keyboards.cancelKeyboard('admin_management'));
+      return;
+    }
 
-    await render(userId, chatId, caption, keyboards.backKeyboard('admin_panel'));
-  } catch {
-    await showMainMenu(userId, chatId);
-  }
-}
+    target.isAdmin = false;
+    await target.save();
 
+    await AdminAction.create({
+      adminId: userId,
+      action: 'ADMIN_REMOVED',
+      target: targetId.toString(),
+      oldValue: 'true',
+      newValue: 'false',
+      result: 'success',
+    });
 
-  // ─── START COMMAND ─────────────────────────────────────────────────────────────
-export async function handleStart(msg: TelegramBot.Message): Promise<void> {
-  const user = await getOrCreateUser(msg);
-  await showMainMenu(user.telegramId, msg.chat.id);
-}
-
-// ─── CALLBACK ROUTER ─────────────────────────────────────────────────────────
-export async function handleCallback(query: TelegramBot.CallbackQuery): Promise<void> {
-  const userId = query.from.id;
-  const chatId = query.message?.chat.id;
-  const data = query.data || '';
-  if (!chatId) return;
-
-  try {
-    await botInstance.answerCallbackQuery(query.id);
-  } catch {
-    /* ignore */
+    await clearState(userId);
+    await toast(userId, chatId, `✅ <b>Admin Removed</b>\n\n<code>${targetId}</code> is no longer an administrator.`, keyboards.backKeyboard('admin_management'));
   }
 
-  const user = await getOrCreateUser({
-    from: query.from,
-    chat: query.message?.chat,
-  } as TelegramBot.Message);
+  async function showAdminList(userId: number, chatId: number): Promise<void> {
+    try {
+      await requireSuperAdmin(userId);
+      const admins = await User.find({ isAdmin: true }).sort({ createdAt: -1 });
+      const lines = admins.map((a: any) => `• <code>${a.telegramId}</code> ${a.isSuperAdmin ? '(Super)' : ''}`);
 
-  // Core Navigation
-  if (data === 'back_main' || data === 'refresh_main') {
-    await showMainMenu(userId, chatId);
-    return;
+      await render(userId, chatId, [
+        `👥 <b>ADMIN LIST</b>`,
+        ``,
+        ...(lines.length ? lines : ['<i>No admins found.</i>']),
+      ].join('\n'), keyboards.backKeyboard('admin_management'));
+    } catch {
+      await showAdminPanel(userId, chatId);
+    }
   }
 
-  if (data === 'swap') { await showSwapPair(userId, chatId); return; }
-  if (data === 'swap_ton_atf') { await startSwapInput(userId, chatId, 'ton_to_atf'); return; }
-  if (data === 'swap_atf_ton') { await startSwapInput(userId, chatId, 'atf_to_ton'); return; }
-  if (data === 'confirm_swap') { await executeSwap(userId, chatId); return; }
-  if (data === 'cancel_swap') { await clearState(userId); await showMainMenu(userId, chatId); return; }
+  async function showUserList(userId: number, chatId: number, page: number): Promise<void> {
+    try {
+      await requireAdmin(userId);
+      const limit = 10;
+      const skip = (page - 1) * limit;
 
-  if (data === 'deposit') { await showDepositMenu(userId, chatId); return; }
-  if (data === 'deposit_ton') { await showDepositTon(userId, chatId); return; }
-  if (data === 'deposit_atf') { await showDepositAtf(userId, chatId); return; }
-  if (data === 'check_deposit_ton') { await checkDepositStatus(userId, chatId, 'TON'); return; }
-  if (data === 'check_deposit_atf') { await checkDepositStatus(userId, chatId, 'ATF'); return; }
+      const users = await User.find()
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit + 1)
+        .select('telegramId firstName username isFrozen createdAt');
 
-  if (data === 'withdraw') { await showWithdrawMenu(userId, chatId); return; }
-  if (data === 'withdraw_ton') { await startWithdrawal(userId, chatId, 'TON'); return; }
-  if (data === 'withdraw_atf') { await startWithdrawal(userId, chatId, 'ATF'); return; }
-  if (data === 'confirm_withdrawal') { await executeWithdrawal(userId, chatId); return; }
-  if (data === 'cancel_withdrawal') { await clearState(userId); await showMainMenu(userId, chatId); return; }
+      const hasMore = users.length > limit;
+      const display = hasMore ? users.slice(0, limit) : users;
 
-  if (data === 'account') { await showAccount(userId, chatId); return; }
-  if (data === 'export_wallet') { await showExportWarning(userId, chatId); return; }
-  if (data === 'export_confirm') { await exportWallet(userId, chatId); return; }
-  if (data === 'import_wallet') { await startImportWallet(userId, chatId); return; }
-  if (data === 'my_wallets') { await showWalletList(userId, chatId); return; }
-  if (data === 'create_wallet') { await createNewWallet(userId, chatId); return; }
-  if (data.startsWith('switch_wallet_')) {
-    await switchWallet(userId, chatId, data.replace('switch_wallet_', ''));
-    return;
+      await render(userId, chatId, [
+        `👤 <b>USERS</b>`,
+        ``,
+        `Total: ${await User.countDocuments()}`,
+        `Page ${page}`,
+      ].join('\n'), keyboards.userListKeyboard(display, page, hasMore));
+    } catch {
+      await showMainMenu(userId, chatId);
+    }
   }
 
-  if (data === 'history') { await showHistory(userId, chatId, 1); return; }
-  if (data.startsWith('history_page_')) {
-    await showHistory(userId, chatId, parseInt(data.split('_')[2], 10));
-    return;
-  }
-
-  if (data === 'prices') { await showPrices(userId, chatId); return; }
-  if (data === 'help') { await showHelp(userId, chatId); return; }
-  if (data === 'referral') { await showReferral(userId, chatId); return; }
-
-  // Admin Callbacks
-  if (data === 'admin_panel') { await showAdminPanel(userId, chatId); return; }
-  if (data === 'admin_management') { await showAdminManagement(userId, chatId); return; }
-  if (data === 'admin_give') { await startGiveAdmin(userId, chatId); return; }
-  if (data === 'admin_remove') { await startRemoveAdmin(userId, chatId); return; }
-  if (data === 'admin_list') { await showAdminList(userId, chatId); return; }
-  if (data === 'admin_users') { await showUserList(userId, chatId, 1); return; }
-  if (data.startsWith('admin_users_page_')) {
-    await showUserList(userId, chatId, parseInt(data.split('_')[3], 10));
-    return;
-  }
-  if (data.startsWith('admin_user_')) {
-    await showUserDetail(userId, chatId, parseInt(data.split('_')[2], 10));
-    return;
-  }
-  if (data.startsWith('admin_freeze_')) {
-    const parts = data.split('_');
-    await toggleFreeze(userId, chatId, parseInt(parts[2], 10), parts[3]);
-    return;
-  }
-  if (data.startsWith('admin_balance_')) {
-    await showAdminUserBalance(userId, chatId, parseInt(data.split('_')[2], 10));
-    return;
-  }
-  if (data.startsWith('admin_tx_')) {
-    await showAdminUserTransactions(userId, chatId, parseInt(data.split('_')[2], 10));
-    return;
-  }
-  if (data === 'admin_audit') { await showAuditLogs(userId, chatId); return; }
-  if (data === 'admin_settings') { await showSystemSettings(userId, chatId); return; }
-  if (data === 'admin_transactions') { await showAdminTransactions(userId, chatId, 1); return; }
-  if (data.startsWith('admin_transactions_page_')) {
-    await showAdminTransactions(userId, chatId, parseInt(data.split('_')[3], 10));
-    return;
-  }
-  if (data === 'admin_deposits') { await showAdminDeposits(userId, chatId, 1); return; }
-  if (data.startsWith('admin_deposits_page_')) {
-    await showAdminDeposits(userId, chatId, parseInt(data.split('_')[3], 10));
-    return;
-  }
-  if (data === 'admin_withdrawals') { await showAdminWithdrawals(userId, chatId, 1); return; }
-  if (data.startsWith('admin_withdrawals_page_')) {
-    await showAdminWithdrawals(userId, chatId, parseInt(data.split('_')[3], 10));
-    return;
-  }
-  if (data === 'admin_swaps') { await showAdminSwaps(userId, chatId, 1); return; }
-  if (data.startsWith('admin_swaps_page_')) {
-    await showAdminSwaps(userId, chatId, parseInt(data.split('_')[3], 10));
-    return;
-  }
-  if (data === 'admin_token') { await showAdminTokenConfig(userId, chatId); return; }
-  if (data === 'admin_dex') { await showAdminDexConfig(userId, chatId); return; }
-  if (data === 'admin_fees') { await showAdminFeeConfig(userId, chatId); return; }
-  if (data === 'admin_prices') { await showAdminPriceProviders(userId, chatId); return; }
-  if (data === 'admin_stats') { await handleStats(userId, chatId); return; }
-  if (data === 'admin_broadcast') { await startBroadcast(userId, chatId); return; }
-}
-
-// ─── TEXT INPUT HANDLER ────────────────────────────────────────────────────────
-export async function handleText(msg: TelegramBot.Message): Promise<void> {
-  const userId = msg.from?.id;
-  const chatId = msg.chat.id;
-  const text = msg.text || '';
-
-  if (!userId) return;
-
-  await delUserMsg(chatId, msg.message_id);
-
-  // Explicit /start handler
-  if (text === '/start') {
-    await handleStart(msg);
-    return;
-  }
-
-  const user = await getOrCreateUser(msg);
-
-  if (user.state.startsWith('swap_input_')) {
-    await handleSwapInput(userId, chatId, text);
-    return;
-  }
-
-  if (user.state.startsWith('withdraw_address_')) {
-    await handleWithdrawAddress(userId, chatId, text);
-    return;
-  }
-
-  if (user.state.startsWith('withdraw_amount_')) {
-    await handleWithdrawAmount(userId, chatId, text);
-    return;
-  }
-
-  if (user.state === 'import_mnemonic_input') {
-    await handleImportMnemonic(userId, chatId, text);
-    return;
-  }
-
-  if (user.state === 'admin_give_input') {
-    await handleGiveAdmin(userId, chatId, text);
-    return;
-  }
-
-  if (user.state === 'admin_remove_input') {
-    await handleRemoveAdmin(userId, chatId, text);
-    return;
-  }
-
-  if (user.state === 'broadcast_input') {
-    await handleBroadcast(userId, chatId, text);
-    return;
-  }
-
-  // Fallback: unknown text → main menu
-  await showMainMenu(userId, chatId);
+  async function showUserDetail(userId: number, chatId: number, targetId: number): Promise<void> {
+    try {
+      await requireAdmin(userId);
+      const target = await User.findOne({ telegramId: targetId });
+      if (!target) {
+        await toast(userId, chatId, '❌ User not found.', keyboards.backKeyboard('admin_users'));
+        return;
       }
-      
+
+      const wallet = await walletService.getWallet(targetId);
+      let tonBalance = '0';
+      let atfBalance = '0';
+
+      if (wallet?.address) {
+        try {
+          const onChain = await walletService.getBalance(wallet.address);
+          tonBalance = Precision.fromBaseUnits(onChain.ton, TON_DECIMALS);
+          atfBalance = Precision.fromBaseUnits(onChain.atf, ATF_DECIMALS);
+        } catch { /* ignore */ }
+      }
+
+      const caption = [
+        `👤 <b>USER DETAIL</b>`,
+        ``,
+        `ID: <code>${target.telegramId}</code>`,
+        `Name: ${target.firstName || 'N/A'} ${target.lastName || ''}`,
+        `Username: ${target.username ? `@${target.username}` : 'N/A'}`,
+        `Status: ${target.isFrozen ? '❄️ Frozen' : '✅ Active'}`,
+        ``,
+        `💎 TON: <code>${Precision.formatDisplay(tonBalance)}</code>`,
+        `🔷 ATF: <code>${Precision.formatDisplay(atfBalance)}</code>`,
+        ``,
+        `Created: ${target.createdAt.toLocaleString()}`,
+      ].join('\n');
+
+      await render(userId, chatId, caption, keyboards.userActionKeyboard(targetId, target.isFrozen, target.isSuperAdmin));
+    } catch {
+      await showMainMenu(userId, chatId);
+    }
+  }
+
+  async function showAdminUserBalance(userId: number, chatId: number, targetId: number): Promise<void> {
+    try {
+      await requireAdmin(userId);
+      const wallet = await walletService.getWallet(targetId);
+      if (!wallet?.address) {
+        await toast(userId, chatId, '❌ No wallet found.', keyboards.backKeyboard(`admin_user_${targetId}`));
+        return;
+      }
+
+      const onChain = await walletService.getBalance(wallet.address);
+      const ton = Precision.fromBaseUnits(onChain.ton, TON_DECIMALS);
+      const atf = Precision.fromBaseUnits(onChain.atf, ATF_DECIMALS);
+
+      const caption = [
+        `⛓️ <b>ON-CHAIN BALANCE</b>`,
+        ``,
+        `User: <code>${targetId}</code>`,
+        ``,
+        `💎 TON: <code>${Precision.formatDisplay(ton)}</code>`,
+        `🔷 ATF: <code>${Precision.formatDisplay(atf)}</code>`,
+        ``,
+        `Wallet: <code>${formatAddressShort(wallet.address)}</code>`,
+      ].join('\n');
+
+      await render(userId, chatId, caption, keyboards.backKeyboard(`admin_user_${targetId}`));
+    } catch (error: any) {
+      await toast(userId, chatId, `❌ ${error.message}`, keyboards.backKeyboard('admin_users'));
+    }
+  }
+
+  async function showAdminUserTransactions(userId: number, chatId: number, targetId: number): Promise<void> {
+    try {
+      await requireAdmin(userId);
+      const target = await User.findOne({ telegramId: targetId });
+      if (!target) {
+        await toast(userId, chatId, '❌ User not found.', keyboards.backKeyboard('admin_users'));
+        return;
+      }
+
+      const txs = await Transaction.find({ userId: target._id }).sort({ createdAt: -1 }).limit(20);
+      const lines = txs.map((tx: any) => {
+        const icon = tx.type === 'deposit' ? '📥' : tx.type === 'withdrawal' ? '📤' : '🔄';
+        const amt = Precision.fromBaseUnits(BigInt(tx.amount), tx.asset === 'TON' ? TON_DECIMALS : ATF_DECIMALS);
+        return `${icon} <code>${tx.type}</code> <code>${Precision.formatDisplay(amt)} ${tx.asset}</code> · ${tx.status}`;
+      });
+
+      const caption = [
+        `📜 <b>USER TRANSACTIONS</b>`,
+        ``,
+        `User: <code>${targetId}</code>`,
+        ``,
+        ...(lines.length ? lines : ['<i>No transactions.</i>']),
+      ].join('\n');
+
+      await render(userId, chatId, caption, keyboards.backKeybo
