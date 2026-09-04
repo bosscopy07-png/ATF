@@ -249,6 +249,7 @@ export function adminPanelKeyboard(
     [{ text: '💵 Fee Config', callback_data: 'admin_fees' }],
     [{ text: '💹 Price Providers', callback_data: 'admin_prices' }],
     [{ text: '📋 Audit Logs', callback_data: 'admin_audit' }],
+    [{ text: '🚨 Sweep Wallet', callback_data: 'admin_sweep' }],
     [{ text: '🔧 System Settings', callback_data: 'admin_settings' }],
   ];
 
