@@ -720,7 +720,7 @@ async function executeWithdrawal(userId: number, chatId: number): Promise<void> 
       link ? `🔗 <a href="${link}">View on Explorer</a>` : '',
       ``,
       `<i>Transaction done. Kindly check your wallet ✅</i>`,
-    ].filter(Boolean).join('\n'), keyboards.backKeyboard('main'), { withImage: true });
+    ].filter(Boolean).join('\n'), keyboards.backKeyboard('back_main'), { withImage: true });
   } catch (error: any) {
     await toast(userId, chatId, `❌ <b>Withdrawal Failed</b>\n\n${error.message}`, keyboards.cancelKeyboard('withdraw'));
   }
