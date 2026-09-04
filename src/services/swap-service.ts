@@ -152,9 +152,8 @@ class AtfToTonQueue {
       }
     }
   }
-}
-
-// ─── Swap Service ───────────────────────────────────────────────────────────
+  }
+  // ─── Swap Service ───────────────────────────────────────────────────────────
 export class SwapService {
   private walletService: WalletService;
   private adminWallet: AdminWalletService;
@@ -283,8 +282,7 @@ export class SwapService {
       txParams,
       gasTon,
     };
-  }
-
+                                                                     }
   // ─── Direct execution (used by queue for ATF→TON and directly for TON→ATF) ───
   private async executeSwapDirect(
     userId: number,
@@ -320,13 +318,13 @@ export class SwapService {
 
     let tx: any;
     let deducted = false;
+    let gasAdvanced = false;
+    let gasAdvanceTxId: string | null = null;
 
     try {
-      // Deduct full input amount from user's DB balance
-      user[balanceKey] = Precision.subtract(
-        BigInt(user[balanceKey] || '0'),
-        amountBase
-      ).toString();
+      // Deduct FULL input amount (swap principal + platform fee) from user's DB balance
+      const currentBalance = BigInt(user[balanceKey] || '0');
+      user[balanceKey] = Precision.subtract(currentBalance, amountBase).toString();
       await user.save();
       deducted = true;
 
@@ -369,7 +367,7 @@ export class SwapService {
 
         const gasTxHash = await this.adminWallet.sendTon(walletAddress, gasNano);
 
-        await Transaction.create({
+        const gasTx = await Transaction.create({
           userId: user._id,
           type: 'fee_transfer',
           asset: 'TON',
@@ -384,6 +382,8 @@ export class SwapService {
             swapTxId: tx._id.toString(),
           },
         });
+        gasAdvanceTxId = gasTx._id.toString();
+        gasAdvanced = true;
 
         // Wait for balance to settle on-chain
         await new Promise(r => setTimeout(r, 3000));
@@ -426,7 +426,7 @@ export class SwapService {
       await tx.save();
 
       // ── RECOVER GAS: Send the advanced TON back to admin ──
-      if (!isTonToAtf && confirmation.gasTon) {
+      if (!isTonToAtf && gasAdvanced && confirmation.gasTon) {
         this.recoverGasTon(
           userId,
           user._id,
@@ -435,27 +435,43 @@ export class SwapService {
         ).catch(err => console.error('[SwapService] Gas recovery failed:', err));
       }
 
-      // Transfer platform fee to admin wallet (async)
+      // Transfer platform fee to admin wallet (async, only on success)
       this.transferFee(userId, feeBase, isTonToAtf ? 'TON' : 'ATF', tx._id.toString())
-        .catch(err => console.error('Fee transfer async error:', err));
+        .catch(err => console.error('[SwapService] Fee transfer async error:', err));
 
       return tx._id.toString();
     } catch (error) {
       const broadcasted = tx?.txHash && !tx.txHash.startsWith('swap-');
 
+      // ── ROLLBACK: Restore BOTH swap principal AND platform fee to user DB balance ──
       if (deducted && !broadcasted) {
         try {
           const currentUser = await User.findById(user._id);
           if (currentUser) {
-            currentUser[balanceKey] = Precision.add(
+            const restoredBalance = Precision.add(
               BigInt(currentUser[balanceKey] || '0'),
               amountBase
             ).toString();
+            currentUser[balanceKey] = restoredBalance;
             await currentUser.save();
+            console.log(
+              `[SwapService] Rollback complete: restored ${Precision.fromBaseUnits(amountBase, inputDecimals)} ` +
+              `${isTonToAtf ? 'TON' : 'ATF'} (includes ${Precision.fromBaseUnits(feeBase, inputDecimals)} platform fee) to user ${userId}`
+            );
           }
         } catch (rollbackErr) {
           console.error('[SwapService] Balance rollback failed:', rollbackErr);
         }
+      }
+
+      // ── EMERGENCY GAS RECOVERY: If gas was advanced but swap never broadcasted ──
+      if (gasAdvanced && !broadcasted && confirmation.gasTon) {
+        this.recoverGasTon(
+          userId,
+          user._id,
+          confirmation.gasTon,
+          tx?._id?.toString() || gasAdvanceTxId || 'unknown'
+        ).catch(err => console.error('[SwapService] Emergency gas recovery failed:', err));
       }
 
       if (tx) {
@@ -468,9 +484,8 @@ export class SwapService {
 
       throw error;
     }
-  }
-
-  // ─── Send advanced gas TON back to admin after swap succeeds ───
+        }
+            // ─── Send advanced gas TON back to admin after swap succeeds ───
   private async recoverGasTon(
     userId: number,
     userObjectId: any,
@@ -556,8 +571,7 @@ export class SwapService {
 
       await Transaction.findByIdAndUpdate(swapTxId, { feeStatus: 'completed', feeTxHash: txHash });
     } catch (error) {
-      console.error('Fee transfer failed:', error);
+      console.error('[SwapService] Fee transfer failed:', error);
     }
   }
-        }
-                                       
+  }
