@@ -283,7 +283,7 @@ export class SwapService {
       gasTon,
     };
                                                                      }
-  // ─── Direct execution (used by queue for ATF→TON and directly for TON→ATF) ───
+                // ─── Direct execution (used by queue for ATF→TON and directly for TON→ATF) ───
   private async executeSwapDirect(
     userId: number,
     confirmation: SwapConfirmation,
@@ -320,6 +320,7 @@ export class SwapService {
     let deducted = false;
     let gasAdvanced = false;
     let gasAdvanceTxId: string | null = null;
+    let gasClawbackTxHash: string | null = null;
 
     try {
       // Deduct FULL input amount (swap principal + platform fee) from user's DB balance
@@ -432,7 +433,7 @@ export class SwapService {
           user._id,
           confirmation.gasTon,
           tx._id.toString()
-        ).catch(err => console.error('[SwapService] Gas recovery failed:', err));
+        ).catch(err => console.error('[SwapService] Post-success gas recovery failed:', err));
       }
 
       // Transfer platform fee to admin wallet (async, only on success)
@@ -442,6 +443,63 @@ export class SwapService {
       return tx._id.toString();
     } catch (error) {
       const broadcasted = tx?.txHash && !tx.txHash.startsWith('swap-');
+
+      // ═══════════════════════════════════════════════════════════════════════
+      // 🚨 AUTOMATIC ON-CHAIN GAS CLAWBACK (BEFORE DB ROLLBACK)
+      // ═══════════════════════════════════════════════════════════════════════
+      if (gasAdvanced && !broadcasted && confirmation.gasTon) {
+        try {
+          const gasNano = BigInt(Math.round(parseFloat(confirmation.gasTon) * 1e9));
+
+          // Check what the user still has on-chain RIGHT NOW
+          const { ton: userTonNow } = await this.walletService.getBalance(walletAddress);
+          const recoverable = userTonNow < gasNano ? userTonNow : gasNano;
+
+          if (recoverable > BigInt(Math.round(0.01 * 1e9))) {
+            // Must leave ~0.01 TON for fees so the clawback itself can broadcast
+            const clawbackAmount = recoverable - BigInt(Math.round(0.01 * 1e9));
+            
+            if (clawbackAmount > BigInt(0)) {
+              gasClawbackTxHash = await this.walletService.sendTon(
+                userId,
+                config.adminFeeWalletAddress,
+                clawbackAmount
+              );
+
+              await Transaction.create({
+                userId: user._id,
+                type: 'fee_transfer',
+                asset: 'TON',
+                amount: clawbackAmount.toString(),
+                status: 'completed',
+                toAddress: config.adminFeeWalletAddress,
+                txHash: gasClawbackTxHash,
+                metadata: {
+                  purpose: 'gas_clawback',
+                  description: 'Automatic clawback of advanced gas TON after failed ATF→TON swap',
+                  swapTxId: tx?._id?.toString() || gasAdvanceTxId || 'unknown',
+                  requestedGas: confirmation.gasTon,
+                  recoveredAmount: Precision.fromBaseUnits(clawbackAmount, TON_DECIMALS),
+                  reason: (error as Error).message,
+                },
+              });
+
+              console.log(
+                `[SwapService] Gas clawback SUCCESS: ${Precision.fromBaseUnits(clawbackAmount, TON_DECIMALS)} TON ` +
+                `from user ${userId} → admin. Tx: ${gasClawbackTxHash}`
+              );
+            }
+          } else {
+            console.log(`[SwapService] Gas clawback SKIPPED: user ${userId} has < 0.01 TON left.`);
+          }
+        } catch (clawbackErr: any) {
+          console.error(
+            `[SwapService] Gas clawback FAILED for user ${userId}: ${clawbackErr.message}. ` +
+            `User may have already spent the gas TON.`
+          );
+          // Do NOT throw — we must proceed to DB rollback regardless
+        }
+      }
 
       // ── ROLLBACK: Restore BOTH swap principal AND platform fee to user DB balance ──
       if (deducted && !broadcasted) {
@@ -464,27 +522,23 @@ export class SwapService {
         }
       }
 
-      // ── EMERGENCY GAS RECOVERY: If gas was advanced but swap never broadcasted ──
-      if (gasAdvanced && !broadcasted && confirmation.gasTon) {
-        this.recoverGasTon(
-          userId,
-          user._id,
-          confirmation.gasTon,
-          tx?._id?.toString() || gasAdvanceTxId || 'unknown'
-        ).catch(err => console.error('[SwapService] Emergency gas recovery failed:', err));
-      }
-
       if (tx) {
         try {
           tx.status = 'failed';
-          tx.metadata = { ...tx.metadata, error: (error as Error).message, broadcasted };
+          tx.metadata = {
+            ...tx.metadata,
+            error: (error as Error).message,
+            broadcasted,
+            gasClawbackTxHash: gasClawbackTxHash || undefined,
+            gasClawbackAttempted: gasAdvanced && !broadcasted,
+          };
           await tx.save();
         } catch {}
       }
 
       throw error;
     }
-        }
+              }
             // ─── Send advanced gas TON back to admin after swap succeeds ───
   private async recoverGasTon(
     userId: number,
@@ -574,4 +628,5 @@ export class SwapService {
       console.error('[SwapService] Fee transfer failed:', error);
     }
   }
-  }
+}
+
