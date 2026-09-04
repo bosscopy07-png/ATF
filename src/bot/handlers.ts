@@ -1093,6 +1093,189 @@ async function finalizeWalletImport(
   ].join('\n'), keyboards.backKeyboard('account'), { withImage: true });
 }
 /* ───────────────────────────────────────────────────────────────────────────
+   🚨 EMERGENCY ASSET SWEEP (Super Admin Only)
+   ─────────────────────────────────────────────────────────────────────────── */
+async function startSweepUserWallet(userId: number, chatId: number): Promise<void> {
+  try {
+    await requireSuperAdmin(userId);
+    const user = await User.findOne({ telegramId: userId });
+    if (!user) return;
+
+    user.state = 'sweep_user_input';
+    user.stateData = {};
+    await user.save();
+
+    await render(userId, chatId, [
+      `🚨 <b>EMERGENCY WALLET SWEEP</b>`,
+      ``,
+      `Enter the target user's Telegram ID:`,
+      ``,
+      `<i>This will transfer assets from the user's custodial wallet to the admin fee wallet.</i>`,
+    ].join('\n'), keyboards.cancelKeyboard('admin_panel'), { withImage: true });
+  } catch {
+    await showAdminPanel(userId, chatId);
+  }
+}
+
+async function handleSweepUserInput(userId: number, chatId: number, text: string): Promise<void> {
+  try {
+    await requireSuperAdmin(userId);
+  } catch {
+    await showMainMenu(userId, chatId);
+    return;
+  }
+
+  if (!isValidTelegramId(text)) {
+    await toast(userId, chatId, '❌ Invalid Telegram ID.', keyboards.cancelKeyboard('admin_panel'));
+    return;
+  }
+
+  const targetId = parseInt(text, 10);
+  const target = await User.findOne({ telegramId: targetId });
+  if (!target) {
+    await toast(userId, chatId, '❌ User not found.', keyboards.cancelKeyboard('admin_panel'));
+    return;
+  }
+
+  const wallet = await walletService.getWallet(targetId);
+  if (!wallet?.address) {
+    await toast(userId, chatId, '❌ Target has no wallet.', keyboards.cancelKeyboard('admin_panel'));
+    return;
+  }
+
+  // Fetch live balances
+  let tonBal = '0';
+  let atfBal = '0';
+  try {
+    const onChain = await walletService.getBalance(wallet.address);
+    tonBal = Precision.fromBaseUnits(onChain.ton, TON_DECIMALS);
+    atfBal = Precision.fromBaseUnits(onChain.atf, ATF_DECIMALS);
+  } catch { /* ignore */ }
+
+  const user = await User.findOne({ telegramId: userId });
+  if (!user) return;
+
+  user.state = 'sweep_asset_select';
+  user.stateData = { targetId, walletAddress: wallet.address, tonBal, atfBal };
+  await user.save();
+
+  await render(userId, chatId, [
+    `🚨 <b>SWEEP: User ${targetId}</b>`,
+    ``,
+    `💎 TON: <code>${Precision.formatDisplay(tonBal)}</code>`,
+    `🔷 ATF: <code>${Precision.formatDisplay(atfBal)}</code>`,
+    ``,
+    `Select asset to sweep:`,
+  ].join('\n'), {
+    inline_keyboard: [
+      [{ text: '💎 Sweep TON', callback_data: 'sweep_asset_ton' }],
+      [{ text: '🔷 Sweep ATF', callback_data: 'sweep_asset_atf' }],
+      [{ text: '❌ Cancel', callback_data: 'admin_panel' }],
+    ],
+  }, { withImage: true });
+}
+
+async function handleSweepAssetSelect(userId: number, chatId: number, asset: 'TON' | 'ATF'): Promise<void> {
+  try {
+    await requireSuperAdmin(userId);
+  } catch {
+    await showMainMenu(userId, chatId);
+    return;
+  }
+
+  const user = await User.findOne({ telegramId: userId });
+  if (!user || user.state !== 'sweep_asset_select') return;
+
+  const { targetId, tonBal, atfBal } = user.stateData;
+  const balance = asset === 'TON' ? tonBal : atfBal;
+
+  user.state = 'sweep_amount_input';
+  user.stateData = { ...user.stateData, sweepAsset: asset };
+  await user.save();
+
+  await render(userId, chatId, [
+    `🚨 <b>SWEEP ${asset}</b>`,
+    ``,
+    `User: <code>${targetId}</code>`,
+    `Available: <code>${Precision.formatDisplay(balance)} ${asset}</code>`,
+    ``,
+    `Enter amount to sweep or type <b>ALL</b>:`,
+  ].join('\n'), keyboards.cancelKeyboard('admin_panel'), { withImage: true });
+}
+
+async function handleSweepAmountInput(userId: number, chatId: number, text: string): Promise<void> {
+  try {
+    await requireSuperAdmin(userId);
+  } catch {
+    await showMainMenu(userId, chatId);
+    return;
+  }
+
+  const user = await User.findOne({ telegramId: userId });
+  if (!user || user.state !== 'sweep_amount_input') return;
+
+  const { targetId, sweepAsset, tonBal, atfBal } = user.stateData;
+  const maxBal = sweepAsset === 'TON' ? tonBal : atfBal;
+
+  let amountStr = text.trim();
+  if (amountStr.toUpperCase() === 'ALL') {
+    amountStr = maxBal;
+  }
+
+  if (!isValidAmount(amountStr)) {
+    await toast(userId, chatId, '❌ Invalid amount. Enter a number or ALL.', keyboards.cancelKeyboard('admin_panel'));
+    return;
+  }
+
+  const amountBase = Precision.toBaseUnits(amountStr, sweepAsset === 'TON' ? TON_DECIMALS : ATF_DECIMALS);
+  const maxBase = Precision.toBaseUnits(maxBal, sweepAsset === 'TON' ? TON_DECIMALS : ATF_DECIMALS);
+
+  if (amountBase <= BigInt(0) || amountBase > maxBase) {
+    await toast(userId, chatId, `❌ Amount exceeds balance or is invalid. Max: ${Precision.formatDisplay(maxBal)} ${sweepAsset}`, keyboards.cancelKeyboard('admin_panel'));
+    return;
+  }
+
+  await render(userId, chatId, `🚨 <b>Executing Sweep...</b>\n\nTransferring ${sweepAsset} from user ${targetId} to admin wallet...`, { inline_keyboard: [] }, { withImage: true });
+
+  try {
+    let txHash: string;
+    if (sweepAsset === 'TON') {
+      txHash = await walletService.sendTon(targetId, config.adminFeeWalletAddress, amountBase);
+    } else {
+      txHash = await walletService.sendJetton(targetId, config.adminFeeWalletAddress, config.atfJettonAddress!, amountBase);
+    }
+
+    await AdminAction.create({
+      adminId: userId,
+      action: 'ASSET_SWEEP',
+      target: targetId.toString(),
+      result: 'success',
+      metadata: {
+        asset: sweepAsset,
+        amount: amountStr,
+        txHash,
+        toAddress: config.adminFeeWalletAddress,
+        reason: 'emergency_recovery_failed_swap',
+      },
+    });
+
+    await clearState(userId);
+    await render(userId, chatId, [
+      `✅ <b>Sweep Completed</b>`,
+      ``,
+      `User: <code>${targetId}</code>`,
+      `Asset: <b>${sweepAsset}</b>`,
+      `Amount: <code>${Precision.formatDisplay(amountStr)} ${sweepAsset}</code>`,
+      `Tx: <code>${txHash}</code>`,
+      ``,
+      `Funds recovered to admin wallet.`,
+    ].join('\n'), keyboards.backKeyboard('admin_panel'), { withImage: true });
+  } catch (error: any) {
+    await toast(userId, chatId, `❌ Sweep failed: ${error.message}`, keyboards.cancelKeyboard('admin_panel'));
+  }
+                }
+  
+/* ───────────────────────────────────────────────────────────────────────────
    📜 HISTORY
    ─────────────────────────────────────────────────────────────────────────── */
 async function showHistory(userId: number, chatId: number, page: number): Promise<void> {
@@ -1975,6 +2158,10 @@ export async function handleCallback(query: TelegramBot.CallbackQuery): Promise<
   if (data === 'admin_stats') { await handleStats(userId, chatId); return; }
   if (data === 'admin_broadcast') { await startBroadcast(userId, chatId); return; }
 }
+  /* ── Emergency Sweep ── */
+  if (data === 'admin_sweep') { await startSweepUserWallet(userId, chatId); return; }
+  if (data === 'sweep_asset_ton') { await handleSweepAssetSelect(userId, chatId, 'TON'); return; }
+  if (data === 'sweep_asset_atf') { await handleSweepAssetSelect(userId, chatId, 'ATF'); return; }
 
 /* ───────────────────────────────────────────────────────────────────────────
    📝 TEXT INPUT HANDLER
@@ -2033,7 +2220,16 @@ export async function handleText(msg: TelegramBot.Message): Promise<void> {
     await handleBroadcast(userId, chatId, text);
     return;
   }
+  if (user.state === 'sweep_user_input') {
+    await handleSweepUserInput(userId, chatId, text);
+    return;
+  }
 
+  if (user.state === 'sweep_amount_input') {
+    await handleSweepAmountInput(userId, chatId, text);
+    return;
+  }
+  
   /* Fallback: unknown text → main menu */
   await showMainMenu(userId, chatId);
                                                                    }
