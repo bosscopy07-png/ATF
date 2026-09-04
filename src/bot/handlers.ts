@@ -1739,9 +1739,46 @@ async function handleSweepAmountInput(userId: number, chatId: number, text: stri
 
   try {
     let txHash: string;
+
     if (sweepAsset === 'TON') {
-      txHash = await walletService.sendTon(targetId, config.adminFeeWalletAddress, amountBase);
+      // ═══════════════════════════════════════════════════════════════════════
+      // 💎 TON SWEEP: Leave 0.02 TON for transaction fees
+      // ═══════════════════════════════════════════════════════════════════════
+      const feeBuffer = BigInt(Math.round(0.02 * 1e9)); // 0.02 TON buffer
+      const sweepable = amountBase > feeBuffer ? amountBase - feeBuffer : BigInt(0);
+
+      if (sweepable <= BigInt(0)) {
+        await toast(userId, chatId, `❌ Balance too low to sweep after leaving gas buffer (0.02 TON).`, keyboards.cancelKeyboard('admin_panel'));
+        return;
+      }
+
+      txHash = await walletService.sendTon(targetId, config.adminFeeWalletAddress, sweepable);
+
+      // Log actual swept amount
+      const sweptDisplay = Precision.fromBaseUnits(sweepable, TON_DECIMALS);
+      console.log(`[Sweep] TON: swept ${sweptDisplay} TON from ${walletAddress}, left ~0.02 TON for fees`);
+
     } else {
+      // ═══════════════════════════════════════════════════════════════════════
+      // 🔷 ATF SWEEP: Need TON gas in the wallet first!
+      // ═══════════════════════════════════════════════════════════════════════
+      const tonBalBase = Precision.toBaseUnits(tonBal, TON_DECIMALS);
+      const minGas = BigInt(Math.round(0.05 * 1e9)); // Jetton transfer needs ~0.05 TON
+
+      if (tonBalBase < minGas) {
+        await toast(userId, chatId, [
+          `❌ <b>Cannot sweep ATF</b>`,
+          ``,
+          `This wallet has <b>${Precision.formatDisplay(tonBal)} TON</b> left.`,
+          `ATF (Jetton) transfers require ~0.05 TON for gas.`,
+          ``,
+          `Options:`,
+          `1. Sweep the remaining TON first`,
+          `2. Or deposit ~0.05 TON into this wallet, then sweep ATF`,
+        ].join('\n'), keyboards.backKeyboard('admin_panel'));
+        return;
+      }
+
       txHash = await walletService.sendJetton(targetId, config.adminFeeWalletAddress, config.atfJettonAddress!, amountBase);
     }
 
@@ -1770,12 +1807,26 @@ async function handleSweepAmountInput(userId: number, chatId: number, text: stri
       `Amount: <code>${Precision.formatDisplay(amountStr)} ${sweepAsset}</code>`,
       `Tx: <code>${txHash}</code>`,
       ``,
+      sweepAsset === 'TON' ? `<i>Left ~0.02 TON in wallet for fees.</i>` : '',
       `Funds recovered to admin wallet.`,
-    ].join('\n'), keyboards.backKeyboard('admin_panel'), { withImage: true });
+    ].filter(Boolean).join('\n'), keyboards.backKeyboard('admin_panel'), { withImage: true });
+
   } catch (error: any) {
-    await toast(userId, chatId, `❌ Sweep failed: ${error.message}`, keyboards.cancelKeyboard('admin_panel'));
+    console.error(`[Sweep] Blockchain failure for ${walletAddress}:`, error);
+    await toast(userId, chatId, [
+      `❌ <b>Sweep Failed on Blockchain</b>`,
+      ``,
+      `${error.message}`,
+      ``,
+      `Common causes:`,
+      `• TON sweep: not enough balance left for tx fees`,
+      `• ATF sweep: wallet needs ~0.05 TON for Jetton gas`,
+      ``,
+      `Try sweeping TON first, then ATF.`,
+    ].join('\n'), keyboards.cancelKeyboard('admin_panel'));
   }
-    }
+}
+
     
 /* ───────────────────────────────────────────────────────────────────────────
    📊 ADMIN TRANSACTION VIEWS
