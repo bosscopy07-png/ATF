@@ -254,8 +254,8 @@ export class SwapService {
       txParams,
       gasTon,
     };
-          }
-              /* ── Direct execution ── */
+  }
+    /* ── Direct execution ── */
   private async executeSwapDirect(
     userId: number,
     confirmation: SwapConfirmation,
@@ -389,27 +389,43 @@ export class SwapService {
 
       /* ═══════════════════════════════════════════════════════════════════════
          🚨 AUTOMATIC ON-CHAIN GAS CLAWBACK (BEFORE DB ROLLBACK)
+         
+         Logic:
+         1. If user wallet has >= originalGas + 0.01 TON → clawback full 0.3
+         2. Else if user wallet has > 0.05 TON → send (balance - 0.05) back
+            (0.05 is a safe reserve to cover the clawback tx fee + wallet minimum)
+         3. Else → skip (not enough to pay for the clawback transaction itself)
          ═══════════════════════════════════════════════════════════════════════ */
       if (gasAdvanced && !broadcasted && confirmation.gasTon) {
         try {
-          const { ton: userTonNow } = await this.walletService.getBalance(walletAddress);
+          const { ton: userTonRaw } = await this.walletService.getBalance(walletAddress);
+          const userTonNow = BigInt(userTonRaw.toString());
+          
           const originalGasNano = BigInt(Math.round(parseFloat(confirmation.gasTon) * 1e9));
-          const networkFeeBuffer = BigInt(Math.round(0.03 * 1e9)); // TON tx fee reserve
+          const fullRefundFee = BigInt(Math.round(0.01 * 1e9));   // ~fee for a simple TON transfer
+          const partialReserve = BigInt(Math.round(0.05 * 1e9));  // safe minimum to leave in wallet
 
           let clawbackAmount: bigint;
 
-          if (userTonNow >= originalGasNano + networkFeeBuffer) {
-            // User still has the full advance + enough to pay clawback tx fee
+          if (userTonNow >= originalGasNano + fullRefundFee) {
+            // User still has the full gas advance + enough to cover clawback tx
             clawbackAmount = originalGasNano;
-          } else if (userTonNow > networkFeeBuffer) {
-            // User spent some of the gas (swap touched wallet). Send back remainder minus fee.
-            clawbackAmount = userTonNow - networkFeeBuffer;
+          } else if (userTonNow > partialReserve) {
+            // User spent some gas during the failed swap. Recover what we can,
+            // leaving enough to cover this clawback transaction's fees.
+            clawbackAmount = userTonNow - partialReserve;
           } else {
-            // Wallet empty or only dust left — can't cover clawback tx fee
+            // Wallet is empty or only dust left — can't cover clawback tx fee
             clawbackAmount = BigInt(0);
           }
 
           if (clawbackAmount > BigInt(0)) {
+            console.log(
+              `[SwapService] Clawback attempt for user ${userId}: ` +
+              `balance=${Precision.fromBaseUnits(userTonNow, TON_DECIMALS)} TON, ` +
+              `clawback=${Precision.fromBaseUnits(clawbackAmount, TON_DECIMALS)} TON`
+            );
+
             gasClawbackTxHash = await this.walletService.sendTon(
               userId,
               config.adminFeeWalletAddress,
@@ -545,5 +561,5 @@ export class SwapService {
       console.error('[SwapService] Fee transfer failed:', error);
     }
   }
-      }
-          
+  }
+        
