@@ -1,10 +1,15 @@
+import crypto from 'crypto';
 import { User } from '../models/User';
 import { Transaction } from '../models/Transaction';
+import { SwapIdempotency } from '../models/SwapIdempotency';
 import { WalletService } from './wallet-service';
 import { AdminWalletService } from './admin-wallet-service';
 import { STONFiAdapter } from './stonfi-adapter';
 import { PriceService } from './price-service';
+import { GasRecoveryService, gasTonToNano } from './gas-recovery-service';
 import { Precision } from '../utils/precision';
+import { checkRateLimit } from '../utils/rate-limiter';
+import { withLock } from '../utils/distributed-lock';
 import { config, TON_DECIMALS, ATF_DECIMALS } from '../config';
 
 export interface SwapRequest {
@@ -14,6 +19,8 @@ export interface SwapRequest {
 }
 
 export interface SwapConfirmation {
+  /** Unique per prepared quote. Used as the idempotency reference for execution. */
+  confirmationId: string;
   inputAmount: string;
   platformFee: string;
   netSwapAmount: string;
@@ -85,9 +92,9 @@ class AtfToTonQueue {
 
         const firstItem = this.queue[0];
         const gasPerSwap = firstItem.confirmation.gasTon
-          ? BigInt(Math.round(parseFloat(firstItem.confirmation.gasTon) * 1e9))
-          : BigInt(Math.round(0.3 * 1e9));
-        const buffer = BigInt(Math.round(0.05 * 1e9));
+          ? gasTonToNano(firstItem.confirmation.gasTon)
+          : gasTonToNano('0.3');
+        const buffer = gasTonToNano('0.05');
         const requiredPerSwap = gasPerSwap + buffer;
 
         if (adminBalance < requiredPerSwap) {
@@ -102,7 +109,7 @@ class AtfToTonQueue {
         let totalRequired = BigInt(0);
         for (let i = 0; i < this.queue.length; i++) {
           const itemGas = this.queue[i].confirmation.gasTon
-            ? BigInt(Math.round(parseFloat(this.queue[i].confirmation.gasTon!) * 1e9))
+            ? gasTonToNano(this.queue[i].confirmation.gasTon!)
             : gasPerSwap;
           const itemRequired = itemGas + buffer;
           if (totalRequired + itemRequired > adminBalance) break;
@@ -148,32 +155,94 @@ export class SwapService {
   private stonfi: STONFiAdapter;
   private priceService: PriceService;
   private atfQueue: AtfToTonQueue;
+  private gasRecovery: GasRecoveryService;
 
   constructor() {
     this.walletService = new WalletService();
     this.adminWallet = new AdminWalletService();
     this.stonfi = new STONFiAdapter();
     this.priceService = PriceService.getInstance();
+    this.gasRecovery = new GasRecoveryService(this.walletService);
     this.atfQueue = new AtfToTonQueue((userId, confirmation, direction) =>
       this.executeSwapDirect(userId, confirmation, direction)
     );
   }
 
-  /* ── Public entry ── */
+  /* ── Public entry ──────────────────────────────────────────────────────
+     Rate limiting, distributed locking, and per-swap idempotency all live
+     here so that EVERY caller (Telegram handler, admin tooling, anything
+     else) goes through the same protection, regardless of direction. */
   async executeSwap(
     userId: number,
     confirmation: SwapConfirmation,
     direction: 'ton_to_atf' | 'atf_to_ton'
   ): Promise<string> {
-    if (direction === 'atf_to_ton') {
-      return this.atfQueue.enqueue(userId, confirmation, direction);
+    await checkRateLimit('swap:execute', userId, config.swapExecuteRateLimit, config.swapExecuteRateWindowMs);
+
+    if (!confirmation.confirmationId) {
+      // Defensive — should never happen for a confirmation minted by prepareSwap.
+      throw new Error('Invalid or expired quote. Please request a new quote.');
     }
-    return this.executeSwapDirect(userId, confirmation, direction);
+
+    return withLock(`lock:swap:${userId}`, config.swapLockTtlMs, async () => {
+      const idemKey = `swap:${userId}:${confirmation.confirmationId}`;
+
+      // Atomic create-if-absent. `updatedExisting` tells us whether WE just
+      // created this record (proceed) or someone else already did
+      // (duplicate execution attempt — return their outcome instead).
+      const raw: any = await SwapIdempotency.findOneAndUpdate(
+        { key: idemKey },
+        {
+          $setOnInsert: {
+            key: idemKey,
+            userId,
+            confirmationId: confirmation.confirmationId,
+            status: 'processing',
+          },
+        },
+        { upsert: true, new: true, rawResult: true }
+      );
+
+      const alreadyExisted = raw?.lastErrorObject?.updatedExisting === true;
+
+      if (alreadyExisted) {
+        const existing = raw.value;
+        if (existing.status === 'completed' && existing.transactionId) {
+          return existing.transactionId;
+        }
+        if (existing.status === 'processing') {
+          throw new Error('This swap is already being processed. Please wait for it to finish.');
+        }
+        throw new Error(existing.error || 'This swap already failed. Please request a new quote.');
+      }
+
+      try {
+        const txId =
+          direction === 'atf_to_ton'
+            ? await this.atfQueue.enqueue(userId, confirmation, direction)
+            : await this.executeSwapDirect(userId, confirmation, direction);
+
+        await SwapIdempotency.updateOne(
+          { key: idemKey },
+          { $set: { status: 'completed', transactionId: txId, updatedAt: new Date() } }
+        );
+
+        return txId;
+      } catch (error: any) {
+        await SwapIdempotency.updateOne(
+          { key: idemKey },
+          { $set: { status: 'failed', error: error?.message || String(error), updatedAt: new Date() } }
+        );
+        throw error;
+      }
+    });
   }
 
   /* ── Prepare quote ── */
   async prepareSwap(request: SwapRequest): Promise<SwapConfirmation> {
     if (!config.atfJettonAddress) throw new Error('ATF jetton address not configured');
+
+    await checkRateLimit('swap:prepare', request.userId, config.swapPrepareRateLimit, config.swapPrepareRateWindowMs);
 
     const user = await User.findOne({ telegramId: request.userId });
     if (!user) throw new Error('User not found');
@@ -242,6 +311,7 @@ export class SwapService {
       : `1 ATF ≈ ${rateValue.toFixed(6)} TON`;
 
     return {
+      confirmationId: crypto.randomUUID(),
       inputAmount: inputDisplay,
       platformFee: feeDisplay,
       netSwapAmount: netDisplay,
@@ -322,11 +392,17 @@ export class SwapService {
 
       /* ── ATF→TON: Admin advances gas TON ── */
       if (!isTonToAtf && confirmation.gasTon) {
-        const gasNano = BigInt(Math.round(parseFloat(confirmation.gasTon) * 1e9));
+        const gasNano = gasTonToNano(confirmation.gasTon);
         await this.adminWallet.initialize();
 
         const adminBalance = await this.adminWallet.getBalance();
         if (adminBalance < gasNano) throw new Error('Platform gas treasury temporarily low. Please try again later.');
+
+        // Capture the user's on-chain TON balance IMMEDIATELY BEFORE the
+        // advance, so recovery later can tell the advance apart from the
+        // user's own pre-existing TON (Step 3/4 of the gas-recovery design).
+        const { ton: preAdvanceBalanceRaw } = await this.walletService.getBalance(walletAddress);
+        const preAdvanceBalanceNano = BigInt(preAdvanceBalanceRaw.toString());
 
         const gasTxHash = await this.adminWallet.sendTon(walletAddress, gasNano);
 
@@ -347,6 +423,13 @@ export class SwapService {
         });
         gasAdvanceTxId = gasTx._id.toString();
         gasAdvanced = true;
+
+        await this.gasRecovery.recordAdvance({
+          swapTransactionId: tx._id.toString(),
+          tonBalanceBeforeGasAdvanceNano: preAdvanceBalanceNano,
+          gasAdvanceAmountNano: gasNano,
+          gasAdvanceTxHash: gasTxHash,
+        });
 
         await new Promise(r => setTimeout(r, 3000));
       }
@@ -371,12 +454,22 @@ export class SwapService {
       tx.txHash = txHash;
       tx.status = 'completed';
       tx.toAddress = swapParams.to;
+      // Explicit broadcast flag — the real signal for "did the swap actually
+      // go out", instead of inferring it from the shape of txHash.
+      tx.metadata = { ...tx.metadata, swapBroadcasted: true };
       await tx.save();
 
-      if (!isTonToAtf && gasAdvanced && confirmation.gasTon) {
-        this.recoverGasTon(userId, user._id, confirmation.gasTon, tx._id.toString()).catch(err =>
-          console.error('[SwapService] Post-success gas recovery failed:', err)
-        );
+      if (!isTonToAtf && gasAdvanced) {
+        // Fire-and-forget, after a short delay so the swap has time to
+        // settle on-chain before we read the wallet's post-swap balance.
+        // Safe, idempotent, retryable — the retry worker (jobs/gas-recovery-retry.ts)
+        // will pick it back up if this attempt can't fully recover yet.
+        const swapTransactionId = tx._id.toString();
+        setTimeout(() => {
+          this.gasRecovery
+            .recoverAdminGasSafely({ swapTransactionId, userId, walletAddress })
+            .catch(err => console.error('[SwapService] Post-success gas recovery failed:', err));
+        }, 8000);
       }
 
       this.transferFee(userId, feeBase, isTonToAtf ? 'TON' : 'ATF', tx._id.toString()).catch(err =>
@@ -385,83 +478,33 @@ export class SwapService {
 
       return tx._id.toString();
     } catch (error) {
-      const broadcasted = tx?.txHash && !tx.txHash.startsWith('swap-');
+      // Explicit broadcast flag is the source of truth — NOT a heuristic on
+      // the shape of txHash. Set on the tx's metadata the moment the real
+      // swap transaction is actually sent (see the try block above).
+      const broadcasted = tx?.metadata?.swapBroadcasted === true;
 
       /* ═══════════════════════════════════════════════════════════════════════
-         🚨 AUTOMATIC ON-CHAIN GAS CLAWBACK (BEFORE DB ROLLBACK)
-         
-         Logic:
-         1. If user wallet has >= originalGas + 0.01 TON → clawback full 0.3
-         2. Else if user wallet has > 0.05 TON → send (balance - 0.05) back
-            (0.05 is a safe reserve to cover the clawback tx fee + wallet minimum)
-         3. Else → skip (not enough to pay for the clawback transaction itself)
+         🚨 SAFE GAS RECOVERY (BEFORE DB ROLLBACK) — via GasRecoveryService
+         Only runs when the swap was NOT broadcast — if it WAS broadcast,
+         something later failing does not mean the gas wasn't legitimately
+         consumed, so we must not blindly claw it back here.
          ═══════════════════════════════════════════════════════════════════════ */
-      if (gasAdvanced && !broadcasted && confirmation.gasTon) {
+      if (gasAdvanced && !broadcasted && tx) {
         try {
-          const { ton: userTonRaw } = await this.walletService.getBalance(walletAddress);
-          const userTonNow = BigInt(userTonRaw.toString());
-          
-          const originalGasNano = BigInt(Math.round(parseFloat(confirmation.gasTon) * 1e9));
-          const fullRefundFee = BigInt(Math.round(0.01 * 1e9));   // ~fee for a simple TON transfer
-          const partialReserve = BigInt(Math.round(0.05 * 1e9));  // safe minimum to leave in wallet
-
-          let clawbackAmount: bigint;
-
-          if (userTonNow >= originalGasNano + fullRefundFee) {
-            // User still has the full gas advance + enough to cover clawback tx
-            clawbackAmount = originalGasNano;
-          } else if (userTonNow > partialReserve) {
-            // User spent some gas during the failed swap. Recover what we can,
-            // leaving enough to cover this clawback transaction's fees.
-            clawbackAmount = userTonNow - partialReserve;
-          } else {
-            // Wallet is empty or only dust left — can't cover clawback tx fee
-            clawbackAmount = BigInt(0);
-          }
-
-          if (clawbackAmount > BigInt(0)) {
-            console.log(
-              `[SwapService] Clawback attempt for user ${userId}: ` +
-              `balance=${Precision.fromBaseUnits(userTonNow, TON_DECIMALS)} TON, ` +
-              `clawback=${Precision.fromBaseUnits(clawbackAmount, TON_DECIMALS)} TON`
-            );
-
-            gasClawbackTxHash = await this.walletService.sendTon(
-              userId,
-              config.adminFeeWalletAddress,
-              clawbackAmount
-            );
-
-            await Transaction.create({
-              userId: user._id,
-              type: 'fee_transfer',
-              asset: 'TON',
-              amount: clawbackAmount.toString(),
-              status: 'completed',
-              toAddress: config.adminFeeWalletAddress,
-              txHash: gasClawbackTxHash,
-              metadata: {
-                purpose: 'gas_clawback',
-                description: 'Automatic clawback of advanced gas TON after failed ATF→TON swap',
-                swapTxId: tx?._id?.toString() || gasAdvanceTxId || 'unknown',
-                requestedGas: confirmation.gasTon,
-                recoveredAmount: Precision.fromBaseUnits(clawbackAmount, TON_DECIMALS),
-                reason: (error as Error).message,
-              },
-            });
-
-            console.log(
-              `[SwapService] Gas clawback SUCCESS: ${Precision.fromBaseUnits(clawbackAmount, TON_DECIMALS)} TON from user ${userId} → admin. Tx: ${gasClawbackTxHash}`
-            );
-          } else {
-            console.log(
-              `[SwapService] Gas clawback SKIPPED: user ${userId} has insufficient TON to cover clawback tx fee. Balance: ${Precision.fromBaseUnits(userTonNow, TON_DECIMALS)} TON`
-            );
-          }
-        } catch (clawbackErr: any) {
-          console.error(
-            `[SwapService] Gas clawback FAILED for user ${userId}: ${clawbackErr.message}. User may have already spent the gas TON.`
+          const result = await this.gasRecovery.recoverAdminGasSafely({
+            swapTransactionId: tx._id.toString(),
+            userId,
+            walletAddress,
+          });
+          gasClawbackTxHash = result.txHash || null;
+          console.log(
+            `[SwapService] Gas recovery for user ${userId} on swap ${tx._id}: status=${result.status}, ` +
+              `recovered=${Precision.fromBaseUnits(result.totalRecoveredNano, TON_DECIMALS)} TON, ` +
+              `pending=${Precision.fromBaseUnits(result.pendingNano, TON_DECIMALS)} TON` +
+              (result.skippedReason ? ` (${result.skippedReason})` : '')
           );
+        } catch (recoveryErr: any) {
+          console.error(`[SwapService] Gas recovery FAILED for user ${userId}: ${recoveryErr.message}`);
         }
       }
 
@@ -483,48 +526,26 @@ export class SwapService {
 
       if (tx) {
         try {
-          tx.status = 'failed';
-          tx.metadata = {
-            ...tx.metadata,
-            error: (error as Error).message,
-            broadcasted,
-            gasClawbackTxHash: gasClawbackTxHash || undefined,
-            gasClawbackAttempted: gasAdvanced && !broadcasted,
-          };
-          await tx.save();
+          // Re-fetch: recoverAdminGasSafely() writes gasRecovery* metadata
+          // straight to the DB via findOneAndUpdate, bypassing this
+          // in-memory `tx` document. Refetch before the final save so that
+          // write isn't clobbered by saving our stale in-memory copy.
+          const latest = await Transaction.findById(tx._id);
+          if (latest) {
+            latest.status = 'failed';
+            latest.metadata = {
+              ...latest.metadata,
+              error: (error as Error).message,
+              broadcasted,
+              gasClawbackTxHash: gasClawbackTxHash || undefined,
+              gasRecoveryAttempted: gasAdvanced && !broadcasted,
+            };
+            await latest.save();
+          }
         } catch {}
       }
 
       throw error;
-    }
-  }
-
-  /* ── Post-success gas recovery ── */
-  private async recoverGasTon(userId: number, userObjectId: any, gasTon: string, swapTxId: string): Promise<void> {
-    await new Promise(r => setTimeout(r, 8000));
-    const gasNano = BigInt(Math.round(parseFloat(gasTon) * 1e9));
-
-    try {
-      const recoveryTxHash = await this.walletService.sendTon(userId, config.adminFeeWalletAddress, gasNano);
-
-      await Transaction.create({
-        userId: userObjectId,
-        type: 'fee_transfer',
-        asset: 'TON',
-        amount: gasNano.toString(),
-        status: 'completed',
-        toAddress: config.adminFeeWalletAddress,
-        txHash: recoveryTxHash,
-        metadata: { purpose: 'gas_recovery', description: 'Recovery of gas TON advanced by admin for ATF→TON swap', swapTxId, gasTon },
-      });
-
-      await Transaction.findByIdAndUpdate(swapTxId, {
-        $set: { 'metadata.gasRecovered': true, 'metadata.gasRecoveryTxHash': recoveryTxHash },
-      });
-
-      console.log(`[SwapService] Gas recovery completed: ${recoveryTxHash}`);
-    } catch (error) {
-      console.error('[SwapService] Gas recovery failed:', error);
     }
   }
 
@@ -562,4 +583,5 @@ export class SwapService {
     }
   }
   }
+
         
