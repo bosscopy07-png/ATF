@@ -78,9 +78,28 @@ export const config = {
     '', // empty = use built-in fallback chain
 
   priceCacheTtlMs: requireEnvNumber('PRICE_CACHE_TTL_MS', 60000),
+
+  // ─── TON admin gas recovery safety (all in nanoTON) ────────
+  // No dedicated on-chain fee estimator exists in this project, so this is a
+  // configurable conservative reserve, NOT the exact network fee. A plain
+  // wallet-to-wallet TON transfer typically costs well under this on mainnet.
+  tonTransferFeeReserveNano: BigInt(requireEnvNumber('TON_TRANSFER_FEE_RESERVE_NANO', 10_000_000)), // 0.01 TON
+  // Extra safety margin on top of the fee reserve before we attempt a recovery send.
+  gasRecoveryBufferNano: BigInt(requireEnvNumber('TON_GAS_RECOVERY_BUFFER_NANO', 20_000_000)), // 0.02 TON
+  // Floor balance recovery must never dip below (protects unrelated user funds/dust).
+  gasRecoveryMinBalanceNano: BigInt(requireEnvNumber('TON_GAS_RECOVERY_MIN_BALANCE_NANO', 0)),
+  // How often the retry worker re-attempts pending/partial gas recoveries.
+  gasRecoveryRetryIntervalMs: requireEnvNumber('GAS_RECOVERY_RETRY_INTERVAL_MS', 120_000),
+
+  // ─── Swap rate limiting / idempotency ──────────────────────
+  swapPrepareRateLimit: requireEnvNumber('SWAP_PREPARE_RATE_LIMIT', 8),
+  swapPrepareRateWindowMs: requireEnvNumber('SWAP_PREPARE_RATE_WINDOW_MS', 10_000),
+  swapExecuteRateLimit: requireEnvNumber('SWAP_EXECUTE_RATE_LIMIT', 3),
+  swapExecuteRateWindowMs: requireEnvNumber('SWAP_EXECUTE_RATE_WINDOW_MS', 10_000),
+  swapLockTtlMs: requireEnvNumber('SWAP_LOCK_TTL_MS', 30_000),
 };
 
 export const TON_DECIMALS = 9;
 export const GRAM_DECIMALS = 9;
 export const ATF_DECIMALS = 9;
-    
+
