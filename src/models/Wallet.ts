@@ -42,6 +42,15 @@ export interface IWallet extends Document {
    */
   walletVersion?: WalletVersion;
 
+  /**
+   * Cached ATF jetton-wallet address for this owner, so the blockchain
+   * monitor doesn't have to re-derive it via an RPC call
+   * (`JettonMaster.getWalletAddress`) every single 30-second poll forever.
+   * The jetton-wallet address for a given owner+jetton pair is deterministic
+   * and never changes, so once computed it's cached here permanently.
+   */
+  atfJettonWalletAddress?: string;
+
   createdAt: Date;
   updatedAt: Date;
 }
@@ -115,6 +124,11 @@ const WalletSchema = new Schema<IWallet>(
       required: false,
       default: undefined,
       index: true,
+    },
+
+    atfJettonWalletAddress: {
+      type: String,
+      required: false,
     },
   },
   {
