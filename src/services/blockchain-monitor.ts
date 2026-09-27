@@ -50,7 +50,6 @@ export class BlockchainMonitor {
   private client: TonClient;
   private isRunning = false;
   private depositJob: any;
-  private txJob: any;
 
   constructor() {
     this.client = new TonClient({
@@ -72,20 +71,22 @@ export class BlockchainMonitor {
       }
     });
 
-    this.txJob = cron.schedule('*/60 * * * * *', async () => {
-      try {
-        await this.monitorPendingTransactions();
-      } catch (error) {
-        console.error('Pending tx monitor error:', error);
-      }
-    });
+    // NOTE: this class previously also ran a `monitorPendingTransactions`
+    // cron job here that marked withdrawals/fee_transfers 'completed' purely
+    // because they were more than 2 minutes old — with no on-chain check at
+    // all. That was removed: `src/jobs/reconciler.ts` already reconciles
+    // exactly these transaction types every 30s using real on-chain
+    // verification (`OnChainVerifier`, checking bounce/compute/action phase
+    // results), running in the same worker process. Keeping both meant two
+    // different code paths could race to "complete" the same transaction —
+    // one honestly, one by assumption. Age alone is never evidence of
+    // success; only the reconciler's on-chain check is.
 
     console.log('Blockchain monitor schedules registered');
   }
 
   stop(): void {
     if (this.depositJob) this.depositJob.stop();
-    if (this.txJob) this.txJob.stop();
     console.log('Blockchain monitor stopped');
   }
 
@@ -221,41 +222,5 @@ export class BlockchainMonitor {
       console.error(`ATF deposit check error for ${walletDoc.address}:`, error);
     }
   }
-
-  private async monitorPendingTransactions(): Promise<void> {
-    const pending = await Transaction.find({
-      status: { $in: ['pending', 'processing'] },
-      txHash: { $exists: true, $ne: null },
-      createdAt: { $gte: new Date(Date.now() - 3600000) },
-    }).limit(50);
-
-    for (const tx of pending) {
-      try {
-        if (!tx.txHash) continue;
-        const ageMs = Date.now() - tx.createdAt.getTime();
-
-        if (tx.type === 'withdrawal' && ageMs > 120000) {
-          tx.status = 'completed';
-          await tx.save();
-          console.log(`Withdrawal ${tx._id} auto-confirmed`);
-        }
-
-        if (tx.type === 'fee_transfer' && ageMs > 120000) {
-          tx.status = 'completed';
-          await tx.save();
-
-          if (tx.metadata?.swapTxId) {
-            await Transaction.findByIdAndUpdate(tx.metadata.swapTxId, {
-              feeStatus: 'completed',
-              feeTxHash: tx.txHash,
-            });
-          }
-          console.log(`Fee transfer ${tx._id} auto-confirmed`);
-        }
-      } catch (error) {
-        console.error(`Pending tx monitor error for ${tx._id}:`, error);
       }
-    }
-  }
-          }
-                                            
+          
