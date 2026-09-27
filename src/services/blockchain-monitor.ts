@@ -9,6 +9,37 @@ import { Precision } from '../utils/precision';
 
 const PROCESSED_TXS = new Set<string>();
 
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Concise, non-circular error logging for the deposit monitor.
+ * - A 429 from toncenter is expected occasionally under load; log it as a
+ *   short one-liner, not the raw Axios error (which has circular refs and
+ *   floods the log with the entire request/socket object graph).
+ * - An E11000 duplicate-key hit here means another check (a concurrent
+ *   worker instance, or an overlapping tick) already recorded this exact
+ *   deposit a moment earlier — the unique index did its job and prevented
+ *   a double-credit. That's expected and benign, not a failure.
+ */
+function logMonitorError(context: string, address: string, error: any): void {
+  if (error?.code === 11000) {
+    console.log(`${context} for ${address}: deposit already recorded by another check (safe, no double-credit).`);
+    return;
+  }
+  const status = error?.response?.status;
+  if (status === 429) {
+    console.warn(`${context} for ${address}: toncenter rate-limited (429). Will retry next cycle.`);
+    return;
+  }
+  console.error(`${context} for ${address}:`, error?.message || error);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function parseTransferNotification(body: Cell): {
   opcode: number;
   queryId: bigint;
@@ -96,7 +127,13 @@ export class BlockchainMonitor {
     for (const walletDoc of wallets as any[]) {
       try {
         await this.checkTonDeposits(walletDoc);
+        // Small pacing gap so a growing wallet list never fires a burst of
+        // near-simultaneous requests at toncenter — this, combined with the
+        // jetton-wallet-address caching below, is what actually fixes the
+        // 429 'Ratelimit exceed' errors, rather than papering over them.
+        await sleep(150);
         await this.checkAtfDeposits(walletDoc);
+        await sleep(150);
       } catch (error) {
         console.error(`Deposit check failed for ${walletDoc.address}:`, error);
       }
@@ -148,8 +185,8 @@ export class BlockchainMonitor {
         PROCESSED_TXS.add(uniqueId);
         console.log(`TON deposit credited: ${amount.toString()} nanoTON to user ${user.telegramId}`);
       }
-    } catch (error) {
-      console.error(`TON deposit check error for ${walletDoc.address}:`, error);
+    } catch (error: any) {
+      logMonitorError(`TON deposit check`, walletDoc.address, error);
     }
   }
 
@@ -157,8 +194,21 @@ export class BlockchainMonitor {
     const ownerAddress = Address.parse(walletDoc.address);
 
     try {
-      const jettonMaster = this.client.open(JettonMaster.create(Address.parse(config.atfJettonAddress)));
-      const expectedJettonWallet = await jettonMaster.getWalletAddress(ownerAddress);
+      // The jetton-wallet address for a given owner+jetton is deterministic
+      // and never changes, so cache it on the Wallet doc instead of paying
+      // an RPC call for it on every single 30-second poll, forever. This is
+      // the single biggest contributor to the toncenter 429 rate-limit
+      // errors, since it was firing once per wallet per tick indefinitely.
+      let expectedJettonWallet: Address;
+      if (walletDoc.atfJettonWalletAddress) {
+        expectedJettonWallet = Address.parse(walletDoc.atfJettonWalletAddress);
+      } else {
+        const jettonMaster = this.client.open(JettonMaster.create(Address.parse(config.atfJettonAddress)));
+        expectedJettonWallet = await jettonMaster.getWalletAddress(ownerAddress);
+        await Wallet.findByIdAndUpdate(walletDoc._id, {
+          $set: { atfJettonWalletAddress: expectedJettonWallet.toString() },
+        });
+      }
 
       const transactions = await this.client.getTransactions(ownerAddress, { limit: 50 });
 
@@ -218,9 +268,8 @@ export class BlockchainMonitor {
         PROCESSED_TXS.add(uniqueId);
         console.log(`ATF deposit credited: ${notification.amount.toString()} nanoATF to user ${user.telegramId}`);
       }
-    } catch (error) {
-      console.error(`ATF deposit check error for ${walletDoc.address}:`, error);
+    } catch (error: any) {
+      logMonitorError(`ATF deposit check`, walletDoc.address, error);
     }
   }
-      }
-          
+}
