@@ -36,10 +36,6 @@ function logMonitorError(context: string, address: string, error: any): void {
   console.error(`${context} for ${address}:`, error?.message || error);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 function parseTransferNotification(body: Cell): {
   opcode: number;
   queryId: bigint;
@@ -272,4 +268,5 @@ export class BlockchainMonitor {
       logMonitorError(`ATF deposit check`, walletDoc.address, error);
     }
   }
-}
+      }
+            
