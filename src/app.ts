@@ -5,6 +5,7 @@ import { startBot, stopBot } from './bot';
 import { createAdminApp } from './admin';
 import { BlockchainMonitor } from './services/blockchain-monitor';
 import { startReconciler, stopReconciler } from './jobs/reconciler';
+import { GasRecoveryRetryJob } from './jobs/gas-recovery-retry';
 
 // ─── Service Registry & Lifecycle ─────────────────────────────────────────
 
@@ -190,6 +191,14 @@ async function startWorker(): Promise<void> {
     health: async () => ({ status: 'healthy' }),
   });
 
+  const gasRecoveryRetry = new GasRecoveryRetryJob();
+  manager.register({
+    name: 'gas_recovery_retry',
+    start: async () => gasRecoveryRetry.start(),
+    stop: async () => gasRecoveryRetry.stop(),
+    health: async () => ({ status: 'healthy' }),
+  });
+
   await manager.startAll();
 
   // Workers should also expose a lightweight health endpoint or metrics
@@ -307,4 +316,5 @@ bootstrap().catch((error) => {
   console.error('[Bootstrap] Unhandled bootstrap error:', error);
   process.exit(1);
 });
-                
+
+                        
