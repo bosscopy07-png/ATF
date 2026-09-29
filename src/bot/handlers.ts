@@ -29,6 +29,8 @@ const WALLET_BALANCE_TIMEOUT_MS = 8_000;
 const withTimeout = <T>(promise: Promise<T>, ms: number): Promise<T | null> =>
   Promise.race([promise, new Promise<null>((resolve) => setTimeout(() => resolve(null), ms))]);
 
+/* ── 💰 Price display helpers ── */
+
 const fmtMoney = (v: string, dp = 2): string =>
   Number(v).toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp });
 
@@ -36,23 +38,18 @@ const cleanSource = (p: any): string => String(p?.source ?? '').replace(' (stale
 
 const isStale = (p: any): boolean => typeof p?.source === 'string' && p.source.includes('(stale)');
 
-/** 📊 🟢 up / 🔴 down / ⚪ no data / ⏳ stale — with signed %. */
 function movementLine(p: any): string {
   if (!p) return '⚪ —';
-  if (isStale(p)) return '⏳ cached'; // price is old — movement would be a lie
+  if (isStale(p)) return '⏳ cached';
   const c = p.change24hPercent ?? null;
   if (c === null || !Number.isFinite(c)) return '⚪ —';
   return `${c > 0 ? '🟢' : c < 0 ? '🔴' : '⚪'} ${c > 0 ? '+' : ''}${c.toFixed(2)}%`;
 }
 
-/** 🔗 provider name, hyperlinked when we know the chart URL. */
 function sourceBadge(p: any): string {
   const name = sourceLabel({ ...p, source: cleanSource(p) });
   return `<i>${name}${isStale(p) ? ' · ⏳ stale' : ''}</i>`;
 }
-
-const fmtMoney = (v: string, dp = 2): string =>
-  Number(v).toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp });
 
 function marketMovement(price: any): string {
   const change = Number(price?.change24hPercent);
