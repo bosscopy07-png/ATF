@@ -1177,7 +1177,8 @@ async function showHistory(userId: number, chatId: number, page: number): Promis
 /* ───────────────────────────────────────────────────────────────────────────
    💹 PRICES
    ─────────────────────────────────────────────────────────────────────────── */
-async function showPrices(userId: number, chatId: number): Promise<void> {
+
+    async function showPrices(userId: number, chatId: number): Promise<void> {
   const user = await User.findOne({ telegramId: userId });
 
   if (user && user.lastAction !== 'prices') {
@@ -1212,8 +1213,7 @@ async function showPrices(userId: number, chatId: number): Promise<void> {
     return [
       `${emoji} <b>${label}</b>`,
       `   ├ 💵 <code>$${Number(price.price).toFixed(decimals)}</code> · ${movementLine(price)}`,
-      `   ├ 🇳🇬 <code>${ngn}</code>`,
-      `   └ 🔗 ${sourceBadge(price)}`,
+      `   └ 🇳🇬 <code>${ngn}</code>`,
     ];
   };
 
@@ -1228,7 +1228,7 @@ async function showPrices(userId: number, chatId: number): Promise<void> {
     ...asset('💎', tonPrice, 'TON', 2),
     '',
     ngnRate
-      ? `🇳🇬 <b>USD/NGN</b> <code>₦${Number(ngnRate.price).toFixed(2)}</code> · ${sourceBadge(ngnRate)}`
+      ? `🇳🇬 <b>USD/NGN</b> <code>₦${Number(ngnRate.price).toFixed(2)}</code>`
       : `🇳🇬 <b>USD/NGN</b> · <i>⏳ Unavailable</i>`,
     '',
     `⌁ <i>🛡️ Prices use the configured provider chain and cached fallback when necessary.</i>`,
@@ -1243,9 +1243,7 @@ async function showPrices(userId: number, chatId: number): Promise<void> {
     keyboards.pricesKeyboard(),
     { withImage: true },
   );
-}
-
- 
+    }
 /* ───────────────────────────────────────────────────────────────────────────
    ❓ HELP
    ─────────────────────────────────────────────────────────────────────────── */
