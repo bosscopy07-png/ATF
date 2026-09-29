@@ -5,6 +5,7 @@ export interface IPriceCache extends Document {
   price: number;
   currency: string;
   source: string;
+  change24hPercent?: number | null;
   timestamp: Date;
 }
 
@@ -15,7 +16,8 @@ const PriceCacheSchema = new Schema<IPriceCache>(
     currency: { type: String, required: true },
     source: { type: String, required: true },
     change24hPercent: { type: Number, default: null },
-    timestamp: { type: Date, default: Date.now, expires: 300 }, // TTL 5 minutes
+    // 🕐 TTL raised to 1h so the stale-cache fallback actually has something to serve
+    timestamp: { type: Date, default: Date.now, expires: 3600 },
   },
   { timestamps: true }
 );
