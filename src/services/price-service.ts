@@ -20,12 +20,16 @@ interface Provider {
   extract: (data: any) => number | string | ProviderResult | null;
 }
 
+/* ─────────────────────────────────────────────
+   🧭 Shared helpers (exported for handlers.ts)
+   ───────────────────────────────────────────── */
+
 /** 🧹 strip the stale marker so labels/links stay clean */
-const cleanSource = (p: Pick<PriceData, 'source'> | null): string =>
+export const cleanSource = (p: Pick<PriceData, 'source'> | null): string =>
   (p?.source ?? '').replace(' (stale)', '');
 
 /** ⏳ true when this quote came from the stale-cache fallback */
-const isStale = (p: PriceData | null): boolean =>
+export const isStale = (p: PriceData | null): boolean =>
   !!p?.source?.includes('(stale)');
 
 export class PriceService {
@@ -42,17 +46,16 @@ export class PriceService {
   }
 
   /* ─────────────────────────────────────────────
-     🔗 Chart links (PriceData carries no URL —
-     derive the canonical chart per asset)
+     🔗 Chart links — PriceData carries no URL,
+     so derive the canonical chart per asset
      ───────────────────────────────────────────── */
 
   getChartUrl(asset: 'atf' | 'ton'): string | null {
     if (asset === 'atf') {
-      if (config.atfChartUrl) return config.atfChartUrl;
       const addr = config.atfJettonAddress;
       return addr ? `https://dexscreener.com/ton/${addr}` : null;
     }
-    return config.tonChartUrl || 'https://www.coingecko.com/en/coins/toncoin';
+    return 'https://www.coingecko.com/en/coins/toncoin';
   }
 
   /* ─────────────────────────────────────────────
@@ -117,14 +120,14 @@ export class PriceService {
   ): Promise<PriceData | null> {
     const cached = await PriceCache.findOne({ asset }).sort({ timestamp: -1 });
 
-    /** ⚡ Fresh cache — now preserves the stored 24h movement. */
+    /** ⚡ Fresh cache — preserves the stored 24h movement. */
     if (cached && Date.now() - cached.timestamp.getTime() < this.cacheTtlMs) {
       return {
         price: cached.price,
         currency: cached.currency,
         source: cached.source,
         timestamp: cached.timestamp,
-        change24hPercent: (cached as any).change24hPercent ?? null,
+        change24hPercent: cached.change24hPercent ?? null,
       };
     }
 
@@ -134,7 +137,7 @@ export class PriceService {
         throw new Error(`Invalid ${asset} price`);
       }
 
-      /** 📊 Provider movement, else compare against previous cached observation. */
+      /** 📊 Provider movement, else compare vs previous cached observation. */
       let change = data.change24hPercent ?? null;
       if (change === null && cached && cached.price > 0) {
         change = ((data.price - cached.price) / cached.price) * 100;
@@ -146,7 +149,7 @@ export class PriceService {
         currency: data.currency,
         source: data.source,
         timestamp: new Date(),
-        change24hPercent: change, // 🆕 persisted so the next cache hit keeps it
+        change24hPercent: change,
       });
 
       return { ...data, change24hPercent: change };
@@ -185,7 +188,7 @@ export class PriceService {
           }),
         },
         {
-          // 2️⃣ Dexscreener (also gives us the chart link target)
+          // 2️⃣ Dexscreener
           url: `https://api.dexscreener.com/latest/dex/tokens/${address}`,
           extract: (d: any) => {
             const pair = d?.pairs?.find((p: any) => Number.isFinite(Number(p?.priceUsd))) || d?.pairs?.[0];
@@ -196,10 +199,10 @@ export class PriceService {
           },
         },
         {
-          // 3️⃣ CoinGecko jetton-by-contract (was a duplicate STON — now a real backup)
+          // 3️⃣ CoinGecko jetton-by-contract
           url: `https://api.coingecko.com/api/v3/simple/token_price/ton?contract_addresses=${address}&vs_currencies=usd&include_24hr_change=true`,
           extract: (d: any) => {
-            const row = d?.[String(address).toLowerCase()] || Object.values(d || {})[0] as any;
+            const row = d?.[String(address).toLowerCase()] || (Object.values(d || {})[0] as any);
             return {
               price: row?.usd,
               change24hPercent: row?.usd_24h_change ?? null,
@@ -223,16 +226,15 @@ export class PriceService {
   }
 
   /* ─────────────────────────────────────────────
-     💎 TON / USD — reordered: keyless, reliable
-     exchanges first; CoinGecko last because its
-     free tier 429s constantly. ✅
+     💎 TON / USD — keyless exchanges first;
+     CoinGecko moved to last (free tier 429s)
      ───────────────────────────────────────────── */
 
   async getTonPriceUsd(): Promise<PriceData | null> {
     return this.getCachedOrFetch('ton_usd', async () => {
       const providers: Provider[] = [
         {
-          // 1️⃣ Bybit — free, keyless, reliable
+          // 1️⃣ Bybit
           url: 'https://api.bybit.com/v5/market/tickers?category=spot&symbol=TONUSDT',
           extract: (d: any) => {
             const item = d?.result?.list?.[0];
@@ -244,8 +246,7 @@ export class PriceService {
           },
         },
         {
-          // 2️⃣ OKX — FIXED: was `sodUtc8 ? null : null` (always null).
-          // OKX ticker carries open24h → compute real 24h %.
+          // 2️⃣ OKX — 24h % computed from open24h
           url: 'https://www.okx.com/api/v5/market/ticker?instId=TON-USDT',
           extract: (d: any) => {
             const t = d?.data?.[0];
@@ -260,7 +261,7 @@ export class PriceService {
           },
         },
         {
-          // 3️⃣ MEXC — keyless, generous limits
+          // 3️⃣ MEXC
           url: 'https://api.mexc.com/api/v3/ticker/24hr?symbol=TONUSDT',
           extract: (d: any) => ({
             price: d?.lastPrice,
@@ -268,7 +269,7 @@ export class PriceService {
           }),
         },
         {
-          // 4️⃣ KuCoin — changeRate is a decimal ratio (0.0123 = +1.23%)
+          // 4️⃣ KuCoin — changeRate is a ratio (0.0123 = +1.23%)
           url: 'https://api.kucoin.com/api/v1/market/stats?symbol=TON-USDT',
           extract: (d: any) => {
             const rate = parseFloat(d?.data?.changeRate);
@@ -279,7 +280,7 @@ export class PriceService {
           },
         },
         {
-          // 5️⃣ Binance (geo-blocked in some regions — mid-chain now)
+          // 5️⃣ Binance (geo-blocked in some regions)
           url: 'https://api.binance.com/api/v3/ticker/24hr?symbol=TONUSDT',
           extract: (d: any) => ({
             price: d?.lastPrice ?? d?.price,
@@ -287,7 +288,7 @@ export class PriceService {
           }),
         },
         {
-          // 6️⃣ CoinGecko — LAST: free tier rate-limits hard (this was the old #1 = your failures)
+          // 6️⃣ CoinGecko (last — rate-limit-prone)
           url: config.tonPriceApiUrl || 'https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd&include_24hr_change=true',
           extract: (d: any) => ({
             price: d?.['the-open-network']?.usd,
@@ -334,15 +335,11 @@ export class PriceService {
     return (amt * priceUsd).toFixed(2);
   }
 
-  /**
-   * 🆕 Returns a PLAIN string (no toLocaleString).
-   * Localizing here caused Number("1,234") → NaN upstream.
-   * Formatting belongs in the UI layer.
-   */
+  /** 🆕 PLAIN string out — formatting belongs in the UI layer. */
   convertUsdToNgn(usdAmount: string, ngnRate: number): string {
     const amt = parseFloat(usdAmount);
     if (!Number.isFinite(amt) || !Number.isFinite(ngnRate)) return '0';
     return String(Math.round(amt * ngnRate));
   }
-          }
-    
+        }
+        
