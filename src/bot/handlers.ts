@@ -24,6 +24,17 @@ const swapService = new SwapService();
 const withdrawalService = new WithdrawalService();
 const walletService = new WalletService();
 const priceService = PriceService.getInstance();
+const WALLET_BALANCE_TIMEOUT_MS = 8_000;
+
+const withTimeout = <T>(promise: Promise<T>, ms: number): Promise<T | null> =>
+  Promise.race([promise, new Promise<null>((resolve) => setTimeout(() => resolve(null), ms))]);
+
+const fmtMoney = (v: string, dp = 2): string =>
+  Number(v).toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp });
+
+const cleanSource = (p: any): string => String(p?.source ?? '').replace(' (stale)', '');
+
+const isStale = (p: any): boolean => typeof p?.source === 'string' && p.source.includes('(stale)');
 
 /** 📊 🟢 up / 🔴 down / ⚪ no data / ⏳ stale — with signed %. */
 function movementLine(p: any): string {
