@@ -500,4 +500,543 @@ async function executeSwap(userId: number, chatId: number): Promise<void> {
     await toast(userId, chatId, `❌ <b>Swap Failed</b>\n\n${error.message}`, keyboards.backKeyboard('swap'));
   }
                }
-      /* ─────────────────────────────────────────────────────────────────────────── 📥 DEPOSIT FLOW ─────────────────────────────
+          /* ───────────────────────────────────────────────────────────────────────────
+   📥 DEPOSIT FLOW
+   ─────────────────────────────────────────────────────────────────────────── */
+async function showDepositMenu(userId: number, chatId: number): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (user) {
+    user.lastAction = 'deposit';
+    await user.save();
+  }
+ 
+  await render(userId, chatId, [
+    terminalHeader('DEPOSIT', 'Fund your custodial wallet'),
+    ``,
+    `Select the asset you want to deposit.`,
+    ``,
+    `💎 <b>TON</b>  ·  Native TON`,
+    `🔷 <b>ATF</b>  ·  Official ATF Jetton`,
+    ``,
+    `⚠ <i>Always verify the asset and network before sending.</i>`,
+  ].join('\n'), keyboards.depositKeyboard(), { withImage: true });
+}
+ 
+async function showDepositTon(userId: number, chatId: number): Promise<void> {
+  const wallet = await getActiveWallet(userId);
+  if (!wallet) {
+    await toast(userId, chatId, '❌ Wallet not found.', keyboards.backKeyboard('deposit'));
+    return;
+  }
+ 
+  await render(userId, chatId, [
+    `◈ <b>ATF NEXUS · DEPOSIT TON</b>`,
+    ``,
+    `Send TON to your custodial address:`,
+    ``,
+    `<code>${wallet.address}</code>`,
+    ``,
+    `⚠️ <i>Only send native TON to this address.</i>`,
+    ``,
+    `✅ Deposits are credited automatically in ~3s.`,
+  ].join('\n'), keyboards.depositTonScreen(wallet.address), { withImage: true });
+}
+ 
+async function showDepositAtf(userId: number, chatId: number): Promise<void> {
+  const wallet = await getActiveWallet(userId);
+  if (!wallet) {
+    await toast(userId, chatId, '❌ Wallet not found.', keyboards.backKeyboard('deposit'));
+    return;
+  }
+ 
+  await render(userId, chatId, [
+    `◈ <b>ATF NEXUS · DEPOSIT ATF</b>`,
+    ``,
+    `Send ATF Jetton to:`,
+    ``,
+    `<code>${wallet.address}</code>`,
+    ``,
+    `Token: <b>ATF</b>`,
+    `⚠️ <i>Only send the official ATF Jetton.</i>`,
+    ``,
+    `✅ Deposits are credited automatically in ~3s.`,
+  ].join('\n'), keyboards.depositAtfScreen(), { withImage: true });
+}
+ 
+async function checkDepositStatus(userId: number, chatId: number, asset: 'TON' | 'ATF'): Promise<void> {
+  const wallet = await getActiveWallet(userId);
+  if (!wallet?.address) {
+    await toast(userId, chatId, '❌ Wallet not found.', keyboards.backKeyboard('deposit'));
+    return;
+  }
+ 
+  await render(userId, chatId, `🔍 <b>Checking ${asset} deposits...</b>\n\nScanning blockchain ⛓️`, {
+    inline_keyboard: [[{ text: '🔙 Back', callback_data: `deposit_${asset.toLowerCase()}` }]],
+  }, { withImage: true });
+ 
+  try {
+    const onChain = await walletService.getBalance(wallet.address);
+    const balance = asset === 'TON'
+      ? Precision.fromBaseUnits(onChain.ton, TON_DECIMALS)
+      : Precision.fromBaseUnits(onChain.atf, ATF_DECIMALS);
+ 
+    await toast(userId, chatId, [
+      `✅ <b>${asset} Balance Updated</b>`,
+      ``,
+      `Current: <code>${Precision.formatDisplay(balance)} ${asset}</code>`,
+    ].join('\n'), keyboards.backKeyboard('deposit'));
+  } catch (error: any) {
+    await toast(userId, chatId, `❌ Check failed: ${error.message}`, keyboards.backKeyboard('deposit'));
+  }
+}
+ 
+/* ───────────────────────────────────────────────────────────────────────────
+   📤 WITHDRAWAL FLOW
+   ─────────────────────────────────────────────────────────────────────────── */
+async function showWithdrawMenu(userId: number, chatId: number): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (user) {
+    user.lastAction = 'withdraw';
+    await user.save();
+  }
+ 
+  await render(userId, chatId, [
+    terminalHeader('WITHDRAW', 'Send assets to an external TON address'),
+    ``,
+    `Select the asset to withdraw.`,
+    ``,
+    `💎 <b>TON</b>  ·  Native TON`,
+    `🔷 <b>ATF</b>  ·  ATF Jetton`,
+    ``,
+    `⚠ <i>Destination transactions cannot normally be reversed.</i>`,
+  ].join('\n'), keyboards.withdrawAssetKeyboard(), { withImage: true });
+}
+ 
+async function startWithdrawal(userId: number, chatId: number, asset: 'TON' | 'ATF'): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (!user) return;
+ 
+  user.state = `withdraw_address_${asset}`;
+  user.stateData = {};
+  await user.save();
+ 
+  await render(userId, chatId, [
+    `◈ <b>ATF NEXUS · WITHDRAW ${asset}</b>`,
+    ``,
+    `Enter the destination TON address.`,
+    ``,
+    `<i>Example: EQD... or UQD...</i>`,
+  ].join('\n'), keyboards.cancelKeyboard('withdraw'), { withImage: true });
+}
+ 
+async function handleWithdrawAddress(userId: number, chatId: number, text: string): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (!user || !user.state.startsWith('withdraw_address_')) return;
+ 
+  const asset = user.state.replace('withdraw_address_', '') as 'TON' | 'ATF';
+  if (!isValidTonAddress(text)) {
+    await toast(userId, chatId, '❌ Invalid TON address. Try again.', keyboards.cancelKeyboard('withdraw'));
+    return;
+  }
+ 
+  user.state = `withdraw_amount_${asset}`;
+  user.stateData = { address: text };
+  await user.save();
+ 
+  await render(userId, chatId, [
+    `◈ <b>ATF NEXUS · WITHDRAW ${asset}</b>`,
+    ``,
+    `Destination: <code>${formatAddressShort(text)}</code>`,
+    ``,
+    `Enter ${asset} amount:`,
+  ].join('\n'), keyboards.cancelKeyboard('withdraw'), { withImage: true });
+}
+ 
+async function handleWithdrawAmount(userId: number, chatId: number, text: string): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (!user || !user.state.startsWith('withdraw_amount_')) return;
+ 
+  const asset = user.state.replace('withdraw_amount_', '') as 'TON' | 'ATF';
+  if (!isValidAmount(text)) {
+    await toast(userId, chatId, '❌ Invalid amount.', keyboards.cancelKeyboard('withdraw'));
+    return;
+  }
+ 
+  try {
+    const prep = await withdrawalService.prepareWithdrawal({
+      userId,
+      asset,
+      amount: text.trim(),
+      toAddress: user.stateData.address,
+    });
+ 
+    user.state = `withdraw_confirm_${asset}`;
+    user.stateData = { address: user.stateData.address, amount: text.trim(), prep };
+    await user.save();
+ 
+    await render(userId, chatId, [
+      `◈ <b>ATF NEXUS · CONFIRM WITHDRAWAL</b>`,
+      ``,
+      `<b>Asset:</b> ${asset}`,
+      `<b>To:</b> <code>${formatAddressShort(prep.toAddress)}</code>`,
+      `<b>Amount:</b> <code>${Precision.formatDisplay(prep.amount)} ${asset}</code>`,
+      `<b>Network Fee:</b> ≈ ${prep.networkCost} TON`,
+      `<b>Net Receive:</b> <code>${Precision.formatDisplay(prep.receiveAmount)} ${asset}</code>`,
+    ].join('\n'), keyboards.confirmWithdrawalKeyboard(), { withImage: true });
+  } catch (error: any) {
+    await toast(userId, chatId, `❌ ${error.message}`, keyboards.cancelKeyboard('withdraw'));
+  }
+}
+ 
+async function executeWithdrawal(userId: number, chatId: number): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (!user || !user.state.startsWith('withdraw_confirm_')) {
+    await showMainMenu(userId, chatId);
+    return;
+  }
+ 
+  const asset = user.state.replace('withdraw_confirm_', '') as 'TON' | 'ATF';
+  const { address, amount } = user.stateData;
+ 
+  await render(userId, chatId, `📡 <b>Broadcasting Withdrawal...</b>\n\nPlease wait ⏳`, { inline_keyboard: [] }, { withImage: true });
+ 
+  try {
+    const txId = await withdrawalService.executeWithdrawal({
+      userId,
+      asset,
+      amount,
+      toAddress: address,
+    });
+ 
+    const txRecord = await Transaction.findById(txId);
+    const txHash = txRecord?.txHash || '';
+    const link = explorerLink(txHash);
+ 
+    await clearState(userId);
+    await render(userId, chatId, [
+      `✅ <b>Withdrawal Sent</b>`,
+      ``,
+      `<b>Amount:</b> ${amount} ${asset}`,
+      `<b>Speed:</b> ~3s`,
+      `<b>Asset:</b> ${asset}`,
+      link ? `🔗 <a href="${link}">View on Explorer</a>` : '',
+      ``,
+      `<i>Transaction done. Kindly check your wallet ✅</i>`,
+    ].filter(Boolean).join('\n'), keyboards.backKeyboard('back_main'), { withImage: true });
+  } catch (error: any) {
+    await toast(userId, chatId, `❌ <b>Withdrawal Failed</b>\n\n${error.message}`, keyboards.cancelKeyboard('withdraw'));
+  }
+}
+  /* ───────────────────────────────────────────────────────────────────────────
+   👤 ACCOUNT / DASHBOARD
+   ─────────────────────────────────────────────────────────────────────────── */
+async function showAccount(userId: number, chatId: number): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (!user) return;
+ 
+  user.lastAction = 'account';
+  await user.save();
+ 
+  const wallet = await getActiveWallet(userId);
+  let tonBalance = '0';
+  let atfBalance = '0';
+  if (wallet?.address) {
+    try {
+      const onChain = await walletService.getBalance(wallet.address);
+      tonBalance = Precision.fromBaseUnits(onChain.ton, TON_DECIMALS);
+      atfBalance = Precision.fromBaseUnits(onChain.atf, ATF_DECIMALS);
+    } catch { /* keep fallback */ }
+  }
+ 
+  const [tonPrice, atfPrice, ngnRate] = await Promise.all([
+    priceService.getTonPriceUsd().catch(() => null),
+    priceService.getAtfPriceUsd().catch(() => null),
+    priceService.getUsdNgnRate().catch(() => null),
+  ]);
+ 
+  const tonUsd = tonPrice ? priceService.convertCryptoToUsd(tonBalance, tonPrice.price, TON_DECIMALS) : null;
+  const atfUsd = atfPrice ? priceService.convertCryptoToUsd(atfBalance, atfPrice.price, ATF_DECIMALS) : null;
+  const totalUsd = (parseFloat(tonUsd || '0') + parseFloat(atfUsd || '0')).toFixed(2);
+  const totalNgn = ngnRate ? priceService.convertUsdToNgn(totalUsd, ngnRate.price) : null;
+  const version = wallet?.walletVersion ? wallet.walletVersion.toUpperCase() : 'TON';
+  const type = wallet?.isImported ? 'Imported' : 'Generated';
+ 
+  await render(userId, chatId, [
+    terminalHeader('WALLET', 'Account and custody controls'),
+    ``,
+    `💼 <b>Portfolio Value</b>`,
+    `<code>$${totalUsd}</code>${totalNgn ? `  ·  ₦${totalNgn}` : ''}`,
+    ``,
+    `💎 TON  <code>${Precision.formatDisplay(tonBalance)}</code>${tonUsd ? `  ·  $${tonUsd}` : ''}`,
+    `🔷 ATF  <code>${Precision.formatDisplay(atfBalance)}</code>${atfUsd ? `  ·  $${atfUsd}` : ''}`,
+    ``,
+    `━━━━━━━━━━━━━━━━━━━━`,
+    `◉ <b>ACTIVE WALLET</b>`,
+    wallet ? `<code>${formatAddressShort(wallet.address)}</code>` : `<i>No active wallet</i>`,
+    wallet ? `Type  ·  ${type}  ·  ${version}` : '',
+    ``,
+    `🔐 <i>Never share your recovery phrase with anyone.</i>`,
+  ].filter(Boolean).join('\n'), keyboards.accountKeyboard(), { withImage: true });
+}
+ 
+/* ───────────────────────────────────────────────────────────────────────────
+   👛 MULTI-WALLET SYSTEM
+   ─────────────────────────────────────────────────────────────────────────── */
+async function showWalletList(userId: number, chatId: number): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (!user) return;
+ 
+  const wallets = await getUserWallets(userId);
+  const activeId = user.activeWalletId?.toString() || '';
+ 
+  await render(userId, chatId, [
+    `👛 <b>MY WALLETS</b>`,
+    ``,
+    `You have <b>${wallets.length}</b> wallet${wallets.length !== 1 ? 's' : ''}.`,
+    `Tap to switch active wallet:`,
+  ].join('\n'), keyboards.walletListKeyboard(wallets, activeId), { withImage: true });
+}
+ 
+async function switchWallet(userId: number, chatId: number, walletId: string): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (!user) return;
+ 
+  const hasWallet = user.walletIds.some((id: any) => id.toString() === walletId);
+  if (!hasWallet) {
+    await toast(userId, chatId, '❌ Wallet not found.', keyboards.backKeyboard('account'));
+    return;
+  }
+ 
+  user.activeWalletId = new mongoose.Types.ObjectId(walletId);
+  await user.save();
+ 
+  await toast(userId, chatId, '✅ <b>Wallet Switched</b>', keyboards.backKeyboard('account'));
+  setTimeout(() => showAccount(userId, chatId), 1000);
+}
+ 
+async function createNewWallet(userId: number, chatId: number): Promise<void> {
+  try {
+    const newWallet = await walletService.createWallet(userId);
+    const user = await User.findOne({ telegramId: userId });
+    if (user && newWallet) {
+      user.walletIds.push(newWallet._id);
+      user.activeWalletId = newWallet._id;
+      await user.save();
+    }
+ 
+    await toast(userId, chatId, [
+      `✅ <b>New Wallet Created</b>`,
+      ``,
+      `Address: <code>${formatAddressShort(newWallet.address)}</code>`,
+      ``,
+      `Switched to new wallet automatically.`,
+    ].join('\n'), keyboards.backKeyboard('account'));
+ 
+    setTimeout(() => showAccount(userId, chatId), 1500);
+  } catch (error: any) {
+    await toast(userId, chatId, `❌ Failed to create wallet: ${error.message}`, keyboards.backKeyboard('account'));
+  }
+}
+ 
+/* ───────────────────────────────────────────────────────────────────────────
+   🔐 WALLET EXPORT
+   ─────────────────────────────────────────────────────────────────────────── */
+async function showExportWarning(userId: number, chatId: number): Promise<void> {
+  await render(userId, chatId, [
+    `🛡️ <b>SECURITY WARNING</b>`,
+    ``,
+    `Your recovery phrase grants <b>full control</b> over this wallet.`,
+    `Never share it. ATFSwap support will <b>never</b> ask for it.`,
+    ``,
+    `Tap <b>Reveal Phrase</b> to show your backup words.`,
+  ].join('\n'), keyboards.exportWarningKeyboard(), { withImage: true });
+}
+ 
+async function exportWallet(userId: number, chatId: number): Promise<void> {
+  try {
+    const wallet = await getActiveWallet(userId);
+    if (!wallet) {
+      await toast(userId, chatId, '❌ No wallet found.', keyboards.backKeyboard('account'));
+      return;
+    }
+ 
+    const { decrypt } = await import('../utils/encryption');
+    const phrase = decrypt(wallet.encryptedMnemonic, wallet.iv, wallet.tag);
+ 
+    await render(userId, chatId, [
+      `🔐 <b>WALLET BACKUP</b>`,
+      ``,
+      `<code>${phrase}</code>`,
+      ``,
+      `🗑️ <i>Delete this message immediately after copying.</i>`,
+    ].join('\n'), keyboards.backKeyboard('account'), { withImage: true });
+ 
+    await AdminAction.create({
+      adminId: userId,
+      action: 'WALLET_EXPORTED',
+      target: userId.toString(),
+      result: 'success',
+    });
+  } catch (error: any) {
+    await toast(userId, chatId, `❌ Export failed: ${error.message}`, keyboards.backKeyboard('account'));
+  }
+      }
+              /* ───────────────────────────────────────────────────────────────────────────
+   🔑 WALLET IMPORT  (V4R2 / W5R1)
+   ─────────────────────────────────────────────────────────────────────────── */
+type WalletVersion = 'v4r2' | 'v5r1';
+ 
+/** Ephemeral memory-only cache. NEVER logged. NEVER persisted. */
+const autoDetectMnemonicCache = new Map<number, { mnemonic: string; timer: NodeJS.Timeout }>();
+ 
+function setAutoDetectMnemonic(userId: number, mnemonic: string): void {
+  const existing = autoDetectMnemonicCache.get(userId);
+  if (existing) clearTimeout(existing.timer);
+  const timer = setTimeout(() => autoDetectMnemonicCache.delete(userId), 90000);
+  autoDetectMnemonicCache.set(userId, { mnemonic, timer });
+}
+ 
+function getAndClearAutoDetectMnemonic(userId: number): string | null {
+  const entry = autoDetectMnemonicCache.get(userId);
+  if (!entry) return null;
+  clearTimeout(entry.timer);
+  autoDetectMnemonicCache.delete(userId);
+  return entry.mnemonic;
+}
+ 
+async function startImportWallet(userId: number, chatId: number): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (!user) return;
+ 
+  user.state = 'import_version_select';
+  user.stateData = {};
+  await user.save();
+ 
+  await render(userId, chatId, [
+    `🔐 <b>IMPORT WALLET</b>`,
+    ``,
+    `Select the wallet version:`,
+    ``,
+    `<i>Your existing wallets will not be replaced.</i>`,
+  ].join('\n'), keyboards.importWalletVersionKeyboard(), { withImage: true });
+}
+ 
+async function handleImportVersionSelect(
+  userId: number,
+  chatId: number,
+  strategy: 'auto' | WalletVersion
+): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (!user || user.state !== 'import_version_select') return;
+ 
+  if (strategy === 'auto') {
+    user.stateData = { importStrategy: 'auto' };
+  } else {
+    user.stateData = { importStrategy: 'manual', importVersion: strategy };
+  }
+ 
+  user.state = 'import_mnemonic_input';
+  await user.save();
+ 
+  await render(userId, chatId, [
+    `🔐 <b>IMPORT WALLET</b>`,
+    ``,
+    `Paste your 24-word recovery phrase below.`,
+    ``,
+    `<i>This will add a NEW wallet. Your existing wallets will not be replaced.</i>`,
+  ].join('\n'), keyboards.cancelKeyboard('account'), { withImage: true });
+}
+ 
+async function handleImportMnemonic(userId: number, chatId: number, text: string): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (!user || user.state !== 'import_mnemonic_input') return;
+ 
+  const words = text.trim().split(/\s+/);
+  if (words.length !== 24) {
+    await toast(userId, chatId, '❌ Invalid phrase. Please enter exactly 24 words.', keyboards.cancelKeyboard('account'));
+    return;
+  }
+ 
+  const mnemonic = text.trim();
+  const strategy = user.stateData?.importStrategy as 'auto' | undefined;
+  const manualVersion = user.stateData?.importVersion as WalletVersion | undefined;
+ 
+  try {
+    let selectedVersion: WalletVersion;
+ 
+    if (strategy === 'auto') {
+      try {
+        const detected = await walletService.detectWalletVersion(mnemonic);
+        selectedVersion = detected.version;
+      } catch (detectErr: any) {
+        if (detectErr.message?.includes('Both')) {
+          const wallets = await walletService.deriveAllWallets(mnemonic);
+          setAutoDetectMnemonic(userId, mnemonic);
+          user.state = 'import_version_confirm';
+          await user.save();
+ 
+          await render(userId, chatId, [
+            `🔍 <b>AUTO-DETECT RESULT</b>`,
+            ``,
+            `Both <b>V4R2</b> and <b>W5R1</b> were found for this phrase.`,
+            ``,
+            `V4R2: <code>${wallets.v4.address}</code>`,
+            `W5R1: <code>${wallets.v5.address}</code>`,
+            ``,
+            `Please choose which wallet to import:`,
+          ].join('\n'), {
+            inline_keyboard: [
+              [{ text: '🟦 Import V4R2', callback_data: 'import_version_v4' }],
+              [{ text: '🟪 Import W5R1', callback_data: 'import_version_v5' }],
+              [{ text: '❌ Cancel', callback_data: 'account' }],
+            ],
+          }, { withImage: true });
+          return;
+        }
+        throw detectErr;
+      }
+    } else if (manualVersion) {
+      selectedVersion = manualVersion;
+    } else {
+      await toast(userId, chatId, '❌ Import configuration error. Please start over.', keyboards.backKeyboard('account'));
+      return;
+    }
+ 
+    await finalizeWalletImport(userId, chatId, mnemonic, selectedVersion);
+  } catch (error: any) {
+    await toast(userId, chatId, `❌ Import failed: ${error.message}`, keyboards.cancelKeyboard('account'));
+  }
+}
+ 
+async function handleImportVersionConfirm(userId: number, chatId: number, version: WalletVersion): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (!user || user.state !== 'import_version_confirm') return;
+ 
+  const mnemonic = getAndClearAutoDetectMnemonic(userId);
+  if (!mnemonic) {
+    await toast(userId, chatId, '⏳ Session expired. Please start again.', keyboards.backKeyboard('account'));
+    await clearState(userId);
+    return;
+  }
+ 
+  try {
+    await finalizeWalletImport(userId, chatId, mnemonic, version);
+  } catch (error: any) {
+    await toast(userId, chatId, `❌ Import failed: ${error.message}`, keyboards.cancelKeyboard('account'));
+  }
+}
+ 
+async function finalizeWalletImport(
+  userId: number,
+  chatId: number,
+  mnemonic: string,
+  version: WalletVersion
+): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (!user) return;
+ 
+  const existingWallets = await getUserWallets(userId);
+  const derived = await walletService.deriveAllWallets(mnemonic);
+  const targetAddress = version === 'v4r2' ? derived.v4.address : derived.v5.address;
+ 
+  const existing = exis
