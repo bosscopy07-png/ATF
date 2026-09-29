@@ -14,6 +14,7 @@ const PriceCacheSchema = new Schema<IPriceCache>(
     price: { type: Number, required: true },
     currency: { type: String, required: true },
     source: { type: String, required: true },
+    change24hPercent: { type: Number, default: null },
     timestamp: { type: Date, default: Date.now, expires: 300 }, // TTL 5 minutes
   },
   { timestamps: true }
