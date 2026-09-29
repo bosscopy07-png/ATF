@@ -285,60 +285,93 @@ async function restoreLastAction(userId: number, chatId: number): Promise<void> 
   }
   }
   /* ─────────────────────────────────────────────────────────────────────────── 🏠 MAIN MENU ─────────────────────────────────────────────────────────────────────────── */
+const WALLET_BALANCE_TIMEOUT_MS = 8_000;
+
+/** Resolves to null instead of hanging forever when the RPC is slow. */
+const withTimeout = <T>(promise: Promise<T>, ms: number): Promise<T | null> =>
+  Promise.race([promise, new Promise<null>((resolve) => setTimeout(() => resolve(null), ms))]);
+
+const fmtUsd = (value: string): string =>
+  Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
 export async function showMainMenu(userId: number, chatId: number): Promise<void> {
-  const user = await User.findOne({ telegramId: userId });
+  const [user, wallet] = await Promise.all([
+    User.findOne({ telegramId: userId }),
+    getActiveWallet(userId),
+  ]);
   if (!user) return;
 
-  user.lastAction = 'main_menu';
-  await user.save();
-
-  const wallet = await getActiveWallet(userId);
-  let tonBalance = '0';
-  let atfBalance = '0';
-
-  if (wallet?.address) {
-    try {
-      const onChain = await walletService.getBalance(wallet.address);
-      tonBalance = Precision.fromBaseUnits(onChain.ton, TON_DECIMALS);
-      atfBalance = Precision.fromBaseUnits(onChain.atf, ATF_DECIMALS);
-    } catch { /* preserve zero fallback */ }
+  if (user.lastAction !== 'main_menu') {
+    await User.updateOne({ _id: user._id }, { $set: { lastAction: 'main_menu' } }).catch(() => {});
   }
 
-  const [atfPrice, tonPrice, ngnRate] = await Promise.all([
-    priceService.getAtfPriceUsd().catch(() => null),
-    priceService.getTonPriceUsd().catch(() => null),
-    priceService.getUsdNgnRate().catch(() => null),
+  const balancePromise = wallet?.address
+    ? withTimeout(walletService.getBalance(wallet.address), WALLET_BALANCE_TIMEOUT_MS)
+    : Promise.resolve(null);
+
+  const [onChain, [atfPrice, tonPrice, ngnRate]] = await Promise.all([
+    balancePromise.catch(() => null),
+    Promise.all([
+      priceService.getAtfPriceUsd().catch(() => null),
+      priceService.getTonPriceUsd().catch(() => null),
+      priceService.getUsdNgnRate().catch(() => null),
+    ]),
   ]);
 
-  const tonUsd = tonPrice ? priceService.convertCryptoToUsd(tonBalance, tonPrice.price, TON_DECIMALS) : null;
-  const atfUsd = atfPrice ? priceService.convertCryptoToUsd(atfBalance, atfPrice.price, ATF_DECIMALS) : null;
-  const totalUsd = (parseFloat(tonUsd || '0') + parseFloat(atfUsd || '0')).toFixed(2);
-  const totalNgn = ngnRate ? priceService.convertUsdToNgn(totalUsd, ngnRate.price) : null;
+  const tonBalance = onChain ? Precision.fromBaseUnits(onChain.ton, TON_DECIMALS) : null;
+  const atfBalance = onChain ? Precision.fromBaseUnits(onChain.atf, ATF_DECIMALS) : null;
+
+  const tonUsd = tonBalance !== null && tonPrice
+    ? priceService.convertCryptoToUsd(tonBalance, tonPrice.price, TON_DECIMALS)
+    : null;
+  const atfUsd = atfBalance !== null && atfPrice
+    ? priceService.convertCryptoToUsd(atfBalance, atfPrice.price, ATF_DECIMALS)
+    : null;
+
+  const totalUsd = tonUsd !== null || atfUsd !== null
+    ? (parseFloat(tonUsd ?? '0') + parseFloat(atfUsd ?? '0')).toFixed(2)
+    : null;
+  const totalNgn = totalUsd !== null && ngnRate
+    ? priceService.convertUsdToNgn(totalUsd, ngnRate.price)
+    : null;
+
+  const assetRow = (
+    emoji: string,
+    symbol: string,
+    balance: string | null,
+    usd: string | null,
+    price: Parameters<typeof marketMovement>[0] | null,
+  ): string => {
+    if (balance === null) return `${emoji} <b>${symbol}</b> <i>unavailable</i>`;
+    const value = usd ? ` ≈ $${fmtUsd(usd)}${price ? ` · ${marketMovement(price)}` : ''}` : '';
+    return `${emoji} <b>${symbol}</b> <code>${Precision.formatDisplay(balance)}</code>${value}`;
+  };
 
   const caption = [
     terminalHeader('PORTFOLIO', 'Your assets, market value and live pricing'),
-    ``,
+    '',
     `💼 <b>Total Portfolio</b>`,
-    `<code>$${totalUsd}</code>${totalNgn ? ` · <code>₦${totalNgn}</code>` : ''}`,
-    ``,
-    `💎 <b>TON</b> <code>${Precision.formatDisplay(tonBalance)}</code>`,
-    tonUsd ? ` ≈ $${tonUsd} · ${marketMovement(tonPrice)}` : ` Market unavailable`,
-    ``,
-    `🔷 <b>ATF</b> <code>${Precision.formatDisplay(atfBalance)}</code>`,
-    atfUsd ? ` ≈ $${atfUsd} · ${marketMovement(atfPrice)}` : ` Market unavailable`,
-    ``,
+    totalUsd !== null
+      ? `<code>$${fmtUsd(totalUsd)}</code>${totalNgn ? ` · <code>₦${fmtUsd(totalNgn)}</code>` : ''}`
+      : `<i>unavailable</i>`,
+    '',
+    assetRow('💎', 'TON', tonBalance, tonUsd, tonPrice),
+    assetRow('🔷', 'ATF', atfBalance, atfUsd, atfPrice),
+    '',
     `━━━━━━━━━━━━━━━━━━━━`,
     `◉ <b>MARKET</b>`,
     tonPrice ? `TON <code>$${tonPrice.price.toFixed(2)}</code> · ${marketMovement(tonPrice)}` : `TON <i>unavailable</i>`,
     atfPrice ? `ATF <code>$${atfPrice.price.toFixed(6)}</code> · ${marketMovement(atfPrice)}` : `ATF <i>unavailable</i>`,
     ngnRate ? `USD <code>₦${ngnRate.price.toFixed(2)}</code>` : '',
-    ``,
-    wallet ? `◉ Wallet <code>${formatAddressShort(wallet.address)}</code>` : `⚠ Wallet unavailable`,
-    wallet?.walletVersion ? `Network <code>TON · ${wallet.walletVersion.toUpperCase()}</code>` : '',
+    '',
+    wallet
+      ? `◉ Wallet <code>${formatAddressShort(wallet.address)}</code>${wallet.walletVersion ? ` · <code>${wallet.walletVersion.toUpperCase()}</code>` : ''}`
+      : `⚠️ No active wallet — tap ▣ Wallet to create or import one`,
   ].filter(Boolean).join('\n');
 
   await render(userId, chatId, caption, keyboards.mainMenuKeyboard(user.isAdmin || user.isSuperAdmin), { withImage: true });
-}
+             }
+
 
 /* ─────────────────────────────────────────────────────────────────────────── 🔄 SWAP FLOW ─────────────────────────────────────────────────────────────────────────── */
 async function showSwapPair(userId: number, chatId: number): Promise<void> {
