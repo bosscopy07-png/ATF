@@ -1179,8 +1179,12 @@ async function showHistory(userId: number, chatId: number, page: number): Promis
    ─────────────────────────────────────────────────────────────────────────── */
 async function showPrices(userId: number, chatId: number): Promise<void> {
   const user = await User.findOne({ telegramId: userId });
+
   if (user && user.lastAction !== 'prices') {
-    await User.updateOne({ _id: user._id }, { $set: { lastAction: 'prices' } }).catch(() => {});
+    await User.updateOne(
+      { _id: user._id },
+      { $set: { lastAction: 'prices' } },
+    ).catch(() => {});
   }
 
   const [atfPrice, tonPrice, ngnRate] = await Promise.all([
@@ -1189,38 +1193,54 @@ async function showPrices(userId: number, chatId: number): Promise<void> {
     priceService.getUsdNgnRate().catch(() => null),
   ]);
 
-  const asset = (emoji: string, price: any, label: string, decimals: number): string[] => {
-    if (!price) return [`${emoji} <b>${label}</b> · <i>⏳ Unavailable</i>`];
+  const asset = (
+    emoji: string,
+    price: any,
+    label: string,
+    decimals: number,
+  ): string[] => {
+    if (!price) {
+      return [
+        `${emoji} <b>${label}</b> · <i>⏳ Unavailable</i>`,
+      ];
+    }
+
     const ngn = ngnRate
       ? `₦${fmtMoney(String(price.price * ngnRate.price))}`
       : '—';
+
     return [
       `${emoji} <b>${label}</b>`,
-      `   ├ 💵 <code>$${price.price.toFixed(decimals)}</code> · ${movementLine(price)}`,
+      `   ├ 💵 <code>$${Number(price.price).toFixed(decimals)}</code> · ${movementLine(price)}`,
       `   ├ 🇳🇬 <code>${ngn}</code>`,
       `   └ 🔗 ${sourceBadge(price)}`,
     ];
   };
 
   const caption = [
-    terminalHeader('MARKET', '⚡ live pricing · 🔄 provider fallback · 📊 24h movement'),
+    terminalHeader(
+      'MARKET',
+      '⚡ live pricing · 🔄 provider fallback · 📊 24h movement',
+    ),
     '',
     ...asset('🔷', atfPrice, 'ATF', 6),
     '',
     ...asset('💎', tonPrice, 'TON', 2),
     '',
     ngnRate
-      ? `🇳🇬 <b>USD/NGN</b> <code>₦${ngnRate.price.toFixed(2)}</code> · ${sourceBadge(ngnRate)}`
+      ? `🇳🇬 <b>USD/NGN</b> <code>₦${Number(ngnRate.price).toFixed(2)}</code> · ${sourceBadge(ngnRate)}`
       : `🇳🇬 <b>USD/NGN</b> · <i>⏳ Unavailable</i>`,
     '',
     `⌁ <i>🛡️ Prices use the configured provider chain and cached fallback when necessary.</i>`,
-  ].filter(Boolean).join('\n');
+  ]
+    .filter(Boolean)
+    .join('\n');
 
   await render(
     userId,
     chatId,
     caption,
-    keyboards.pricesKeyboard(priceService.getChartUrl('atf'), priceService.getChartUrl('ton')),
+    keyboards.pricesKeyboard(),
     { withImage: true },
   );
 }
