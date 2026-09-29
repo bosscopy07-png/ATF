@@ -1,7 +1,10 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { config } from '../config';
 
-/** * ATF NEXUS — Telegram UI keyboard system. * Callback IDs intentionally remain compatible with handlers.ts. */
+/**
+ * ATF NEXUS — Telegram UI keyboard system.
+ * Callback IDs intentionally remain compatible with handlers.ts.
+ */
 const b = (text: string, callback_data: string): TelegramBot.InlineKeyboardButton => ({ text, callback_data });
 const row = (...buttons: TelegramBot.InlineKeyboardButton[]) => buttons;
 
@@ -9,9 +12,9 @@ export function mainMenuKeyboard(isAdmin: boolean): TelegramBot.InlineKeyboardMa
   const buttons: TelegramBot.InlineKeyboardButton[][] = [
     row(b('⇄ Swap', 'swap'), b('＋ Deposit', 'deposit')),
     row(b('↗ Withdraw', 'withdraw'), b('▣ Wallet', 'account')),
-    row(b('◈ Market', 'prices'), b('◷ Activity', 'history')),
-    row(b('🎁 Rewards', 'referral'), b('？ Support', 'help')),
-    row(b('↻ Refresh Portfolio', 'refresh_main')),
+    row(b('⚖️ Market', 'prices'), b('◷ Activity', 'history')),
+    row(b('🎁 Rewards', 'referral'), b('❓ Support', 'help')),
+    row(b('🔄 Refresh Portfolio', 'refresh_main')),
   ];
 
   if (isAdmin) buttons.push(row(b('⚙ Admin Console', 'admin_panel')));
@@ -20,16 +23,16 @@ export function mainMenuKeyboard(isAdmin: boolean): TelegramBot.InlineKeyboardMa
 
 export function swapPairKeyboard(): TelegramBot.InlineKeyboardMarkup {
   return { inline_keyboard: [
-    row(b('💎 TON → ATF', 'swap_ton_atf')),
-    row(b('ATF → TON 💎', 'swap_atf_ton')),
-    row(b('‹ Portfolio', 'back_main')),
+    row(b('💎 TON → ATF 🪙', 'swap_ton_atf')),
+    row(b('🪙 ATF → TON 💎', 'swap_atf_ton')),
+    row(b('👛 Portfolio', 'back_main')),
   ] };
 }
 
 export function confirmSwapKeyboard(): TelegramBot.InlineKeyboardMarkup {
   return { inline_keyboard: [
-    row(b('✓ Confirm Swap', 'confirm_swap')),
-    row(b('× Cancel', 'cancel_swap')),
+    row(b('✅ Confirm Swap', 'confirm_swap')),
+    row(b('❌ Cancel', 'cancel_swap')),
   ] };
 }
 
@@ -37,7 +40,7 @@ export function depositKeyboard(): TelegramBot.InlineKeyboardMarkup {
   return { inline_keyboard: [
     row(b('💎 Deposit TON', 'deposit_ton')),
     row(b('🔷 Deposit ATF', 'deposit_atf')),
-    row(b('‹ Portfolio', 'back_main')),
+    row(b('👛 Portfolio', 'back_main')),
   ] };
 }
 
@@ -65,8 +68,8 @@ export function withdrawAssetKeyboard(): TelegramBot.InlineKeyboardMarkup {
 
 export function confirmWithdrawalKeyboard(): TelegramBot.InlineKeyboardMarkup {
   return { inline_keyboard: [
-    row(b('✓ Confirm Withdrawal', 'confirm_withdrawal')),
-    row(b('× Cancel', 'cancel_withdrawal')),
+    row(b('✅ Confirm Withdrawal', 'confirm_withdrawal')),
+    row(b('❌ Cancel', 'cancel_withdrawal')),
   ] };
 }
 
@@ -75,7 +78,7 @@ export function backKeyboard(callback: string): TelegramBot.InlineKeyboardMarkup
 }
 
 export function cancelKeyboard(callback: string): TelegramBot.InlineKeyboardMarkup {
-  return { inline_keyboard: [row(b('× Cancel', callback))] };
+  return { inline_keyboard: [row(b('❌ Cancel', callback))] };
 }
 
 export function pricesKeyboard(): TelegramBot.InlineKeyboardMarkup {
@@ -102,8 +105,8 @@ export function accountKeyboard(): TelegramBot.InlineKeyboardMarkup {
 
 export function exportWarningKeyboard(): TelegramBot.InlineKeyboardMarkup {
   return { inline_keyboard: [
-    row(b('⚠ Reveal Recovery Phrase', 'export_confirm')),
-    row(b('× Cancel', 'account')),
+    row(b('⚠️ Reveal Recovery Phrase', 'export_confirm')),
+    row(b('❌ Cancel', 'account')),
   ] };
 }
 
@@ -111,7 +114,7 @@ export function importWalletVersionKeyboard(): TelegramBot.InlineKeyboardMarkup 
   return { inline_keyboard: [
     row(b('⌁ Auto Detect', 'import_version_auto')),
     row(b('V4R2', 'import_version_v4'), b('W5R1', 'import_version_v5')),
-    row(b('× Cancel', 'account')),
+    row(b('❌ Cancel', 'account')),
   ] };
 }
 
@@ -119,7 +122,7 @@ export function walletListKeyboard(wallets: any[], activeId: string): TelegramBo
   const rows = wallets.map((w, idx) => {
     const version = w.walletVersion === 'v5r1' ? 'W5' : w.walletVersion === 'v4r2' ? 'V4' : '?';
     const active = w._id.toString() === activeId;
-    return [b(`${active ? '●' : '○'} Wallet ${idx + 1} · ${version}${w.isImported ? ' · Imported' : ''}`, `switch_wallet_${w._id.toString()}`)];
+    return [b(`${active ? '🟢' : '⚪'} Wallet ${idx + 1} · ${version}${w.isImported ? ' · Imported' : ''}`, `switch_wallet_${w._id.toString()}`)];
   });
 
   rows.push(row(b('＋ Create New Wallet', 'create_wallet')));
@@ -192,4 +195,5 @@ export function userActionKeyboard(telegramId: number, isFrozen: boolean): Teleg
     row(b('▣ View Transactions', `admin_tx_${telegramId}`)),
     row(b('‹ Users', 'admin_users')),
   ] };
-    }
+  }
+    
