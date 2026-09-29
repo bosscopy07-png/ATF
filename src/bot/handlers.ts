@@ -25,6 +25,24 @@ const withdrawalService = new WithdrawalService();
 const walletService = new WalletService();
 const priceService = PriceService.getInstance();
 
+/** 📊 🟢 up / 🔴 down / ⚪ no data / ⏳ stale — with signed %. */
+function movementLine(p: any): string {
+  if (!p) return '⚪ —';
+  if (isStale(p)) return '⏳ cached'; // price is old — movement would be a lie
+  const c = p.change24hPercent ?? null;
+  if (c === null || !Number.isFinite(c)) return '⚪ —';
+  return `${c > 0 ? '🟢' : c < 0 ? '🔴' : '⚪'} ${c > 0 ? '+' : ''}${c.toFixed(2)}%`;
+}
+
+/** 🔗 provider name, hyperlinked when we know the chart URL. */
+function sourceBadge(p: any): string {
+  const name = sourceLabel({ ...p, source: cleanSource(p) });
+  return `<i>${name}${isStale(p) ? ' · ⏳ stale' : ''}</i>`;
+}
+
+const fmtMoney = (v: string, dp = 2): string =>
+  Number(v).toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp });
+
 function marketMovement(price: any): string {
   const change = Number(price?.change24hPercent);
   if (!Number.isFinite(change)) return '24h · —';
@@ -285,15 +303,6 @@ async function restoreLastAction(userId: number, chatId: number): Promise<void> 
   }
   }
   /* ─────────────────────────────────────────────────────────────────────────── 🏠 MAIN MENU ─────────────────────────────────────────────────────────────────────────── */
-const WALLET_BALANCE_TIMEOUT_MS = 8_000;
-
-/** Resolves to null instead of hanging forever when the RPC is slow. */
-const withTimeout = <T>(promise: Promise<T>, ms: number): Promise<T | null> =>
-  Promise.race([promise, new Promise<null>((resolve) => setTimeout(() => resolve(null), ms))]);
-
-const fmtUsd = (value: string): string =>
-  Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-
 export async function showMainMenu(userId: number, chatId: number): Promise<void> {
   const [user, wallet] = await Promise.all([
     User.findOne({ telegramId: userId }),
@@ -321,56 +330,49 @@ export async function showMainMenu(userId: number, chatId: number): Promise<void
   const tonBalance = onChain ? Precision.fromBaseUnits(onChain.ton, TON_DECIMALS) : null;
   const atfBalance = onChain ? Precision.fromBaseUnits(onChain.atf, ATF_DECIMALS) : null;
 
-  const tonUsd = tonBalance !== null && tonPrice
-    ? priceService.convertCryptoToUsd(tonBalance, tonPrice.price, TON_DECIMALS)
-    : null;
-  const atfUsd = atfBalance !== null && atfPrice
-    ? priceService.convertCryptoToUsd(atfBalance, atfPrice.price, ATF_DECIMALS)
-    : null;
+  const tonUsd = tonBalance !== null && tonPrice ? priceService.convertCryptoToUsd(tonBalance, tonPrice.price, TON_DECIMALS) : null;
+  const atfUsd = atfBalance !== null && atfPrice ? priceService.convertCryptoToUsd(atfBalance, atfPrice.price, ATF_DECIMALS) : null;
 
   const totalUsd = tonUsd !== null || atfUsd !== null
     ? (parseFloat(tonUsd ?? '0') + parseFloat(atfUsd ?? '0')).toFixed(2)
     : null;
-  const totalNgn = totalUsd !== null && ngnRate
-    ? priceService.convertUsdToNgn(totalUsd, ngnRate.price)
-    : null;
+  const totalNgn = totalUsd !== null && ngnRate ? priceService.convertUsdToNgn(totalUsd, ngnRate.price) : null;
 
-  const assetRow = (
-    emoji: string,
-    symbol: string,
-    balance: string | null,
-    usd: string | null,
-    price: Parameters<typeof marketMovement>[0] | null,
-  ): string => {
-    if (balance === null) return `${emoji} <b>${symbol}</b> <i>unavailable</i>`;
-    const value = usd ? ` ≈ $${fmtUsd(usd)}${price ? ` · ${marketMovement(price)}` : ''}` : '';
-    return `${emoji} <b>${symbol}</b> <code>${Precision.formatDisplay(balance)}</code>${value}`;
+  const assetBlock = (emoji: string, symbol: string, balance: string | null, usd: string | null, price: any): string[] => {
+    if (balance === null) return [`${emoji} <b>${symbol}</b> <i>⏳ unavailable</i>`];
+    return [
+      `${emoji} <b>${symbol}</b> <code>${Precision.formatDisplay(balance)}</code>`,
+      `   ├ 💵 <code>$${fmtMoney(usd ?? '0')}</code>`,
+      `   └ 📊 ${movementLine(price)}`,
+    ];
   };
 
   const caption = [
-    terminalHeader('PORTFOLIO', 'Your assets, market value and live pricing'),
+    terminalHeader('PORTFOLIO', '💼 your assets · 💵 live value · 📊 24h movement'),
     '',
     `💼 <b>Total Portfolio</b>`,
     totalUsd !== null
-      ? `<code>$${fmtUsd(totalUsd)}</code>${totalNgn ? ` · <code>₦${fmtUsd(totalNgn)}</code>` : ''}`
-      : `<i>unavailable</i>`,
+      ? `💵 <code>$${fmtMoney(totalUsd)}</code>${totalNgn ? `  🇳🇬 <code>₦${fmtMoney(totalNgn, 0)}</code>` : ''}`
+      : `<i>⏳ unavailable</i>`,
     '',
-    assetRow('💎', 'TON', tonBalance, tonUsd, tonPrice),
-    assetRow('🔷', 'ATF', atfBalance, atfUsd, atfPrice),
+    ...assetBlock('💎', 'TON', tonBalance, tonUsd, tonPrice),
+    '',
+    ...assetBlock('🔷', 'ATF', atfBalance, atfUsd, atfPrice),
     '',
     `━━━━━━━━━━━━━━━━━━━━`,
     `◉ <b>MARKET</b>`,
-    tonPrice ? `TON <code>$${tonPrice.price.toFixed(2)}</code> · ${marketMovement(tonPrice)}` : `TON <i>unavailable</i>`,
-    atfPrice ? `ATF <code>$${atfPrice.price.toFixed(6)}</code> · ${marketMovement(atfPrice)}` : `ATF <i>unavailable</i>`,
-    ngnRate ? `USD <code>₦${ngnRate.price.toFixed(2)}</code>` : '',
+    tonPrice ? `💎 TON <code>$${tonPrice.price.toFixed(2)}</code> · ${movementLine(tonPrice)}` : `💎 TON <i>⏳ unavailable</i>`,
+    atfPrice ? `🔷 ATF <code>$${atfPrice.price.toFixed(6)}</code> · ${movementLine(atfPrice)}` : `🔷 ATF <i>⏳ unavailable</i>`,
+    ngnRate ? `🇳🇬 USD/NGN <code>₦${ngnRate.price.toFixed(2)}</code>` : '',
     '',
     wallet
-      ? `◉ Wallet <code>${formatAddressShort(wallet.address)}</code>${wallet.walletVersion ? ` · <code>${wallet.walletVersion.toUpperCase()}</code>` : ''}`
+      ? `◉ 🗝 Wallet <code>${formatAddressShort(wallet.address)}</code>${wallet.walletVersion ? ` · <code>${wallet.walletVersion.toUpperCase()}</code>` : ''}`
       : `⚠️ No active wallet — tap ▣ Wallet to create or import one`,
   ].filter(Boolean).join('\n');
 
   await render(userId, chatId, caption, keyboards.mainMenuKeyboard(user.isAdmin || user.isSuperAdmin), { withImage: true });
-             }
+               }
+      
 
 
 /* ─────────────────────────────────────────────────────────────────────────── 🔄 SWAP FLOW ─────────────────────────────────────────────────────────────────────────── */
@@ -1169,39 +1171,52 @@ async function showHistory(userId: number, chatId: number, page: number): Promis
    ─────────────────────────────────────────────────────────────────────────── */
 async function showPrices(userId: number, chatId: number): Promise<void> {
   const user = await User.findOne({ telegramId: userId });
-  if (user) {
-    user.lastAction = 'prices';
-    await user.save();
+  if (user && user.lastAction !== 'prices') {
+    await User.updateOne({ _id: user._id }, { $set: { lastAction: 'prices' } }).catch(() => {});
   }
- 
+
   const [atfPrice, tonPrice, ngnRate] = await Promise.all([
     priceService.getAtfPriceUsd().catch(() => null),
     priceService.getTonPriceUsd().catch(() => null),
     priceService.getUsdNgnRate().catch(() => null),
   ]);
- 
+
+  const asset = (emoji: string, price: any, label: string, decimals: number): string[] => {
+    if (!price) return [`${emoji} <b>${label}</b> · <i>⏳ Unavailable</i>`];
+    const ngn = ngnRate
+      ? `₦${fmtMoney(String(price.price * ngnRate.price))}`
+      : '—';
+    return [
+      `${emoji} <b>${label}</b>`,
+      `   ├ 💵 <code>$${price.price.toFixed(decimals)}</code> · ${movementLine(price)}`,
+      `   ├ 🇳🇬 <code>${ngn}</code>`,
+      `   └ 🔗 ${sourceBadge(price)}`,
+    ];
+  };
+
   const caption = [
-    terminalHeader('MARKET', 'Live pricing · provider fallback · 24h movement'),
-    ``,
-    atfPrice ? [
-      `🔷 <b>ATF</b>`,
-      `<code>$${atfPrice.price.toFixed(6)}</code>  ·  ${marketMovement(atfPrice)}`,
-      `≈ ₦${ngnRate ? (atfPrice.price * ngnRate.price).toFixed(2) : '—'}  ·  <i>${sourceLabel(atfPrice)}</i>`,
-    ].join('\n') : `🔷 <b>ATF</b>  ·  <i>Unavailable</i>`,
-    ``,
-    tonPrice ? [
-      `💎 <b>TON</b>`,
-      `<code>$${tonPrice.price.toFixed(2)}</code>  ·  ${marketMovement(tonPrice)}`,
-      `≈ ₦${ngnRate ? (tonPrice.price * ngnRate.price).toFixed(2) : '—'}  ·  <i>${sourceLabel(tonPrice)}</i>`,
-    ].join('\n') : `💎 <b>TON</b>  ·  <i>Unavailable</i>`,
-    ``,
-    ngnRate ? `💱 <b>USD/NGN</b>  <code>₦${ngnRate.price.toFixed(2)}</code>  ·  <i>${sourceLabel(ngnRate)}</i>` : `💱 <b>USD/NGN</b>  ·  <i>Unavailable</i>`,
-    ``,
-    `⌁ <i>Prices use the configured provider chain and cached fallback when necessary.</i>`,
-  ].join('\n');
- 
-  await render(userId, chatId, caption, keyboards.pricesKeyboard(), { withImage: true });
+    terminalHeader('MARKET', '⚡ live pricing · 🔄 provider fallback · 📊 24h movement'),
+    '',
+    ...asset('🔷', atfPrice, 'ATF', 6),
+    '',
+    ...asset('💎', tonPrice, 'TON', 2),
+    '',
+    ngnRate
+      ? `🇳🇬 <b>USD/NGN</b> <code>₦${ngnRate.price.toFixed(2)}</code> · ${sourceBadge(ngnRate)}`
+      : `🇳🇬 <b>USD/NGN</b> · <i>⏳ Unavailable</i>`,
+    '',
+    `⌁ <i>🛡️ Prices use the configured provider chain and cached fallback when necessary.</i>`,
+  ].filter(Boolean).join('\n');
+
+  await render(
+    userId,
+    chatId,
+    caption,
+    keyboards.pricesKeyboard(priceService.getChartUrl('atf'), priceService.getChartUrl('ton')),
+    { withImage: true },
+  );
 }
+
  
 /* ───────────────────────────────────────────────────────────────────────────
    ❓ HELP
