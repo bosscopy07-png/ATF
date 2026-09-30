@@ -61,18 +61,22 @@ export class WithdrawalService {
   }
 
   /**
-   * Calculate the amount of company gas that is still reserved
-   * for this EXACT wallet.
-   *
-   * This is blockchain-side protection.
-   *
-   * It does not rely on user.tonBalance because the company gas
-   * has already been sent on-chain.
+   * Per-swap breakdown of company gas still reserved for this
+   * EXACT wallet, ordered oldest first.
    */
-  private async getOutstandingAdminGasReserve(
+  private async getOutstandingAdminGasReserveItems(
     userObjectId: any,
+
     walletAddress: string
-  ): Promise<bigint> {
+  ): Promise<
+    Array<{
+      swapId: string;
+
+      pendingNano: bigint;
+
+      writtenOffNano: bigint;
+    }>
+  > {
     const pendingSwaps =
       await Transaction.find({
         userId: userObjectId,
@@ -91,12 +95,21 @@ export class WithdrawalService {
           'metadata.gasRecoveryWalletAddress ' +
             'metadata.gasRecoveryPendingAmountNano ' +
             'metadata.gasAdvanceAmountNano ' +
-            'metadata.gasRecoveredAmountNano'
+            'metadata.gasRecoveredAmountNano ' +
+            'metadata.gasRecoveryWrittenOffNano'
         )
+        .sort({
+          _id: 1,
+        })
         .lean();
 
-    let totalReserved =
-      0n;
+    const items: Array<{
+      swapId: string;
+
+      pendingNano: bigint;
+
+      writtenOffNano: bigint;
+    }> = [];
 
     for (
       const swap of pendingSwaps
@@ -156,6 +169,14 @@ export class WithdrawalService {
             )
           : 0n;
 
+      let writtenOffNano =
+        metadata.gasRecoveryWrittenOffNano !=
+        null
+          ? BigInt(
+              metadata.gasRecoveryWrittenOffNano
+            )
+          : 0n;
+
       /**
        * Older records may not contain
        * gasRecoveryPendingAmountNano.
@@ -176,27 +197,340 @@ export class WithdrawalService {
               '0'
           );
 
+        const settled =
+          recovered +
+          writtenOffNano;
+
         pendingNano =
-          advanced > recovered
-            ? advanced - recovered
+          advanced > settled
+            ? advanced -
+              settled
             : 0n;
       }
 
       if (
         pendingNano > 0n
       ) {
-        totalReserved +=
-          pendingNano;
+        items.push({
+          swapId:
+            swap._id.toString(),
+
+          pendingNano,
+
+          writtenOffNano,
+        });
       }
+    }
+
+    return items;
+  }
+
+  /**
+   * Calculate the amount of company gas that is still reserved
+   * for this EXACT wallet.
+   *
+   * This is blockchain-side protection.
+   *
+   * It does not rely on user.tonBalance because the company gas
+   * has already been sent on-chain.
+   */
+  private async getOutstandingAdminGasReserve(
+    userObjectId: any,
+    walletAddress: string
+  ): Promise<bigint> {
+    const items =
+      await this.getOutstandingAdminGasReserveItems(
+        userObjectId,
+        walletAddress
+      );
+
+    let totalReserved =
+      0n;
+
+    for (
+      const item of items
+    ) {
+      totalReserved +=
+        item.pendingNano;
     }
 
     return totalReserved;
   }
 
   /**
+   * Settle the platform gas reserve that a TON withdrawal would
+   * breach by charging the unrecoverable remainder to the user's
+   * internal TON balance.
+   *
+   * Only the breached portion (shortfall) is charged. Recovered
+   * amounts are never double-charged: every charged nanoTON is
+   * written off in the swap's recovery metadata, so the retry
+   * worker can never recover it again.
+   *
+   * Must be called while holding the wallet lock.
+   *
+   * Returns the amount charged in nanoTON.
+   */
+  private async chargeGasReserveShortfall(
+    user: any,
+
+    walletAddress: string,
+
+    shortfallNano: bigint
+  ): Promise<bigint> {
+    if (
+      shortfallNano <= 0n
+    ) {
+      return 0n;
+    }
+
+    const items =
+      await this.getOutstandingAdminGasReserveItems(
+        user._id,
+        walletAddress
+      );
+
+    let available =
+      0n;
+
+    for (
+      const item of items
+    ) {
+      available +=
+        item.pendingNano;
+    }
+
+    const chargeNano =
+      minBigInt(
+        shortfallNano,
+        available
+      );
+
+    if (
+      chargeNano <= 0n
+    ) {
+      return 0n;
+    }
+
+    const internalTon =
+      BigInt(
+        user.tonBalance ||
+          '0'
+      );
+
+    if (
+      internalTon <
+      chargeNano
+    ) {
+      throw new Error(
+        `TON withdrawal blocked: ${Precision.fromBaseUnits(
+          chargeNano,
+          TON_DECIMALS
+        )} TON is reserved for pending platform gas recovery and your internal balance cannot cover it. Please wait for the swap gas to be returned or reduce the amount.`
+      );
+    }
+
+    let remaining =
+      chargeNano;
+
+    const settledSwapIds: string[] =
+      [];
+
+    const writeOffs: Array<{
+      swapTxId: string;
+
+      writtenOffNano: string;
+    }> = [];
+
+    /**
+     * Oldest first; partially write off the last swap if the
+     * shortfall does not cover its full pending amount.
+     */
+    for (
+      const item of items
+    ) {
+      if (
+        remaining <= 0n
+      ) {
+        break;
+      }
+
+      const writeOff =
+        minBigInt(
+          item.pendingNano,
+          remaining
+        );
+
+      const newPending =
+        item.pendingNano -
+        writeOff;
+
+      const newWrittenOff =
+        item.writtenOffNano +
+        writeOff;
+
+      const newStatus =
+        newPending <= 0n
+          ? 'completed'
+          : 'partial';
+
+      const updated =
+        await Transaction.findOneAndUpdate(
+          {
+            _id:
+              item.swapId,
+
+            'metadata.gasRecoveryStatus':
+              {
+                $in: [
+                  'pending',
+                  'partial',
+                  'processing',
+                ],
+              },
+          },
+          {
+            $set: {
+              'metadata.gasRecoveryPendingAmountNano':
+                newPending.toString(),
+
+              'metadata.gasRecoveryWrittenOffNano':
+                newWrittenOff.toString(),
+
+              'metadata.gasRecoveryStatus':
+                newStatus,
+
+              'metadata.gasRecoveryProcessingAt':
+                null,
+
+              'metadata.gasRecoverySettledAt':
+                new Date().toISOString(),
+
+              'metadata.gasRecoverySettlementReason':
+                'charged_to_user_balance',
+            },
+          },
+          {
+            new: true,
+          }
+        );
+
+      if (!updated) {
+        /**
+         * Recovery state changed underneath us — skip this
+         * swap instead of double-settling it.
+         */
+        continue;
+      }
+
+      settledSwapIds.push(
+        item.swapId
+      );
+
+      writeOffs.push({
+        swapTxId:
+          item.swapId,
+
+        writtenOffNano:
+          writeOff.toString(),
+      });
+
+      remaining -=
+        writeOff;
+    }
+
+    const totalCharged =
+      chargeNano -
+      remaining;
+
+    if (
+      totalCharged <= 0n
+    ) {
+      return 0n;
+    }
+
+    user.tonBalance =
+      Precision.subtract(
+        BigInt(
+          user.tonBalance ||
+            '0'
+        ),
+        totalCharged
+      ).toString();
+
+    await user.save();
+
+    /**
+     * Audit the internal settlement.
+     */
+    await Transaction.create({
+      userId:
+        user._id,
+
+      type:
+        'fee',
+
+      asset:
+        'TON',
+
+      amount:
+        totalCharged.toString(),
+
+      status:
+        'completed',
+
+      toAddress:
+        config.adminFeeWalletAddress,
+
+      feeStatus:
+        'completed',
+
+      feeWallet:
+        config.adminFeeWalletAddress,
+
+      txHash:
+        provisionalTxHash(
+          'gas-settle'
+        ),
+
+      metadata: {
+        purpose:
+          'gas_reserve_settlement',
+
+        description:
+          'Unrecoverable platform gas advance charged to user internal balance during TON withdrawal',
+
+        walletAddress,
+
+        swapTxIds:
+          settledSwapIds,
+
+        writeOffs,
+
+        chargedAmountNano:
+          totalCharged.toString(),
+      },
+    });
+
+    console.log(
+      `[WithdrawalService] Gas reserve settled by charging user balance: ` +
+        `user=${user.telegramId} ` +
+        `wallet=${walletAddress} ` +
+        `chargedNano=${totalCharged} ` +
+        `swaps=${settledSwapIds.length}`
+    );
+
+    return totalCharged;
+  }
+
+  /**
    * Final live-balance + company-gas-reserve check.
    *
    * This is called immediately before an actual withdrawal.
+   *
+   * The reserve no longer hard-blocks when the user's internal
+   * balance can cover the breached portion — that portion is
+   * charged automatically at execution time.
    */
   private async assertWithdrawalFundsAvailable(
     user: any,
@@ -246,14 +580,33 @@ export class WithdrawalService {
       liveBalance -
       amountBase;
 
-    /**
-     * The withdrawal must leave enough TON in the wallet
-     * for the pending company-gas recovery.
-     */
     if (
       remainingAfterWithdrawal <
       adminGasReserve
     ) {
+      const shortfall =
+        adminGasReserve -
+        remainingAfterWithdrawal;
+
+      const internalTon =
+        BigInt(
+          user.tonBalance ||
+            '0'
+        );
+
+      if (
+        internalTon >=
+        shortfall
+      ) {
+        /**
+         * The breached portion will be charged from the
+         * user's internal balance at execution time.
+         *
+         * Not an error.
+         */
+        return;
+      }
+
       throw new Error(
         `TON withdrawal blocked: ${Precision.fromBaseUnits(
           adminGasReserve,
@@ -530,6 +883,50 @@ export class WithdrawalService {
         ? onChainTon
         : onChainAtf;
 
+    /* ─────────────────────────────────────────
+       GAS-RESERVE SETTLEMENT (TON only)
+       ───────────────────────────────────────── */
+
+    if (
+      request.asset === 'TON'
+    ) {
+      const adminGasReserve =
+        await this.getOutstandingAdminGasReserve(
+          user._id,
+          walletAddress
+        );
+
+      if (
+        adminGasReserve > 0n
+      ) {
+        const remainingAfterWithdrawal =
+          liveBalance -
+          amountBase;
+
+        const shortfall =
+          remainingAfterWithdrawal <
+          adminGasReserve
+            ? adminGasReserve -
+              remainingAfterWithdrawal
+            : 0n;
+
+        if (
+          shortfall > 0n
+        ) {
+          /**
+           * Instead of blocking the withdrawal, settle the
+           * breached portion by charging the user's internal
+           * TON balance and writing off the recovery reserve.
+           */
+          await this.chargeGasReserveShortfall(
+            user,
+            walletAddress,
+            shortfall
+          );
+        }
+      }
+    }
+
     /**
      * This is the critical protection.
      */
@@ -639,223 +1036,4 @@ export class WithdrawalService {
             amountBase.toString(),
 
           fee:
-            feeBase.toString(),
-
-          feeAsset:
-            request.asset,
-
-          feePercentage:
-            config.platformWithdrawalFeePercent ||
-              0,
-
-          feeWallet:
-            config.adminFeeWalletAddress,
-
-          feeStatus:
-            'pending',
-
-          status:
-            'processing',
-
-          toAddress:
-            request.toAddress,
-
-          txHash:
-            provisionalTxHash(
-              'withdrawal'
-            ),
-
-          metadata: {
-            requestedAmount:
-              request.amount,
-
-            destination:
-              request.toAddress,
-
-            platformFee:
-              Precision.fromBaseUnits(
-                feeBase,
-                decimals
-              ),
-
-            networkCost:
-              Precision.fromBaseUnits(
-                networkCostBase,
-                TON_DECIMALS
-              ),
-
-            sendAmount:
-              Precision.fromBaseUnits(
-                sendBase,
-                decimals
-              ),
-
-            gasReserveProtected:
-              request.asset ===
-              'TON',
-          },
-        });
-
-      /**
-       * 1. Send withdrawal to destination.
-       */
-      let txHash: string;
-
-      if (
-        request.asset ===
-        'TON'
-      ) {
-        txHash =
-          await this.walletService.sendTon(
-            request.userId,
-            request.toAddress,
-            sendBase
-          );
-      } else {
-        txHash =
-          await this.walletService.sendJetton(
-            request.userId,
-            request.toAddress,
-            config.atfJettonAddress!,
-            sendBase
-          );
-      }
-
-      tx.txHash =
-        txHash;
-
-      tx.status =
-        'completed';
-
-      await tx.save();
-
-      /**
-       * 2. Send platform fee to admin.
-       */
-      if (
-        feeBase > 0n
-      ) {
-        try {
-          let feeTxHash: string;
-
-          if (
-            request.asset ===
-            'TON'
-          ) {
-            feeTxHash =
-              await this.walletService.sendTon(
-                request.userId,
-                config.adminFeeWalletAddress,
-                feeBase
-              );
-          } else {
-            feeTxHash =
-              await this.walletService.sendJetton(
-                request.userId,
-                config.adminFeeWalletAddress,
-                config.atfJettonAddress!,
-                feeBase
-              );
-          }
-
-          tx.feeTxHash =
-            feeTxHash;
-
-          tx.feeStatus =
-            'completed';
-
-          await tx.save();
-        } catch (feeErr) {
-          console.error(
-            '[WithdrawalService] Fee transfer failed:',
-            feeErr
-          );
-
-          tx.feeStatus =
-            'failed';
-
-          tx.metadata = {
-            ...tx.metadata,
-
-            feeError:
-              (feeErr as Error)
-                .message,
-          };
-
-          await tx.save();
-        }
-      }
-
-      return tx._id.toString();
-    } catch (error) {
-      const broadcasted =
-        tx?.txHash &&
-        !tx.txHash.startsWith(
-          'withdrawal-'
-        );
-
-      /**
-       * Only roll back internal balance if the actual blockchain
-       * withdrawal was NOT broadcast.
-       */
-      if (
-        deducted &&
-        !broadcasted
-      ) {
-        try {
-          const currentUser =
-            await User.findById(
-              user._id
-            );
-
-          if (currentUser) {
-            const balanceKey =
-              request.asset === 'TON'
-                ? 'tonBalance'
-                : 'atfBalance';
-
-            currentUser[balanceKey] =
-              Precision.add(
-                BigInt(
-                  currentUser[
-                    balanceKey
-                  ] || '0'
-                ),
-                amountBase
-              ).toString();
-
-            await currentUser.save();
-          }
-        } catch (rollbackErr) {
-          console.error(
-            '[WithdrawalService] Balance rollback failed:',
-            rollbackErr
-          );
-        }
-      }
-
-      if (tx) {
-        try {
-          tx.status =
-            'failed';
-
-          tx.metadata = {
-            ...tx.metadata,
-
-            error:
-              (error as Error)
-                .message,
-
-            broadcasted,
-          };
-
-          await tx.save();
-        } catch {
-          // Preserve original withdrawal error.
-        }
-      }
-
-      throw error;
-    }
-  }
-        }
+    
