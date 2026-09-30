@@ -76,6 +76,11 @@ export interface RecoveryResult {
  * - withdrawal and recovery share the same distributed lock
  * - partial recovery remains retryable
  * - processing records can be reopened after worker crashes
+ *
+ * Written-off amounts (metadata.gasRecoveryWrittenOffNano) are
+ * portions of the advance that were charged to the user's internal
+ * balance by WithdrawalService. They are permanently excluded from
+ * the obligation so the same nanoTON can never be recovered twice.
  */
 export class GasRecoveryService {
   private walletService: WalletService;
@@ -144,6 +149,9 @@ export class GasRecoveryService {
 
           'metadata.gasRecoveryPendingAmountNano':
             params.gasAdvanceAmountNano.toString(),
+
+          'metadata.gasRecoveryWrittenOffNano':
+            '0',
 
           'metadata.gasRecoveryProcessingAt':
             null,
@@ -329,9 +337,22 @@ export class GasRecoveryService {
             '0'
         );
 
+      /**
+       * Portions of the advance already charged to the user's
+       * internal balance by WithdrawalService. These nanoTON
+       * are permanently settled and must never be recovered
+       * again.
+       */
+      const writtenOffNano =
+        BigInt(
+          meta.gasRecoveryWrittenOffNano ||
+            '0'
+        );
+
       const stillOwed =
         adminAdvancedNano -
-        alreadyRecoveredNano;
+        alreadyRecoveredNano -
+        writtenOffNano;
 
       /**
        * No outstanding company gas.
@@ -347,6 +368,7 @@ export class GasRecoveryService {
             `wallet=${record.walletAddress} ` +
             `gasAdvancedNanoTon=${adminAdvancedNano} ` +
             `recoveredNanoTon=${alreadyRecoveredNano} ` +
+            `writtenOffNanoTon=${writtenOffNano} ` +
             `recoveryStatus=completed`
         );
 
@@ -487,6 +509,7 @@ export class GasRecoveryService {
             `gasAdvancedNanoTon=${adminAdvancedNano} ` +
             `recoverableNanoTon=0 ` +
             `recoveredNanoTon=${alreadyRecoveredNano} ` +
+            `writtenOffNanoTon=${writtenOffNano} ` +
             `recoveryStatus=partial ` +
             `reason=Nothing currently recoverable from the platform advance.`
         );
@@ -545,6 +568,7 @@ export class GasRecoveryService {
             `gasAdvancedNanoTon=${adminAdvancedNano} ` +
             `recoverableNanoTon=${adminGasRemaining} ` +
             `recoveredNanoTon=${alreadyRecoveredNano} ` +
+            `writtenOffNanoTon=${writtenOffNano} ` +
             `recoveryStatus=partial ` +
             `reason=Balance is currently below the safe recovery-send threshold.`
         );
@@ -610,6 +634,7 @@ export class GasRecoveryService {
           `guaranteedUserOutputNano=${guaranteedUserOutputNano} ` +
           `recoverableNanoTon=${adminGasRemaining} ` +
           `recoveredNanoTon=${safeRecoverable} ` +
+          `writtenOffNanoTon=${writtenOffNano} ` +
           `recoveryStatus=${finalStatus}`
       );
 
@@ -693,11 +718,19 @@ export class GasRecoveryService {
             '0'
         );
 
+      const writtenOffNano =
+        BigInt(
+          meta.gasRecoveryWrittenOffNano ||
+            '0'
+        );
+
       const pendingNano =
         adminAdvancedNano >
-        alreadyRecoveredNano
+        alreadyRecoveredNano +
+          writtenOffNano
           ? adminAdvancedNano -
-            alreadyRecoveredNano
+            alreadyRecoveredNano -
+            writtenOffNano
           : 0n;
 
       await Transaction.findByIdAndUpdate(
@@ -816,5 +849,5 @@ export function gasTonToNano(
     gasTon,
     TON_DECIMALS
   );
-          }
-          
+  }
+  
