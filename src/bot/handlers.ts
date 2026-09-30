@@ -1220,7 +1220,7 @@ async function showHistory(userId: number, chatId: number, page: number): Promis
   const caption = [
     terminalHeader(
       'MARKET',
-      '⚡ live pricing · 🔄 provider fallback · 📊 24h movement',
+      '⚡ live pricing · 📊 24h movement',
     ),
     '',
     ...asset('🔷', atfPrice, 'ATF', 6),
