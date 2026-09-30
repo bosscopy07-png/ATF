@@ -340,6 +340,16 @@ export class GasRecoveryService {
         adminAdvancedNano <= 0n ||
         stillOwed <= 0n
       ) {
+        console.log(
+          `[GasRecovery] Recovery already settled: ` +
+            `swap=${record.swapTransactionId} ` +
+            `user=${record.userId} ` +
+            `wallet=${record.walletAddress} ` +
+            `gasAdvancedNanoTon=${adminAdvancedNano} ` +
+            `recoveredNanoTon=${alreadyRecoveredNano} ` +
+            `recoveryStatus=completed`
+        );
+
         return await this.settle(
           claimed,
           'completed',
@@ -381,10 +391,81 @@ export class GasRecoveryService {
             preAdvanceBalanceNano
           : 0n;
 
+      /**
+       * A genuinely successful ATF → TON swap delivers TON
+       * output to the user's wallet. That output belongs to
+       * the user and must never be mistaken for recoverable
+       * platform gas.
+       *
+       * The stored quote's minAskUnits is the on-chain
+       * GUARANTEED minimum swap output, so at least that much
+       * of the balance increase is definitely user-owned
+       * output, not platform gas.
+       *
+       * A swap that failed before broadcast produced no
+       * output, so the entire increase above the pre-advance
+       * balance is still platform gas — existing failed-swap
+       * behavior is preserved exactly.
+       */
+      const swapSucceeded =
+        claimed.status ===
+          'completed' ||
+        meta.swapBroadcasted ===
+          true;
+
+      let guaranteedUserOutputNano =
+        0n;
+
+      if (swapSucceeded) {
+        try {
+          const minAskUnits =
+            meta.quote?.minAskUnits;
+
+          if (
+            minAskUnits !==
+              undefined &&
+            minAskUnits !==
+              null &&
+            minAskUnits !==
+              ''
+          ) {
+            guaranteedUserOutputNano =
+              BigInt(
+                minAskUnits.toString()
+              );
+          }
+        } catch {
+          guaranteedUserOutputNano =
+            0n;
+        }
+      }
+
+      const advanceAttributedIncrease =
+        guaranteedUserOutputNano >
+        0n
+          ? netIncreaseFromAdvance >
+            guaranteedUserOutputNano
+            ? netIncreaseFromAdvance -
+              guaranteedUserOutputNano
+            : 0n
+          : netIncreaseFromAdvance;
+
+      /**
+       * Recoverable platform gas is capped by:
+       *
+       * 1. the recorded advance obligation still owed
+       *    (stillOwed), and
+       * 2. the balance increase attributable to the advance
+       *    itself.
+       *
+       * The user's entire wallet balance is NEVER treated as
+       * recoverable, and never more than the recorded advance
+       * can be recovered.
+       */
       const adminGasRemaining =
         min2(
           stillOwed,
-          netIncreaseFromAdvance
+          advanceAttributedIncrease
         );
 
       /**
@@ -398,6 +479,18 @@ export class GasRecoveryService {
       if (
         adminGasRemaining <= 0n
       ) {
+        console.log(
+          `[GasRecovery] ${swapSucceeded ? 'Successful' : 'Failed'} ATF→TON recovery pending: ` +
+            `swap=${record.swapTransactionId} ` +
+            `user=${record.userId} ` +
+            `wallet=${record.walletAddress} ` +
+            `gasAdvancedNanoTon=${adminAdvancedNano} ` +
+            `recoverableNanoTon=0 ` +
+            `recoveredNanoTon=${alreadyRecoveredNano} ` +
+            `recoveryStatus=partial ` +
+            `reason=Nothing currently recoverable from the platform advance.`
+        );
+
         return await this.settle(
           claimed,
           'partial',
@@ -444,6 +537,18 @@ export class GasRecoveryService {
       if (
         safeRecoverable <= 0n
       ) {
+        console.log(
+          `[GasRecovery] ${swapSucceeded ? 'Successful' : 'Failed'} ATF→TON recovery pending: ` +
+            `swap=${record.swapTransactionId} ` +
+            `user=${record.userId} ` +
+            `wallet=${record.walletAddress} ` +
+            `gasAdvancedNanoTon=${adminAdvancedNano} ` +
+            `recoverableNanoTon=${adminGasRemaining} ` +
+            `recoveredNanoTon=${alreadyRecoveredNano} ` +
+            `recoveryStatus=partial ` +
+            `reason=Balance is currently below the safe recovery-send threshold.`
+        );
+
         return await this.settle(
           claimed,
           'partial',
@@ -481,6 +586,32 @@ export class GasRecoveryService {
           ? adminAdvancedNano -
             newTotalRecovered
           : 0n;
+
+      /**
+       * The exact consumed amount is not knowable
+       * synchronously; this is a proven lower bound
+       * (advance minus the increase attributable to the
+       * advance). No transaction fee is guessed.
+       */
+      const consumedLowerBoundNano =
+        adminAdvancedNano >
+        advanceAttributedIncrease
+          ? adminAdvancedNano -
+            advanceAttributedIncrease
+          : 0n;
+
+      console.log(
+        `[GasRecovery] ${swapSucceeded ? 'Successful' : 'Failed'} ATF→TON recovery: ` +
+          `swap=${record.swapTransactionId} ` +
+          `user=${record.userId} ` +
+          `wallet=${record.walletAddress} ` +
+          `gasAdvancedNanoTon=${adminAdvancedNano} ` +
+          `gasConsumedNanoTon>=${consumedLowerBoundNano} ` +
+          `guaranteedUserOutputNano=${guaranteedUserOutputNano} ` +
+          `recoverableNanoTon=${adminGasRemaining} ` +
+          `recoveredNanoTon=${safeRecoverable} ` +
+          `recoveryStatus=${finalStatus}`
+      );
 
       /**
        * Audit the actual recovery transfer.
@@ -539,6 +670,10 @@ export class GasRecoveryService {
     } catch (error: any) {
       /**
        * Never mark failed recovery as completed.
+       *
+       * The swap itself is NEVER touched here — a recovery
+       * failure must never change a successful swap into a
+       * failed one.
        */
       const meta =
         claimed.metadata as Record<
@@ -681,4 +816,5 @@ export function gasTonToNano(
     gasTon,
     TON_DECIMALS
   );
-        }
+          }
+          
