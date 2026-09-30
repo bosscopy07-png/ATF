@@ -1048,7 +1048,7 @@ export class SwapService {
        * This is critical because the swap record is where the
        * gas-recovery audit state is stored.
        */
-      tx =
+            tx =
         await Transaction.create({
           userId:
             user._id,
@@ -1328,12 +1328,59 @@ export class SwapService {
 
       /**
        * The swap has now actually been broadcast.
+       *
+       * IMPORTANT:
+       *
+       * Do NOT call tx.save() here.
+       *
+       * The in-memory `tx` document was created BEFORE
+       * GasRecoveryService.recordAdvance() wrote the
+       * recovery audit fields
+       * (metadata.gasRecoveryStatus, metadata.gasAdvanceAmountNano,
+       *  metadata.gasRecoveryWalletAddress, ...)
+       * directly into the database.
+       *
+       * tx.save() would replace the whole metadata
+       * subdocument with this stale in-memory copy, ERASING
+       * the recovery state. The recovery claim
+       * (metadata.gasRecoveryStatus ∈ pending/partial/failed)
+       * would then never match, and the platform's gas
+       * advance would never be recovered after a successful
+       * swap.
+       *
+       * Use a targeted atomic update that only writes the
+       * swap result fields and leaves the recovery metadata
+       * intact.
        */
-      tx.txHash =
-        txHash;
+      await Transaction.updateOne(
+        {
+          _id: tx._id,
+        },
+        {
+          $set: {
+            txHash,
 
-      tx.status =
-        'completed';
+            status:
+              'completed',
+
+            toAddress:
+              swapParams.to,
+
+            'metadata.swapBroadcasted':
+              true,
+          },
+        }
+      );
+
+      /**
+       * Keep the in-memory copy consistent for the
+       * catch-path broadcasted check.
+       *
+       * This in-memory document is NEVER persisted again.
+       */
+      tx.txHash = txHash;
+
+      tx.status = 'completed';
 
       tx.toAddress =
         swapParams.to;
@@ -1344,8 +1391,6 @@ export class SwapService {
         swapBroadcasted:
           true,
       };
-
-      await tx.save();
 
       /* ─────────────────────────────────────────
          SUCCESSFUL ATF → TON GAS RECOVERY
@@ -1368,6 +1413,14 @@ export class SwapService {
          */
         const swapTransactionId =
           tx._id.toString();
+
+        console.log(
+          `[SwapService] Scheduling post-success gas recovery: ` +
+            `swap=${swapTransactionId} ` +
+            `user=${userId} ` +
+            `wallet=${walletAddress} ` +
+            `delayMs=${config.postSwapGasRecoveryDelayMs}`
+        );
 
         setTimeout(
           () => {
@@ -1526,7 +1579,6 @@ export class SwapService {
         }
       }
 
-      
       /* ─────────────────────────────────────────
          FINAL TRANSACTION UPDATE
          ───────────────────────────────────────── */
@@ -1684,4 +1736,4 @@ export class SwapService {
       );
     }
   }
-}
+          }
