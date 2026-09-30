@@ -918,7 +918,7 @@ export class WithdrawalService {
            * breached portion by charging the user's internal
            * TON balance and writing off the recovery reserve.
            */
-          await this.chargeGasReserveShortfall(
+            await this.chargeGasReserveShortfall(
             user,
             walletAddress,
             shortfall
@@ -1036,4 +1036,234 @@ export class WithdrawalService {
             amountBase.toString(),
 
           fee:
-    
+            feeBase.toString(),
+
+          feeAsset:
+            request.asset,
+
+          feePercentage:
+            config.platformWithdrawalFeePercent ||
+              0,
+
+          feeWallet:
+            config.adminFeeWalletAddress,
+
+          feeStatus:
+            'pending',
+
+          status:
+            'processing',
+
+          toAddress:
+            request.toAddress,
+
+          txHash:
+            provisionalTxHash(
+              'withdrawal'
+            ),
+
+          metadata: {
+            requestedAmount:
+              request.amount,
+
+            destination:
+              request.toAddress,
+
+            platformFee:
+              Precision.fromBaseUnits(
+                feeBase,
+                decimals
+              ),
+
+            networkCost:
+              Precision.fromBaseUnits(
+                networkCostBase,
+                TON_DECIMALS
+              ),
+
+            sendAmount:
+              Precision.fromBaseUnits(
+                sendBase,
+                decimals
+              ),
+
+            gasReserveProtected:
+              request.asset ===
+              'TON',
+          },
+        });
+
+      /**
+       * 1. Send withdrawal to destination.
+       */
+      let txHash: string;
+
+      if (
+        request.asset ===
+        'TON'
+      ) {
+        txHash =
+          await this.walletService.sendTon(
+            request.userId,
+            request.toAddress,
+            sendBase
+          );
+      } else {
+        txHash =
+          await this.walletService.sendJetton(
+            request.userId,
+            request.toAddress,
+            config.atfJettonAddress!,
+            sendBase
+          );
+      }
+
+      tx.txHash =
+        txHash;
+
+      tx.status =
+        'completed';
+
+      await tx.save();
+
+      /**
+       * 2. Send platform fee to admin.
+       */
+      if (
+        feeBase > 0n
+      ) {
+        try {
+          let feeTxHash: string;
+
+          if (
+            request.asset ===
+            'TON'
+          ) {
+            feeTxHash =
+              await this.walletService.sendTon(
+                request.userId,
+                config.adminFeeWalletAddress,
+                feeBase
+              );
+          } else {
+            feeTxHash =
+              await this.walletService.sendJetton(
+                request.userId,
+                config.adminFeeWalletAddress,
+                config.atfJettonAddress!,
+                feeBase
+              );
+          }
+
+          tx.feeTxHash =
+            feeTxHash;
+
+          tx.feeStatus =
+            'completed';
+
+          await tx.save();
+        } catch (feeErr) {
+          console.error(
+            '[WithdrawalService] Fee transfer failed:',
+            feeErr
+          );
+
+          tx.feeStatus =
+            'failed';
+
+          tx.metadata = {
+            ...tx.metadata,
+
+            feeError:
+              (feeErr as Error)
+                .message,
+          };
+
+          await tx.save();
+        }
+      }
+
+      return tx._id.toString();
+    } catch (error) {
+      const broadcasted =
+        tx?.txHash &&
+        !tx.txHash.startsWith(
+          'withdrawal-'
+        );
+
+      /**
+       * Only roll back internal balance if the actual blockchain
+       * withdrawal was NOT broadcast.
+       *
+       * NOTE: the gas-reserve settlement charge applied earlier
+       * is deliberately NOT rolled back — it settled a real,
+       * already-consumed platform gas obligation.
+       */
+      if (
+        deducted &&
+        !broadcasted
+      ) {
+        try {
+          const currentUser =
+            await User.findById(
+              user._id
+            );
+
+          if (currentUser) {
+            const balanceKey =
+              request.asset === 'TON'
+                ? 'tonBalance'
+                : 'atfBalance';
+
+            currentUser[balanceKey] =
+              Precision.add(
+                BigInt(
+                  currentUser[
+                    balanceKey
+                  ] || '0'
+                ),
+                amountBase
+              ).toString();
+
+            await currentUser.save();
+          }
+        } catch (rollbackErr) {
+          console.error(
+            '[WithdrawalService] Balance rollback failed:',
+            rollbackErr
+          );
+        }
+      }
+
+      if (tx) {
+        try {
+          tx.status =
+            'failed';
+
+          tx.metadata = {
+            ...tx.metadata,
+
+            error:
+              (error as Error)
+                .message,
+
+            broadcasted,
+          };
+
+          await tx.save();
+        } catch {
+          // Preserve original withdrawal error.
+        }
+      }
+
+      throw error;
+    }
+  }
+}
+
+function minBigInt(
+  a: bigint,
+  b: bigint
+): bigint {
+  return a < b ? a : b;
+            }
