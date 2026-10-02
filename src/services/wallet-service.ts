@@ -3,7 +3,7 @@ import {
   mnemonicToWalletKey,
   KeyPair,
 } from '@ton/crypto';
-
+ 
 import {
   WalletContractV4,
   WalletContractV5R1,
@@ -17,12 +17,12 @@ import {
   JettonMaster,
   JettonWallet,
 } from '@ton/ton';
-
+ 
 import { encrypt, decrypt } from '../utils/encryption';
 import { Wallet, IWallet } from '../models/Wallet';
 import { User } from '../models/User';
 import { config } from '../config';
-
+ 
 /**
  * Supported wallet contracts.
  *
@@ -30,7 +30,7 @@ import { config } from '../config';
  * but they produce different addresses.
  */
 export type WalletVersion = 'v4r2' | 'v5r1';
-
+ 
 export interface DerivedWallet {
   version: WalletVersion;
   address: string;
@@ -40,13 +40,13 @@ export interface DerivedWallet {
   hasTransactions: boolean;
   deployed: boolean;
 }
-
+ 
 export interface ISigner {
   getAddress(
     publicKey: Buffer,
     version?: WalletVersion
   ): string;
-
+ 
   signTransfer(
     wallet:
       | WalletContractV4
@@ -56,7 +56,7 @@ export interface ISigner {
     messages: any[]
   ): Cell;
 }
-
+ 
 /**
  * Default local signer.
  *
@@ -80,23 +80,23 @@ class LocalSigner implements ISigner {
               : -239,
         },
       });
-
+ 
       return wallet.address.toString({
         bounceable: false,
       });
     }
-
+ 
     const wallet = WalletContractV4.create({
       publicKey,
       workchain: 0,
       walletId: 0x29a9a317,
     });
-
+ 
     return wallet.address.toString({
       bounceable: false,
     });
   }
-
+ 
   signTransfer(
     wallet:
       | WalletContractV4
@@ -111,12 +111,11 @@ class LocalSigner implements ISigner {
         secretKey,
         messages,
         sendMode:
-          SendMode.PAY_GAS_SEPARATELY |
-          SendMode.IGNORE_ERRORS,
+          SendMode.PAY_GAS_SEPARATELY,
         timeout: Math.floor(Date.now() / 1000) + 60,
       });
     }
-
+ 
     return wallet.createTransfer({
       seqno,
       secretKey,
@@ -124,11 +123,11 @@ class LocalSigner implements ISigner {
     });
   }
 }
-
+ 
 export class WalletService {
   private client: TonClient;
   private signer: ISigner;
-
+ 
   /**
    * TON mainnet:
    *   -239
@@ -137,25 +136,25 @@ export class WalletService {
    *   -3
    */
   private readonly v5NetworkGlobalId: number;
-
+ 
   constructor(signer?: ISigner) {
     this.client = new TonClient({
       endpoint: config.tonRpcUrl,
       apiKey: config.tonApiKey,
     });
-
+ 
     this.signer = signer || new LocalSigner();
-
+ 
     this.v5NetworkGlobalId =
       process.env.TON_NETWORK === 'testnet'
         ? -3
         : -239;
   }
-
+ 
   // ===========================================================================
   // WALLET CONTRACT CREATION
   // ===========================================================================
-
+ 
   /**
    * Create a V4R2 contract from a keypair.
    */
@@ -168,7 +167,7 @@ export class WalletService {
       walletId: 0x29a9a317,
     });
   }
-
+ 
   /**
    * Create a V5R1 / W5 contract from a keypair.
    */
@@ -183,7 +182,7 @@ export class WalletService {
       },
     });
   }
-
+ 
   /**
    * Create the correct contract for a wallet version.
    */
@@ -194,14 +193,14 @@ export class WalletService {
     if (version === 'v5r1') {
       return this.createV5Wallet(publicKey);
     }
-
+ 
     return this.createV4Wallet(publicKey);
   }
-
+ 
   // ===========================================================================
   // ADDRESS DERIVATION
   // ===========================================================================
-
+ 
   /**
    * Derive an address for a specific wallet version.
    */
@@ -213,12 +212,12 @@ export class WalletService {
       keyPair.publicKey,
       version
     );
-
+ 
     return wallet.address.toString({
       bounceable: false,
     });
   }
-
+ 
   /**
    * Derive BOTH V4 and W5 addresses from one mnemonic.
    *
@@ -231,30 +230,30 @@ export class WalletService {
     v5: DerivedWallet;
   }> {
     const words = this.normalizeMnemonic(mnemonicPhrase);
-
+ 
     const keyPair = await mnemonicToWalletKey(words);
-
+ 
     const v4Contract = this.createV4Wallet(
       keyPair.publicKey
     );
-
+ 
     const v5Contract = this.createV5Wallet(
       keyPair.publicKey
     );
-
+ 
     const v4Address = v4Contract.address.toString({
       bounceable: false,
     });
-
+ 
     const v5Address = v5Contract.address.toString({
       bounceable: false,
     });
-
+ 
     const [v4Info, v5Info] = await Promise.all([
       this.inspectAddress(v4Address),
       this.inspectAddress(v5Address),
     ]);
-
+ 
     return {
       v4: {
         version: 'v4r2',
@@ -263,7 +262,7 @@ export class WalletService {
         contract: v4Contract,
         ...v4Info,
       },
-
+ 
       v5: {
         version: 'v5r1',
         address: v5Address,
@@ -273,11 +272,11 @@ export class WalletService {
       },
     };
   }
-
+ 
   // ===========================================================================
   // ADDRESS INSPECTION / AUTOMATIC DETECTION
   // ===========================================================================
-
+ 
   /**
    * Inspect an address to determine whether it appears to be an
    * existing/used wallet.
@@ -291,36 +290,36 @@ export class WalletService {
   }> {
     try {
       const parsed = Address.parse(address);
-
+ 
       const balance =
         await this.client.getBalance(parsed);
-
+ 
       let hasTransactions = false;
-
+ 
       try {
         const transactions =
           await this.client.getTransactions(parsed, {
             limit: 1,
           });
-
+ 
         hasTransactions = transactions.length > 0;
       } catch {
         // Some providers can return balance successfully
         // while transaction history is temporarily unavailable.
       }
-
+ 
       let deployed = false;
-
+ 
       try {
         const state =
           await this.client.getContractState(parsed);
-
+ 
         deployed =
           state.state === 'active';
       } catch {
         // Ignore state lookup failure.
       }
-
+ 
       return {
         balance,
         hasTransactions,
@@ -334,7 +333,7 @@ export class WalletService {
       };
     }
   }
-
+ 
   /**
    * Automatically determine which wallet version is actually being used.
    *
@@ -357,17 +356,17 @@ export class WalletService {
   }> {
     const wallets =
       await this.deriveAllWallets(mnemonicPhrase);
-
+ 
     const v4Used =
       wallets.v4.balance > 0n ||
       wallets.v4.hasTransactions ||
       wallets.v4.deployed;
-
+ 
     const v5Used =
       wallets.v5.balance > 0n ||
       wallets.v5.hasTransactions ||
       wallets.v5.deployed;
-
+ 
     if (v4Used && !v5Used) {
       return {
         version: 'v4r2',
@@ -375,7 +374,7 @@ export class WalletService {
         ...wallets,
       };
     }
-
+ 
     if (v5Used && !v4Used) {
       return {
         version: 'v5r1',
@@ -383,7 +382,7 @@ export class WalletService {
         ...wallets,
       };
     }
-
+ 
     if (v4Used && v5Used) {
       throw new Error(
         [
@@ -396,7 +395,7 @@ export class WalletService {
         ].join('\n')
       );
     }
-
+ 
     /**
      * No activity.
      *
@@ -409,11 +408,11 @@ export class WalletService {
       ...wallets,
     };
   }
-
+ 
   // ===========================================================================
   // MNEMONIC HELPERS
   // ===========================================================================
-
+ 
   private normalizeMnemonic(
     mnemonicPhrase: string
   ): string[] {
@@ -421,26 +420,26 @@ export class WalletService {
       .trim()
       .toLowerCase()
       .split(/\s+/);
-
+ 
     if (words.length !== 24) {
       throw new Error(
         'Invalid mnemonic: must contain exactly 24 words'
       );
     }
-
+ 
     return words;
   }
-
+ 
   private mnemonicToString(
     words: string[]
   ): string {
     return words.join(' ');
   }
-
+ 
   // ===========================================================================
   // CREATE WALLET
   // ===========================================================================
-
+ 
   /**
    * Create a brand-new V5 wallet.
    *
@@ -453,28 +452,28 @@ export class WalletService {
     const user = await User.findOne({
       telegramId: userId,
     });
-
+ 
     if (!user) {
       throw new Error('User not found');
     }
-
+ 
     const mnemonic =
       await mnemonicNew(24);
-
+ 
     const keyPair =
       await mnemonicToWalletKey(mnemonic);
-
+ 
     /**
      * New wallets use V5R1.
      */
     const version: WalletVersion = 'v5r1';
-
+ 
     const address =
       this.getAddressFromKeyPair(
         keyPair,
         version
       );
-
+ 
     const {
       encrypted,
       iv,
@@ -482,7 +481,7 @@ export class WalletService {
     } = encrypt(
       this.mnemonicToString(mnemonic)
     );
-
+ 
     return Wallet.create({
       userId: user._id,
       address,
@@ -493,11 +492,11 @@ export class WalletService {
       walletVersion: version,
     });
   }
-
+ 
   // ===========================================================================
   // IMPORT WALLET
   // ===========================================================================
-
+ 
   /**
    * Import wallet.
    *
@@ -519,24 +518,24 @@ export class WalletService {
     const user = await User.findOne({
       telegramId: userId,
     });
-
+ 
     if (!user) {
       throw new Error('User not found');
     }
-
+ 
     const words =
       this.normalizeMnemonic(
         mnemonicPhrase
       );
-
+ 
     const normalizedMnemonic =
       this.mnemonicToString(words);
-
+ 
     const keyPair =
       await mnemonicToWalletKey(words);
-
+ 
     let version: WalletVersion;
-
+ 
     if (walletVersion) {
       version = walletVersion;
     } else {
@@ -544,22 +543,22 @@ export class WalletService {
         await this.detectWalletVersion(
           normalizedMnemonic
         );
-
+ 
       version = detected.version;
     }
-
+ 
     const address =
       this.getAddressFromKeyPair(
         keyPair,
         version
       );
-
+ 
     const {
       encrypted,
       iv,
       tag,
     } = encrypt(normalizedMnemonic);
-
+ 
     /**
      * IMPORTANT:
      *
@@ -576,22 +575,22 @@ export class WalletService {
       walletVersion: version,
     });
   }
-
+ 
   // ===========================================================================
   // WALLET LOOKUP
   // ===========================================================================
-
+ 
   async getWallet(
     userId: number
   ): Promise<IWallet | null> {
     const user = await User.findOne({
       telegramId: userId,
     });
-
+ 
     if (!user) {
       return null;
     }
-
+ 
     /**
      * First use explicitly selected active wallet.
      */
@@ -600,12 +599,12 @@ export class WalletService {
         await Wallet.findById(
           user.activeWalletId
         );
-
+ 
       if (active) {
         return active;
       }
     }
-
+ 
     /**
      * Fallback to newest wallet.
      */
@@ -615,35 +614,35 @@ export class WalletService {
       createdAt: -1,
     });
   }
-
+ 
   async getWallets(
     userId: number
   ): Promise<IWallet[]> {
     const user = await User.findOne({
       telegramId: userId,
     });
-
+ 
     if (!user) {
       return [];
     }
-
+ 
     return Wallet.find({
       userId: user._id,
     }).sort({
       createdAt: 1,
     });
   }
-
+ 
   async getWalletById(
     walletId: string
   ): Promise<IWallet | null> {
     return Wallet.findById(walletId);
   }
-
+ 
   // ===========================================================================
   // KEYPAIR
   // ===========================================================================
-
+ 
   /**
    * Get keypair for a specific wallet document.
    */
@@ -652,16 +651,16 @@ export class WalletService {
   ): Promise<KeyPair> {
     const wallet =
       await this.getWallet(userId);
-
+ 
     if (!wallet) {
       throw new Error('Wallet not found');
     }
-
+ 
     return this.getKeyPairForWallet(
       wallet
     );
   }
-
+ 
   private async getKeyPairForWallet(
     wallet: IWallet
   ): Promise<KeyPair> {
@@ -671,19 +670,19 @@ export class WalletService {
         wallet.iv,
         wallet.tag
       );
-
+ 
     const words =
       this.normalizeMnemonic(
         mnemonicPhrase
       );
-
+ 
     return mnemonicToWalletKey(words);
   }
-
+ 
   // ===========================================================================
   // WALLET VERSION RECOVERY
   // ===========================================================================
-
+ 
   /**
    * Existing wallet documents created before walletVersion was added
    * will have no version.
@@ -698,14 +697,14 @@ export class WalletService {
       (wallet as any).walletVersion as
         | WalletVersion
         | undefined;
-
+ 
     if (
       storedVersion === 'v4r2' ||
       storedVersion === 'v5r1'
     ) {
       return storedVersion;
     }
-
+ 
     /**
      * Backward compatibility for your old V4-only database.
      */
@@ -714,19 +713,19 @@ export class WalletService {
         keyPair,
         'v4r2'
       );
-
+ 
     const v5Address =
       this.getAddressFromKeyPair(
         keyPair,
         'v5r1'
       );
-
+ 
     const storedAddress =
       Address.parse(wallet.address)
         .toString({
           bounceable: false,
         });
-
+ 
     if (
       storedAddress ===
       Address.parse(v4Address).toString({
@@ -735,7 +734,7 @@ export class WalletService {
     ) {
       return 'v4r2';
     }
-
+ 
     if (
       storedAddress ===
       Address.parse(v5Address).toString({
@@ -744,16 +743,44 @@ export class WalletService {
     ) {
       return 'v5r1';
     }
-
+ 
     throw new Error(
       'Unable to determine wallet version from stored address'
     );
   }
-
+ 
   // ===========================================================================
   // BALANCES
   // ===========================================================================
-
+ 
+  /** Strict on-chain TON balance read for money-recovery paths.
+   * Unlike getBalance(), this never converts an RPC failure into zero.
+   */
+  async getTonBalanceStrict(address: string): Promise<bigint> {
+    return this.client.getBalance(Address.parse(address));
+  }
+ 
+  /** Strict balance read used by reconciliation/recovery.
+   * RPC failures are thrown instead of being converted to zero.
+   */
+  async getBalanceStrict(
+    address: string
+  ): Promise<{
+    ton: bigint;
+    atf: bigint;
+  }> {
+    const ton = await this.client.getBalance(Address.parse(address));
+ 
+    const jettonMaster = this.client.open(
+      JettonMaster.create(Address.parse(config.atfJettonAddress))
+    );
+    const jettonWalletAddress = await jettonMaster.getWalletAddress(Address.parse(address));
+    const jettonWallet = this.client.open(JettonWallet.create(jettonWalletAddress));
+    const atf = await jettonWallet.getBalance();
+ 
+    return { ton, atf };
+  }
+ 
   async getBalance(
     address: string
   ): Promise<{
@@ -762,7 +789,7 @@ export class WalletService {
   }> {
     let tonBalance = 0n;
     let atfBalance = 0n;
-
+ 
     try {
       tonBalance =
         await this.client.getBalance(
@@ -774,7 +801,7 @@ export class WalletService {
         error
       );
     }
-
+ 
     try {
       const jettonMaster =
         this.client.open(
@@ -784,19 +811,19 @@ export class WalletService {
             )
           )
         );
-
+ 
       const jettonWalletAddress =
         await jettonMaster.getWalletAddress(
           Address.parse(address)
         );
-
+ 
       const jettonWallet =
         this.client.open(
           JettonWallet.create(
             jettonWalletAddress
           )
         );
-
+ 
       atfBalance =
         await jettonWallet.getBalance();
     } catch {
@@ -805,17 +832,17 @@ export class WalletService {
        */
       atfBalance = 0n;
     }
-
+ 
     return {
       ton: tonBalance,
       atf: atfBalance,
     };
   }
-
+ 
   // ===========================================================================
   // WALLET CONTRACT FOR USER
   // ===========================================================================
-
+ 
   private async getWalletContext(
     userId: number
   ): Promise<{
@@ -828,30 +855,30 @@ export class WalletService {
   }> {
     const walletDoc =
       await this.getWallet(userId);
-
+ 
     if (!walletDoc) {
       throw new Error(
         'Wallet not found'
       );
     }
-
+ 
     const keyPair =
       await this.getKeyPairForWallet(
         walletDoc
       );
-
+ 
     const version =
       await this.getWalletVersion(
         walletDoc,
         keyPair
       );
-
+ 
     const contract =
       this.createWalletContract(
         keyPair.publicKey,
         version
       );
-
+ 
     /**
      * Safety check.
      *
@@ -862,13 +889,13 @@ export class WalletService {
       contract.address.toString({
         bounceable: false,
       });
-
+ 
     const storedAddress =
       Address.parse(walletDoc.address)
         .toString({
           bounceable: false,
         });
-
+ 
     if (
       derivedAddress !== storedAddress
     ) {
@@ -881,7 +908,7 @@ export class WalletService {
         ].join('\n')
       );
     }
-
+ 
     /**
      * Persist version for old V4 wallets.
      */
@@ -898,7 +925,7 @@ export class WalletService {
         }
       );
     }
-
+ 
     return {
       walletDoc,
       keyPair,
@@ -906,303 +933,5 @@ export class WalletService {
       contract,
     };
   }
-
-  // ===========================================================================
-  // SEND TON
-  // ===========================================================================
-
-  async sendTon(
-    userId: number,
-    toAddress: string,
-    amount: bigint,
-    body?: Cell | string
-  ): Promise<string> {
-    const {
-      walletDoc,
-      keyPair,
-      contract,
-      version,
-    } = await this.getWalletContext(userId);
-
-    const destination = Address.parse(toAddress);
-    const opened = this.client.open(contract);
-    const seqno = await opened.getSeqno();
-
-    const message = internal({
-      to: destination,
-      value: amount,
-      bounce: false,
-      body,
-    });
-
-    let transfer: Cell;
-
-    if (version === 'v5r1') {
-      transfer = (contract as WalletContractV5R1).createTransfer({
-        seqno,
-        secretKey: keyPair.secretKey,
-        messages: [message],
-        sendMode:
-          SendMode.PAY_GAS_SEPARATELY |
-          SendMode.IGNORE_ERRORS,
-        timeout: Math.floor(Date.now() / 1000) + 60,
-      });
-    } else {
-      transfer = (contract as WalletContractV4).createTransfer({
-        seqno,
-        secretKey: keyPair.secretKey,
-        messages: [message],
-      });
-    }
-
-    await this.client.sendExternalMessage(opened, transfer);
-    return this.waitForTransaction(opened, walletDoc.address, seqno);
-  }
-  
-
-  // ===========================================
-  async sendJetton(
-    userId: number,
-    toAddress: string,
-    jettonMasterAddress: string,
-    amount: bigint
-  ): Promise<string> {
-    const {
-      walletDoc,
-      keyPair,
-      contract,
-      version,
-    } = await this.getWalletContext(userId);
-
-    const ownerAddress = Address.parse(walletDoc.address);
-    const destination = Address.parse(toAddress);
-    const userJettonWallet = await this.deriveJettonWallet(
-      walletDoc.address,
-      jettonMasterAddress
-    );
-
-    const transferBody = beginCell()
-      .storeUint(0x0f8a7ea5, 32)
-      .storeUint(BigInt(Math.floor(Date.now() / 1000)), 64)
-      .storeCoins(amount)
-      .storeAddress(destination)
-      .storeAddress(ownerAddress)
-      .storeBit(0)
-      .storeCoins(toNano('0.001'))
-      .storeBit(0)
-      .endCell();
-
-    const opened = this.client.open(contract);
-    const seqno = await opened.getSeqno();
-
-    const message = internal({
-      to: userJettonWallet,
-      value: toNano('0.05'),
-      bounce: true,
-      body: transferBody,
-    });
-
-    let transfer: Cell;
-
-    if (version === 'v5r1') {
-      transfer = (contract as WalletContractV5R1).createTransfer({
-        seqno,
-        secretKey: keyPair.secretKey,
-        messages: [message],
-        sendMode:
-          SendMode.PAY_GAS_SEPARATELY |
-          SendMode.IGNORE_ERRORS,
-        timeout: Math.floor(Date.now() / 1000) + 60,
-      });
-    } else {
-      transfer = (contract as WalletContractV4).createTransfer({
-        seqno,
-        secretKey: keyPair.secretKey,
-        messages: [message],
-      });
-    }
-
-    await this.client.sendExternalMessage(opened, transfer);
-    return this.waitForTransaction(opened, walletDoc.address, seqno);
-        }
-  
-
-  // ===========================================================================
-  // JETTON WALLET
-  // ===========================================================================
-
-  async deriveJettonWallet(
-    ownerAddress: string,
-    jettonMasterAddress: string
-  ): Promise<Address> {
-    const master =
-      this.client.open(
-        JettonMaster.create(
-          Address.parse(
-            jettonMasterAddress
-          )
-        )
-      );
-
-    return master.getWalletAddress(
-      Address.parse(ownerAddress)
-    );
-  }
-
-  // ===========================================================================
-  // TRANSACTION WAITING
-  // ===========================================================================
-
-  /**
-   * Wait briefly for the external message to appear on-chain.
-   *
-   * IMPORTANT:
-   * We don't treat "not indexed yet" as a failed transaction.
-   */
-  private async waitForTransaction(
-    opened:
-      | ReturnType<
-          TonClient['open']
-        >,
-    address: string,
-    previousSeqno: number
-  ): Promise<string> {
-    const maxAttempts = 10;
-
-    for (
-      let attempt = 0;
-      attempt < maxAttempts;
-      attempt++
-    ) {
-      await new Promise(
-        resolve =>
-          setTimeout(
-            resolve,
-            1500
-          )
-      );
-
-      try {
-        const currentSeqno =
-          await (opened as any).getSeqno();
-
-        /**
-         * If seqno increased, the external message was consumed.
-         */
-        if (
-          currentSeqno >
-          previousSeqno
-        ) {
-          try {
-            const txs =
-              await this.client.getTransactions(
-                Address.parse(address),
-                {
-                  limit: 5,
-                }
-              );
-
-            if (txs.length > 0) {
-              return txs[0]
-                .hash()
-                .toString('hex');
-            }
-          } catch {
-            // Seqno changed but transaction indexing may lag.
-          }
-
-          return `${address}_${previousSeqno}`;
-        }
-      } catch (error) {
-        console.error(
-          'Failed checking transaction seqno:',
-          error
-        );
-      }
-    }
-
-    /**
-     * We don't claim that a fabricated value is a blockchain
-     * transaction hash.
-     *
-     * This is only a tracking identifier when the provider has
-     * not indexed the transaction yet.
-     */
-    return `${address}_${previousSeqno}_${Date.now()}`;
-  }
-
-  // ===========================================================================
-  // GET ADDRESS
-  // ===========================================================================
-
-  async getAddress(
-    userId: number
-  ): Promise<string | null> {
-    const wallet =
-      await this.getWallet(userId);
-
-    return wallet?.address || null;
-  }
-
-  // ===========================================================================
-  // GET ACTIVE WALLET VERSION
-  // ===========================================================================
-
-  async getWalletVersionForUser(
-    userId: number
-  ): Promise<WalletVersion | null> {
-    const wallet =
-      await this.getWallet(userId);
-
-    if (!wallet) {
-      return null;
-    }
-
-    const keyPair =
-      await this.getKeyPairForWallet(
-        wallet
-      );
-
-    return this.getWalletVersion(
-      wallet,
-      keyPair
-    );
-  }
-
-  // ===========================================================================
-  // GET BOTH DERIVED ADDRESSES
-  // ===========================================================================
-
-  async getDerivedAddresses(
-    userId: number
-  ): Promise<{
-    v4: string;
-    v5: string;
-  }> {
-    const wallet =
-      await this.getWallet(userId);
-
-    if (!wallet) {
-      throw new Error(
-        'Wallet not found'
-      );
-    }
-
-    const keyPair =
-      await this.getKeyPairForWallet(
-        wallet
-      );
-
-    return {
-      v4: this.getAddressFromKeyPair(
-        keyPair,
-        'v4r2'
-      ),
-
-      v5: this.getAddressFromKeyPair(
-        keyPair,
-        'v5r1'
-      ),
-    };
-  }
-}
+ 
+  // ===
