@@ -1035,6 +1035,7 @@ export class SwapService {
       deducted =
         true;
  
+      
       /**
        * Create the swap transaction BEFORE the gas advance.
        *
@@ -1068,4 +1069,668 @@ export class SwapService {
           feePercentage:
             config.platformSwapFeePercent,
  
-          f
+          feeWallet:
+            config.adminFeeWalletAddress,
+ 
+          feeStatus:
+            'pending',
+ 
+          status:
+            'processing',
+ 
+          txHash:
+            provisionalTxHash(
+              'swap'
+            ),
+ 
+          metadata: {
+            swapDirection:
+              direction,
+ 
+            inputAmount:
+              confirmation.inputAmount,
+ 
+            platformFee:
+              confirmation.platformFee,
+ 
+            netSwapAmount:
+              confirmation.netSwapAmount,
+ 
+            expectedOutput:
+              confirmation.expectedOutput,
+ 
+            minOutput:
+              confirmation.minOutput,
+ 
+            slippage:
+              config.maxSlippagePercent,
+ 
+            dexCosts:
+              confirmation.dexCosts,
+ 
+            expiresAt:
+              confirmation.expiresAt,
+ 
+            quote:
+              confirmation.quote,
+ 
+            gasTon:
+              confirmation.gasTon,
+ 
+            minOutputBaseUnits:
+              String(confirmation.quote?.minAskUnits || '0'),
+ 
+            expectedOutputBaseUnits:
+              String(confirmation.quote?.askUnits || '0'),
+ 
+            swapOutcome:
+              'unknown',
+ 
+            walletAddress,
+ 
+            actualOutputBaseUnits:
+              '0',
+ 
+            swapBroadcasted:
+              false,
+          },
+        });
+ 
+      /* ─────────────────────────────────────────
+         ATF → TON:
+         ADMIN ADVANCES GAS
+         ───────────────────────────────────────── */
+ 
+      if (
+        !isTonToAtf &&
+        confirmation.gasTon
+      ) {
+        const gasNano =
+          gasTonToNano(
+            confirmation.gasTon
+          );
+ 
+        await this.adminWallet.initialize();
+ 
+        const adminBalance =
+          await this.adminWallet.getBalance();
+ 
+        if (
+          adminBalance <
+          gasNano
+        ) {
+          throw new Error(
+            'Platform gas treasury temporarily low. Please try again later.'
+          );
+        }
+ 
+        /**
+         * Capture the user's exact TON balance immediately
+         * before the company gas is sent.
+         */
+        const {
+          ton:
+            preAdvanceBalanceRaw,
+        } =
+          await this.walletService.getBalance(
+            walletAddress
+          );
+ 
+        const preAdvanceBalanceNano =
+          BigInt(
+            preAdvanceBalanceRaw.toString()
+          );
+ 
+        /**
+         * Company sends gas to the EXACT wallet.
+         */
+        const gasTxHash =
+          await this.adminWallet.sendTon(
+            walletAddress,
+            gasNano
+          );
+ 
+        /**
+         * Audit the gas advance.
+         */
+        const gasTx =
+          await Transaction.create({
+            userId:
+              user._id,
+ 
+            type:
+              'fee_transfer',
+ 
+            asset:
+              'TON',
+ 
+            amount:
+              gasNano.toString(),
+ 
+            status:
+              'completed',
+ 
+            toAddress:
+              walletAddress,
+ 
+            txHash:
+              gasTxHash,
+ 
+            metadata: {
+              purpose:
+                'gas_advance',
+ 
+              description:
+                'Gas TON advanced by admin for ATF→TON swap',
+ 
+              fromAdmin:
+                true,
+ 
+              swapTxId:
+                tx._id.toString(),
+ 
+              walletAddress,
+            },
+          });
+ 
+        gasAdvanceTxId =
+          gasTx._id.toString();
+ 
+        gasAdvanced =
+          true;
+ 
+        /**
+         * IMPORTANT:
+         *
+         * Store the EXACT wallet address in the swap's
+         * gas-recovery record.
+         */
+        await this.gasRecovery.recordAdvance({
+          swapTransactionId:
+            tx._id.toString(),
+ 
+          walletAddress,
+ 
+          tonBalanceBeforeGasAdvanceNano:
+            preAdvanceBalanceNano,
+ 
+          gasAdvanceAmountNano:
+            gasNano,
+ 
+          gasAdvanceTxHash:
+            gasTxHash,
+        });
+ 
+        /**
+         * Give the gas transfer a moment to settle before
+         * constructing/broadcasting the swap.
+         */
+        await new Promise(
+          r =>
+            setTimeout(
+              r,
+              3000
+            )
+        );
+      }
+ 
+      const offerAddress =
+        isTonToAtf
+          ? 'ton'
+          : config.atfJettonAddress;
+ 
+      const askAddress =
+        isTonToAtf
+          ? config.atfJettonAddress
+          : 'ton';
+ 
+      const swapParams =
+        await this.stonfi.buildSwapTransaction(
+          walletAddress,
+          confirmation.quote,
+          offerAddress,
+          askAddress
+        );
+ 
+      /**
+       * TON → ATF needs enough TON to execute.
+       */
+      if (
+        isTonToAtf
+      ) {
+        const {
+          ton:
+            onChainTonCheck,
+        } =
+          await this.walletService.getBalance(
+            walletAddress
+          );
+ 
+        const requiredTon =
+          BigInt(
+            swapParams.value.toString()
+          );
+ 
+        if (
+          onChainTonCheck <
+          requiredTon
+        ) {
+          throw new Error(
+            `Wallet needs ~${Precision.fromBaseUnits(
+              requiredTon,
+              TON_DECIMALS
+            )} TON for this swap (includes gas). Excess is returned. Deposit more TON.`
+          );
+        }
+      }
+ 
+      /**
+       * Capture the exact on-chain balances immediately before the DEX
+       * transaction. These are used later to distinguish user-owned swap
+       * output from the platform gas advance.
+       */
+      const preSwapBalances =
+        await this.walletService.getBalance(
+          walletAddress
+        );
+ 
+      await Transaction.updateOne(
+        { _id: tx._id },
+        {
+          $set: {
+            'metadata.preSwapTonBalanceNano':
+              preSwapBalances.ton.toString(),
+            'metadata.preSwapAtfBalanceNano':
+              preSwapBalances.atf.toString(),
+            'metadata.swapRouterAddress':
+              confirmation.quote?.routerAddress,
+            'metadata.swapValueNano':
+              BigInt(swapParams.value.toString()).toString(),
+            'metadata.swapMinOutputBaseUnits':
+              String(confirmation.quote?.minAskUnits || '0'),
+          },
+        }
+      );
+ 
+      /**
+       * BROADCAST THE ACTUAL SWAP.
+       */
+      const txHash =
+        await this.walletService.sendTon(
+          userId,
+          swapParams.to,
+          BigInt(
+            swapParams.value.toString()
+          ),
+          swapParams.body
+        );
+ 
+      /**
+       * The swap has now actually been broadcast.
+       *
+       * IMPORTANT:
+       *
+       * Do NOT call tx.save() here.
+       *
+       * The in-memory `tx` document was created BEFORE
+       * GasRecoveryService.recordAdvance() wrote the
+       * recovery audit fields
+       * (metadata.gasRecoveryStatus, metadata.gasAdvanceAmountNano,
+       *  metadata.gasRecoveryWalletAddress, ...)
+       * directly into the database.
+       *
+       * tx.save() would replace the whole metadata
+       * subdocument with this stale in-memory copy, ERASING
+       * the recovery state. The recovery claim
+       * (metadata.gasRecoveryStatus ∈ pending/partial/failed)
+       * would then never match, and the platform's gas
+       * advance would never be recovered after a successful
+       * swap.
+       *
+       * Use a targeted atomic update that only writes the
+       * swap result fields and leaves the recovery metadata
+       * intact.
+       */
+      await Transaction.updateOne(
+        {
+          _id: tx._id,
+        },
+        {
+          $set: {
+            txHash,
+ 
+            status:
+              'processing',
+ 
+            toAddress:
+              swapParams.to,
+ 
+            'metadata.swapBroadcasted':
+              true,
+ 
+            'metadata.swapOutcome':
+              'pending',
+ 
+            'metadata.broadcastedAt':
+              new Date().toISOString(),
+          },
+        }
+      );
+ 
+      /**
+       * Keep the in-memory copy consistent for the
+       * catch-path broadcasted check.
+       *
+       * This in-memory document is NEVER persisted again.
+       */
+      tx.txHash = txHash;
+ 
+      tx.status = 'processing';
+ 
+      tx.toAddress =
+        swapParams.to;
+ 
+      tx.metadata = {
+        ...tx.metadata,
+ 
+        swapBroadcasted:
+          true,
+ 
+        swapOutcome:
+          'pending',
+      };
+ 
+      /**
+       * Gas recovery is intentionally NOT attempted here.
+       *
+       * The swap has only been broadcast at this point. The DEX may still
+       * succeed, refund, or fail after the wallet transaction is consumed.
+       * The reconciler now determines the real swap outcome first and then
+       * invokes GasRecoveryService with the correct outcome.
+       */
+ 
+      /**
+       * Platform swap fee.
+       *
+       * Existing behavior retained.
+       */
+      // Platform fee transfer is triggered by the reconciler only after the
+      // swap outcome is confirmed. Charging/transferring a fee immediately
+      // after broadcast would make a failed swap harder to unwind safely.
+ 
+      return tx._id.toString();
+    } catch (error) {
+      /**
+       * Explicit broadcast flag is authoritative.
+       */
+      const broadcasted =
+        tx?.metadata
+          ?.swapBroadcasted ===
+        true;
+ 
+      /* ─────────────────────────────────────────
+         FAILED ATF → TON BEFORE BROADCAST
+         ───────────────────────────────────────── */
+ 
+      if (
+        gasAdvanced &&
+        !broadcasted &&
+        tx
+      ) {
+        try {
+          const result =
+            await this.gasRecovery
+              .recoverAdminGasSafely({
+                swapTransactionId:
+                  tx._id.toString(),
+ 
+                userId,
+ 
+                walletAddress,
+              });
+ 
+          gasClawbackTxHash =
+            result.txHash ||
+            null;
+ 
+          console.log(
+            `[SwapService] Gas recovery for user ${userId} on swap ${tx._id}: ` +
+              `status=${result.status}, ` +
+              `recovered=${Precision.fromBaseUnits(
+                result.totalRecoveredNano,
+                TON_DECIMALS
+              )} TON, ` +
+              `pending=${Precision.fromBaseUnits(
+                result.pendingNano,
+                TON_DECIMALS
+              )} TON` +
+              (
+                result.skippedReason
+                  ? ` (${result.skippedReason})`
+                  : ''
+              )
+          );
+        } catch (
+          recoveryErr: any
+        ) {
+          console.error(
+            `[SwapService] Gas recovery FAILED for user ${userId}:`,
+            recoveryErr
+          );
+        }
+      }
+ 
+      /* ─────────────────────────────────────────
+         ROLLBACK INTERNAL BALANCE
+         ───────────────────────────────────────── */
+ 
+      if (
+        deducted &&
+        !broadcasted
+      ) {
+        try {
+          const currentUser =
+            await User.findById(
+              user._id
+            );
+ 
+          if (currentUser) {
+            currentUser[
+              balanceKey
+            ] =
+              Precision.add(
+                BigInt(
+                  currentUser[
+                    balanceKey
+                  ] || '0'
+                ),
+                amountBase
+              ).toString();
+ 
+            await currentUser.save();
+ 
+            console.log(
+              `[SwapService] Rollback complete: restored ${Precision.fromBaseUnits(
+                amountBase,
+                inputDecimals
+              )} ${
+                isTonToAtf
+                  ? 'TON'
+                  : 'ATF'
+              } (includes ${Precision.fromBaseUnits(
+                feeBase,
+                inputDecimals
+              )} fee) to user ${userId}`
+            );
+          }
+        } catch (
+          rollbackErr
+        ) {
+          console.error(
+            '[SwapService] Balance rollback failed:',
+            rollbackErr
+          );
+        }
+      }
+ 
+      /* ─────────────────────────────────────────
+         FINAL TRANSACTION UPDATE
+         ───────────────────────────────────────── */
+ 
+      if (tx) {
+        try {
+          /**
+           * IMPORTANT:
+           *
+           * Recovery service writes directly to MongoDB.
+           *
+           * Therefore refetch the latest transaction before
+           * saving the final swap state.
+           */
+          const latest =
+            await Transaction.findById(
+              tx._id
+            );
+ 
+          if (latest) {
+            latest.status =
+              broadcasted
+                ? 'processing'
+                : 'failed';
+ 
+            latest.metadata = {
+              ...latest.metadata,
+ 
+              error:
+                (error as Error).message,
+ 
+              broadcasted,
+ 
+              gasAdvanceTxId:
+                gasAdvanceTxId || undefined,
+ 
+              gasClawbackTxHash:
+                gasClawbackTxHash || undefined,
+ 
+              gasRecoveryAttempted:
+                gasAdvanced && !broadcasted,
+ 
+              swapOutcome:
+                broadcasted
+                  ? 'pending'
+                  : 'failed',
+            };
+ 
+            await latest.save();
+          }
+        } catch {
+          // Preserve original error.
+        }
+      }
+ 
+      throw error;
+    }
+  }
+ 
+  /* ─────────────────────────────────────────────
+     FEE TRANSFER
+     ───────────────────────────────────────────── */
+ 
+  private async transferFee(
+    userId: number,
+ 
+    feeAmount: bigint,
+ 
+    asset:
+      | 'TON'
+      | 'ATF',
+ 
+    swapTxId: string
+  ): Promise<void> {
+    try {
+      const user =
+        await User.findOne({
+          telegramId:
+            userId,
+        });
+ 
+      if (!user) {
+        return;
+      }
+ 
+      const feeTx =
+        await Transaction.create({
+          userId:
+            user._id,
+ 
+          type:
+            'fee',
+ 
+          asset,
+ 
+          amount:
+            feeAmount.toString(),
+ 
+          status:
+            'processing',
+ 
+          toAddress:
+            config.adminFeeWalletAddress,
+ 
+          txHash:
+            provisionalTxHash(
+              'fee'
+            ),
+ 
+          metadata: {
+            swapTxId,
+          },
+        });
+ 
+      let txHash: string;
+ 
+      if (
+        asset === 'TON'
+      ) {
+        txHash =
+          await this.walletService.sendTon(
+            userId,
+            config.adminFeeWalletAddress,
+            feeAmount
+          );
+      } else {
+        txHash =
+          await this.walletService.sendJetton(
+            userId,
+            config.adminFeeWalletAddress,
+            config.atfJettonAddress!,
+            feeAmount
+          );
+      }
+ 
+      feeTx.txHash =
+        txHash;
+ 
+      feeTx.status =
+        'completed';
+ 
+      await feeTx.save();
+ 
+      await Transaction.findByIdAndUpdate(
+        swapTxId,
+        {
+          feeStatus:
+            'completed',
+ 
+          feeTxHash:
+            txHash,
+        }
+      );
+    } catch (error) {
+      console.error(
+        '[SwapService] Fee transfer failed:',
+        error
+      );
+    }
+  }
+          }
