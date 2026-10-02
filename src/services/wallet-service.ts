@@ -909,7 +909,7 @@ export class WalletService {
       );
     }
  
-    /**
+      /**
      * Persist version for old V4 wallets.
      */
     if (
@@ -934,4 +934,341 @@ export class WalletService {
     };
   }
  
-  // ===
+  // ===========================================================================
+  // SEND TON
+  // ===========================================================================
+ 
+  async sendTon(
+    userId: number,
+    toAddress: string,
+    amount: bigint,
+    body?: Cell | string
+  ): Promise<string> {
+    const wallet = await this.getWallet(userId);
+    if (!wallet) throw new Error('Wallet not found');
+    return this.sendTonFromWalletAddress(
+      wallet.address,
+      toAddress,
+      amount,
+      body
+    );
+  }
+ 
+  /**
+   * Send TON from one exact stored wallet address.
+   *
+   * This exists specifically for recovery/settlement flows. Those flows
+   * must never resolve the user's current active wallet because the wallet
+   * that received the platform advance may no longer be active.
+   */
+  async sendTonFromWalletAddress(
+    walletAddress: string,
+    toAddress: string,
+    amount: bigint,
+    body?: Cell | string
+  ): Promise<string> {
+    if (amount <= 0n) {
+      throw new Error('TON amount must be greater than zero');
+    }
+ 
+    const walletDoc = await Wallet.findOne({
+      address: walletAddress,
+    });
+ 
+    if (!walletDoc) {
+      throw new Error(`Wallet not found for address ${walletAddress}`);
+    }
+ 
+    const keyPair = await this.getKeyPairForWallet(walletDoc);
+    const version = await this.getWalletVersion(walletDoc, keyPair);
+    const contract = this.createWalletContract(keyPair.publicKey, version);
+ 
+    const derivedAddress = contract.address.toString({ bounceable: false });
+    const storedAddress = Address.parse(walletDoc.address).toString({ bounceable: false });
+ 
+    if (derivedAddress !== storedAddress) {
+      throw new Error(
+        `Wallet address mismatch. Stored=${storedAddress} Derived=${derivedAddress} Version=${version}`
+      );
+    }
+ 
+    const destination = Address.parse(toAddress);
+    const opened = this.client.open(contract);
+    const seqno = await opened.getSeqno();
+ 
+    const message = internal({
+      to: destination,
+      value: amount,
+      bounce: false,
+      body,
+    });
+ 
+    let transfer: Cell;
+ 
+    if (version === 'v5r1') {
+      transfer = (contract as WalletContractV5R1).createTransfer({
+        seqno,
+        secretKey: keyPair.secretKey,
+        messages: [message],
+        sendMode: SendMode.PAY_GAS_SEPARATELY,
+        timeout: Math.floor(Date.now() / 1000) + 60,
+      });
+    } else {
+      transfer = (contract as WalletContractV4).createTransfer({
+        seqno,
+        secretKey: keyPair.secretKey,
+        messages: [message],
+      });
+    }
+ 
+    await this.client.sendExternalMessage(opened, transfer);
+    return this.waitForTransaction(opened, walletDoc.address, seqno);
+  }
+  
+ 
+  // ===========================================
+  async sendJetton(
+    userId: number,
+    toAddress: string,
+    jettonMasterAddress: string,
+    amount: bigint
+  ): Promise<string> {
+    const {
+      walletDoc,
+      keyPair,
+      contract,
+      version,
+    } = await this.getWalletContext(userId);
+ 
+    const ownerAddress = Address.parse(walletDoc.address);
+    const destination = Address.parse(toAddress);
+    const userJettonWallet = await this.deriveJettonWallet(
+      walletDoc.address,
+      jettonMasterAddress
+    );
+ 
+    const transferBody = beginCell()
+      .storeUint(0x0f8a7ea5, 32)
+      .storeUint(BigInt(Math.floor(Date.now() / 1000)), 64)
+      .storeCoins(amount)
+      .storeAddress(destination)
+      .storeAddress(ownerAddress)
+      .storeBit(0)
+      .storeCoins(toNano('0.001'))
+      .storeBit(0)
+      .endCell();
+ 
+    const opened = this.client.open(contract);
+    const seqno = await opened.getSeqno();
+ 
+    const message = internal({
+      to: userJettonWallet,
+      value: toNano('0.05'),
+      bounce: true,
+      body: transferBody,
+    });
+ 
+    let transfer: Cell;
+ 
+    if (version === 'v5r1') {
+      transfer = (contract as WalletContractV5R1).createTransfer({
+        seqno,
+        secretKey: keyPair.secretKey,
+        messages: [message],
+        sendMode:
+          SendMode.PAY_GAS_SEPARATELY,
+        timeout: Math.floor(Date.now() / 1000) + 60,
+      });
+    } else {
+      transfer = (contract as WalletContractV4).createTransfer({
+        seqno,
+        secretKey: keyPair.secretKey,
+        messages: [message],
+      });
+    }
+ 
+    await this.client.sendExternalMessage(opened, transfer);
+    return this.waitForTransaction(opened, walletDoc.address, seqno);
+        }
+  
+ 
+  // ===========================================================================
+  // JETTON WALLET
+  // ===========================================================================
+ 
+  async deriveJettonWallet(
+    ownerAddress: string,
+    jettonMasterAddress: string
+  ): Promise<Address> {
+    const master =
+      this.client.open(
+        JettonMaster.create(
+          Address.parse(
+            jettonMasterAddress
+          )
+        )
+      );
+ 
+    return master.getWalletAddress(
+      Address.parse(ownerAddress)
+    );
+  }
+ 
+  // ===========================================================================
+  // TRANSACTION WAITING
+  // ===========================================================================
+ 
+  /**
+   * Wait briefly for the external message to appear on-chain.
+   *
+   * IMPORTANT:
+   * We don't treat "not indexed yet" as a failed transaction.
+   */
+  private async waitForTransaction(
+    opened:
+      | ReturnType<
+          TonClient['open']
+        >,
+    address: string,
+    previousSeqno: number
+  ): Promise<string> {
+    const maxAttempts = 10;
+ 
+    for (
+      let attempt = 0;
+      attempt < maxAttempts;
+      attempt++
+    ) {
+      await new Promise(
+        resolve =>
+          setTimeout(
+            resolve,
+            1500
+          )
+      );
+ 
+      try {
+        const currentSeqno =
+          await (opened as any).getSeqno();
+ 
+        /**
+         * If seqno increased, the external message was consumed.
+         */
+        if (
+          currentSeqno >
+          previousSeqno
+        ) {
+          try {
+            const txs =
+              await this.client.getTransactions(
+                Address.parse(address),
+                {
+                  limit: 5,
+                }
+              );
+ 
+            if (txs.length > 0) {
+              return txs[0]
+                .hash()
+                .toString('hex');
+            }
+          } catch {
+            // Seqno changed but transaction indexing may lag.
+          }
+ 
+          return `${address}_${previousSeqno}`;
+        }
+      } catch (error) {
+        console.error(
+          'Failed checking transaction seqno:',
+          error
+        );
+      }
+    }
+ 
+    /**
+     * We don't claim that a fabricated value is a blockchain
+     * transaction hash.
+     *
+     * This is only a tracking identifier when the provider has
+     * not indexed the transaction yet.
+     */
+    return `${address}_${previousSeqno}_${Date.now()}`;
+  }
+ 
+  // ===========================================================================
+  // GET ADDRESS
+  // ===========================================================================
+ 
+  async getAddress(
+    userId: number
+  ): Promise<string | null> {
+    const wallet =
+      await this.getWallet(userId);
+ 
+    return wallet?.address || null;
+  }
+ 
+  // ===========================================================================
+  // GET ACTIVE WALLET VERSION
+  // ===========================================================================
+ 
+  async getWalletVersionForUser(
+    userId: number
+  ): Promise<WalletVersion | null> {
+    const wallet =
+      await this.getWallet(userId);
+ 
+    if (!wallet) {
+      return null;
+    }
+ 
+    const keyPair =
+      await this.getKeyPairForWallet(
+        wallet
+      );
+ 
+    return this.getWalletVersion(
+      wallet,
+      keyPair
+    );
+  }
+ 
+  // ===========================================================================
+  // GET BOTH DERIVED ADDRESSES
+  // ===========================================================================
+ 
+  async getDerivedAddresses(
+    userId: number
+  ): Promise<{
+    v4: string;
+    v5: string;
+  }> {
+    const wallet =
+      await this.getWallet(userId);
+ 
+    if (!wallet) {
+      throw new Error(
+        'Wallet not found'
+      );
+    }
+ 
+    const keyPair =
+      await this.getKeyPairForWallet(
+        wallet
+      );
+ 
+    return {
+      v4: this.getAddressFromKeyPair(
+        keyPair,
+        'v4r2'
+      ),
+ 
+      v5: this.getAddressFromKeyPair(
+        keyPair,
+        'v5r1'
+      ),
+    };
+  }
+  }
+      
