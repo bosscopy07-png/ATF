@@ -476,9 +476,12 @@ class ReconciliationService {
     swap: any,
     session: ClientSession
   ): Promise<void> {
+    // Only match the PLATFORM FEE record. Gas advance / gas recovery records
+    // are also type 'fee_transfer' with the same swapTxId and must be ignored.
     const existing = await Transaction.findOne({
       type: 'fee_transfer',
       'metadata.swapTxId': swap._id.toString(),
+      'metadata.purpose': 'swap_fee',
     }).session(session);
 
     if (existing?.status === 'completed') {
@@ -512,6 +515,7 @@ class ReconciliationService {
       {
         type: 'fee_transfer',
         'metadata.swapTxId': swapId,
+        'metadata.purpose': 'swap_fee',
         status: 'pending',
       },
       { $set: { status: 'processing', 'metadata.feeClaimedAt': new Date().toISOString() } },
@@ -576,6 +580,7 @@ class ReconciliationService {
       let feeTx: any = await Transaction.findOne({
         type: 'fee_transfer',
         'metadata.swapTxId': swapId,
+        'metadata.purpose': 'swap_fee',
       });
 
       if (!feeTx) {
@@ -728,7 +733,7 @@ class ReconciliationService {
     if (feeAmount <= 0n) return;
 
     const feeTx = await Transaction.findOneAndUpdate(
-      { type: 'fee_transfer', 'metadata.swapTxId': swap._id.toString() },
+      { type: 'fee_transfer', 'metadata.swapTxId': swap._id.toString(), 'metadata.purpose': 'swap_fee' },
       {
         $setOnInsert: {
           userId: swap.userId,
@@ -737,7 +742,7 @@ class ReconciliationService {
           amount: feeAmount.toString(),
           status: 'pending',
           toAddress: config.adminFeeWalletAddress,
-          metadata: { swapTxId: swap._id.toString(), recovery: true },
+          metadata: { swapTxId: swap._id.toString(), purpose: 'swap_fee', recovery: true },
         },
       },
       { upsert: true, new: true, session }
@@ -872,7 +877,7 @@ class ReconciliationService {
             await lockedTx.save({ session });
             metrics.confirmed++;
 
-            if (lockedTx.metadata?.swapTxId) {
+            if (lockedTx.metadata?.swapTxId && lockedTx.metadata?.purpose === 'swap_fee') {
               await Transaction.findByIdAndUpdate(
                 lockedTx.metadata.swapTxId,
                 { $set: { feeStatus: 'completed', feeTxHash: lockedTx.txHash } },
@@ -952,4 +957,4 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 
-   
+        
