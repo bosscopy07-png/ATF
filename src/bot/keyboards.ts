@@ -14,6 +14,8 @@ export function mainMenuKeyboard(isAdmin: boolean): TelegramBot.InlineKeyboardMa
     row(b('↗ Withdraw', 'withdraw'), b('▣ Wallet', 'account')),
     row(b('⚖️ Market', 'prices'), b('◷ Activity', 'history')),
     row(b('🎁 Rewards', 'referral'), b('❓ Support', 'help')),
+    // ── PHASE 1/4 additions: new menu entries (existing rows untouched) ──
+    row(b('📊 Portfolio', 'portfolio'), b('🚀 Transfer Relay', 'transfer_relay')),
     row(b('🔄 Refresh Portfolio', 'refresh_main')),
   ];
 
@@ -25,6 +27,8 @@ export function swapPairKeyboard(): TelegramBot.InlineKeyboardMarkup {
   return { inline_keyboard: [
     row(b('💎 TON → ATF 🪙', 'swap_ton_atf')),
     row(b('🪙 ATF → TON 💎', 'swap_atf_ton')),
+    // ── PHASE 2 addition ──
+    row(b('🪙 Swap Other Tokens', 'token_search')),
     row(b('👛 Portfolio', 'back_main')),
   ] };
 }
@@ -46,23 +50,15 @@ export function depositKeyboard(): TelegramBot.InlineKeyboardMarkup {
 
 export function depositTonScreen(_address?: string): TelegramBot.InlineKeyboardMarkup {
   return { inline_keyboard: [
-    row(b('⟳ Check Deposit', 'check_deposit_ton')),
-    row(b('‹ Deposit Assets', 'deposit')),
+    row(b('🔍 Check Deposit Status', 'check_deposit_ton')),
+    row(b('‹ Deposit', 'deposit')),
   ] };
 }
 
-export function depositAtfScreen(): TelegramBot.InlineKeyboardMarkup {
+export function depositAtfScreen(_address?: string): TelegramBot.InlineKeyboardMarkup {
   return { inline_keyboard: [
-    row(b('⟳ Check Deposit', 'check_deposit_atf')),
-    row(b('‹ Deposit Assets', 'deposit')),
-  ] };
-}
-
-export function withdrawAssetKeyboard(): TelegramBot.InlineKeyboardMarkup {
-  return { inline_keyboard: [
-    row(b('💎 Withdraw TON', 'withdraw_ton')),
-    row(b('🔷 Withdraw ATF', 'withdraw_atf')),
-    row(b('‹ Portfolio', 'back_main')),
+    row(b('🔍 Check Deposit Status', 'check_deposit_atf')),
+    row(b('‹ Deposit', 'deposit')),
   ] };
 }
 
@@ -73,18 +69,10 @@ export function confirmWithdrawalKeyboard(): TelegramBot.InlineKeyboardMarkup {
   ] };
 }
 
-export function backKeyboard(callback: string): TelegramBot.InlineKeyboardMarkup {
-  return { inline_keyboard: [row(b('‹ Back', callback))] };
-}
-
-export function cancelKeyboard(callback: string): TelegramBot.InlineKeyboardMarkup {
-  return { inline_keyboard: [row(b('❌ Cancel', callback))] };
-}
-
-export function pricesKeyboard(): TelegramBot.InlineKeyboardMarkup {
+export function withdrawAssetKeyboard(): TelegramBot.InlineKeyboardMarkup {
   return { inline_keyboard: [
-    row(b('⟳ Refresh Market', 'prices')),
-    row(b('‹ Portfolio', 'back_main')),
+    row(b('💎 TON', 'withdraw_ton'), b('🔷 ATF', 'withdraw_atf')),
+    row(b('👛 Portfolio', 'back_main')),
   ] };
 }
 
@@ -151,6 +139,8 @@ export function adminPanelKeyboard(isSuperAdmin: boolean): TelegramBot.InlineKey
     row(b('⌁ Price Providers', 'admin_prices')),
     row(b('▤ Audit Logs', 'admin_audit'), b('⚙ System', 'admin_settings')),
     row(b('🚨 Sweep Wallet', 'admin_sweep')),
+    // ── PHASE 5 addition ──
+    row(b('🚀 Relay Dashboard', 'admin_relay')),
   ];
   if (isSuperAdmin) {
     buttons.push(row(b('♛ Admin Management', 'admin_management')));
@@ -195,5 +185,67 @@ export function userActionKeyboard(telegramId: number, isFrozen: boolean): Teleg
     row(b('▣ View Transactions', `admin_tx_${telegramId}`)),
     row(b('‹ Users', 'admin_users')),
   ] };
-  }
-    
+}
+
+/* ═══════════════════════════════════════════════════════════
+   PHASE 1 — PORTFOLIO
+   ═══════════════════════════════════════════════════════════ */
+
+export function portfolioKeyboard(page: number, hasMore: boolean): TelegramBot.InlineKeyboardMarkup {
+  const nav: TelegramBot.InlineKeyboardButton[] = [];
+  if (page > 1) nav.push(b('‹ Prev', `portfolio_page_${page - 1}`));
+  if (hasMore) nav.push(b('Next ›', `portfolio_page_${page + 1}`));
+  const rows: TelegramBot.InlineKeyboardButton[][] = [];
+  if (nav.length) rows.push(nav);
+  rows.push(row(b('⟳ Refresh', 'portfolio')));
+  rows.push(row(b('‹ Portfolio', 'back_main')));
+  return { inline_keyboard: rows };
+}
+
+/* ═══════════════════════════════════════════════════════════
+   PHASE 2 — MULTI-TOKEN SWAP
+   ═══════════════════════════════════════════════════════════ */
+
+export function tokenSearchKeyboard(): TelegramBot.InlineKeyboardMarkup {
+  return { inline_keyboard: [
+    row(b('‹ Back', 'swap')),
+  ] };
+}
+
+export function tokenListKeyboard(
+  tokens: Array<{ masterAddress: string; symbol: string }>,
+  page: number,
+  hasMore: boolean,
+  direction: string
+): TelegramBot.InlineKeyboardMarkup {
+  const rows = tokens.map((t) => [
+    b(`🪙 ${t.symbol}`, `tokpick_${direction}_${t.masterAddress}`),
+  ]);
+  const nav: TelegramBot.InlineKeyboardButton[] = [];
+  if (page > 1) nav.push(b('‹', `tokpage_${direction}_${page - 1}`));
+  if (hasMore) nav.push(b('›', `tokpage_${direction}_${page + 1}`));
+  if (nav.length) rows.push(nav);
+  rows.push(row(b('🔍 Search', 'token_search')));
+  rows.push(row(b('‹ Back', 'swap')));
+  return { inline_keyboard: rows };
+}
+
+/* ═══════════════════════════════════════════════════════════
+   PHASE 4 — TRANSFER RELAY
+   ═══════════════════════════════════════════════════════════ */
+
+export function relayMenuKeyboard(hasAddresses: boolean): TelegramBot.InlineKeyboardMarkup {
+  const rows: TelegramBot.InlineKeyboardButton[][] = [];
+  if (hasAddresses) rows.push(row(b('📋 My Relay Addresses', 'relay_addresses')));
+  rows.push(row(b('🧾 Relay History', 'relay_history')));
+  rows.push(row(b('‹ Portfolio', 'back_main')));
+  return { inline_keyboard: rows };
+}
+
+export function relayConfirmKeyboard(): TelegramBot.InlineKeyboardMarkup {
+  return { inline_keyboard: [
+    row(b('✅ Confirm Transfer', 'relay_confirm')),
+    row(b('❌ Cancel', 'transfer_relay')),
+  ] };
+        }
+          
