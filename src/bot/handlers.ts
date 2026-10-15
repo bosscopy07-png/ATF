@@ -121,11 +121,13 @@ async function render(
   // ── Premium emoji upgrade. Entities are JSON.stringify'd —
   //    node-telegram-bot-api mangles raw arrays in multipart forms. ──
   const premiumEntities = buildPremiumEmojiEntities(text);
-  const textEntities =
+    // Typed as `any` on purpose: node-telegram-bot-api requires entities as a
+  // JSON string at runtime, while the Bot API typings declare MessageEntity[].
+  const textEntities: any =
     premiumEntities.length > 0 ? { entities: JSON.stringify(premiumEntities) } : {};
-  const captionEntities =
+  const captionEntities: any =
     premiumEntities.length > 0 ? { caption_entities: JSON.stringify(premiumEntities) } : {};
-
+  
   const wantPhoto = opts?.withImage !== false && !!imageUrl;
   const wasPhoto = user?.lastMessageWasPhoto ?? false;
 
