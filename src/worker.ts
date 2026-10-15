@@ -1,15 +1,18 @@
 import { BlockchainMonitor } from './services/blockchain-monitor';
 import { startReconciler } from './jobs/reconciler';
 import { GasRecoveryRetryJob } from './jobs/gas-recovery-retry';
+// ── PHASE 4 addition ──
+import { RelayReconcilerJob } from './jobs/relay-reconciler';
 
 /**
  * Background Worker
- * 
+ *
  * Responsibilities:
  * - BlockchainMonitor: Poll for TON + AFT deposits every 30s
  * - Reconciler: Confirm swaps/withdrawals/fees on-chain every 30s
  * - GasRecoveryRetryJob: Retry pending/partial admin gas recoveries
- * 
+ * - RelayReconcilerJob: Resume interrupted relay ops (feature-gated)
+ *
  * Does NOT run:
  * - Express HTTP server
  * - Telegram webhook/polling
@@ -33,6 +36,11 @@ export async function startWorker(): Promise<void> {
   const gasRecoveryRetry = new GasRecoveryRetryJob();
   gasRecoveryRetry.start();
   console.log('Gas recovery retry job started');
+
+  // ── PHASE 4 addition: relay reconciler (no-ops when flag is off) ──
+  const relayReconciler = new RelayReconcilerJob();
+  relayReconciler.start();
+  console.log('Relay reconciler started');
 
   console.log('AFTSwap Background Worker is operational');
 }
