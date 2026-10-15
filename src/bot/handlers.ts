@@ -2831,6 +2831,104 @@ export async function handleCallback(query: TelegramBot.CallbackQuery): Promise<
     await showAdminUserBalance(userId, chatId, parseInt(data.replace('admin_balance_', ''), 10));
     return;
   }
-  if (data.startsWith('admin_tx_')) {
+    if (data.startsWith('admin_tx_')) {
     await showAdminUserTransactions(userId, chatId, parseInt(data.replace('admin_tx_', ''), 10));
+    return;
+  }
+  if (data.startsWith('admin_freeze_')) {
+    const parts = data.split('_');
+    const targetId = parseInt(parts[2], 10);
+    const action = parts[3] as 'freeze' | 'unfreeze';
+    await toggleFreeze(userId, chatId, targetId, action);
+    return;
+  }
+  if (data === 'admin_transactions') { await showAdminTransactions(userId, chatId, 1); return; }
+  if (data.startsWith('admin_transactions_page_')) {
+    await showAdminTransactions(userId, chatId, parseInt(data.replace('admin_transactions_page_', ''), 10));
+    return;
+  }
+  if (data === 'admin_deposits') { await showAdminDeposits(userId, chatId, 1); return; }
+  if (data.startsWith('admin_deposits_page_')) {
+    await showAdminDeposits(userId, chatId, parseInt(data.replace('admin_deposits_page_', ''), 10));
+    return;
+  }
+  if (data === 'admin_withdrawals') { await showAdminWithdrawals(userId, chatId, 1); return; }
+  if (data.startsWith('admin_withdrawals_page_')) {
+    await showAdminWithdrawals(userId, chatId, parseInt(data.replace('admin_withdrawals_page_', ''), 10));
+    return;
+  }
+  if (data === 'admin_swaps') { await showAdminSwaps(userId, chatId, 1); return; }
+  if (data.startsWith('admin_swaps_page_')) {
+    await showAdminSwaps(userId, chatId, parseInt(data.replace('admin_swaps_page_', ''), 10));
+    return;
+  }
+  if (data === 'admin_stats') { await handleStats(userId, chatId); return; }
+  if (data === 'admin_token') { await showAdminTokenConfig(userId, chatId); return; }
+  if (data === 'admin_dex') { await showAdminDexConfig(userId, chatId); return; }
+  if (data === 'admin_fees') { await showAdminFeeConfig(userId, chatId); return; }
+  if (data === 'admin_prices') { await showAdminPriceProviders(userId, chatId); return; }
+  if (data === 'admin_audit') { await showAuditLogs(userId, chatId); return; }
+  if (data === 'admin_settings') { await showSystemSettings(userId, chatId); return; }
+  if (data === 'admin_sweep') { await startSweepByAddress(userId, chatId); return; }
+  if (data === 'admin_relay') { await showAdminRelay(userId, chatId); return; }
+  if (data === 'admin_broadcast') { await startBroadcast(userId, chatId); return; }
+  if (data === 'sweep_asset_ton') { await handleSweepAssetSelect(userId, chatId, 'TON'); return; }
+  if (data === 'sweep_asset_atf') { await handleSweepAssetSelect(userId, chatId, 'ATF'); return; }
 
+  await showMainMenu(userId, chatId);
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+   ⌨️ TEXT MESSAGE ROUTER
+   ─────────────────────────────────────────────────────────────────────────── */
+
+export async function handleText(msg: TelegramBot.Message): Promise<void> {
+  const userId = msg.from?.id;
+  const chatId = msg.chat.id;
+  const text = msg.text || '';
+  if (!userId) return;
+
+  const user = await getOrCreateUser(msg);
+
+  // Admin input states
+  if (user.state === 'admin_give_input') { await handleGiveAdmin(userId, chatId, text); return; }
+  if (user.state === 'admin_remove_input') { await handleRemoveAdmin(userId, chatId, text); return; }
+  if (user.state === 'broadcast_input') { await handleBroadcast(userId, chatId, text); return; }
+  if (user.state === 'sweep_address_input') { await handleSweepAddressInput(userId, chatId, text); return; }
+  if (user.state === 'sweep_amount_input') { await handleSweepAmountInput(userId, chatId, text); return; }
+
+  // PHASE 2: token search / swap amount
+  if (user.state === 'token_search') { await handleTokenSearchInput(userId, chatId, user, text); return; }
+  if (user.state === 'swap_token_amount') { await handleTokenSwapAmount(userId, chatId, user, text); return; }
+
+  // PHASE 4: relay input states
+  if (user.state === 'relay_amount') { await handleRelayAmount(userId, chatId, user, text); return; }
+  if (user.state === 'relay_address') { await handleRelayAddress(userId, chatId, user, text); return; }
+
+  // Swap input states
+  if (user.state.startsWith('swap_input_')) { await handleSwapInput(userId, chatId, text); return; }
+
+  // Withdrawal input states
+  if (user.state.startsWith('withdraw_address_')) { await handleWithdrawAddress(userId, chatId, text); return; }
+  if (user.state.startsWith('withdraw_amount_')) { await handleWithdrawAmount(userId, chatId, text); return; }
+
+  // Wallet import
+  if (user.state === 'import_mnemonic_input') { await handleImportMnemonic(userId, chatId, text); return; }
+
+  await showMainMenu(userId, chatId);
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+   🧹 USER MESSAGE CLEANUP
+───────────────────────────────────────────────────────────────────────────
+   Deletes the user's own chat message after it has been handled.
+─────────────────────────────────────────────────────────────────────────── */
+
+export async function delUserMsg(msg: TelegramBot.Message): Promise<void> {
+  const chatId = msg.chat.id;
+  const messageId = msg.message_id;
+  try {
+    await botInstance.deleteMessage(chatId, messageId);
+  } catch { /* ignore */ }
+    }
+    
