@@ -2493,7 +2493,97 @@ async function handleRelayAddress(userId: number, chatId: number, user: any, tex
   await toast(userId, chatId,
     [
       terminalHeader('CONFIRM TRANSFER'),
-      `💎 Requested to destination: <code>${Precision.fromBaseUnits(quote.requestedNano, 9
+            `💎 Requested to destination: <code>${Precision.fromBaseUnits(quote.requestedNano, 9)} TON</code>`,
+      `🧾 Platform fee (${config.feePolicy.relayTransferPercent}%): <code>${Precision.fromBaseUnits(quote.platformFeeNano, 9)} TON</code>`,
+      `⛽ Est. network costs: <code>~${Precision.fromBaseUnits(quote.forwardFeeEstimateNano + config.relay.minRelayReserveNano, 9)} TON</code> <i>(funding + outgoing, estimated)</i>`,
+      `━━━━━━━━━━━━━━━━━━━━`,
+      `💰 Total debit: <code>${Precision.fromBaseUnits(quote.totalDebitNano, 9)} TON</code>`,
+      `📤 Via relay: <code>${formatAddressShort(quote.relayAddress)}</code>`,
+      `🏁 Destination: <code>${destination.slice(0, 10)}…${destination.slice(-6)}</code>`,
+      ``,
+      `<i>Platform fee and network costs are distinct. Network costs are estimates; the destination receives the requested amount only if on-chain conditions satisfy it — otherwise the operation is flagged for recovery, never silently short-paid.</i>`,
+    ].join('\n'),
+    keyboards.relayConfirmKeyboard());
+}
+
+async function executeRelayTransfer(userId: number, chatId: number, user: any): Promise<void> {
+  const { quote, destination } = user.stateData || {};
+  if (!quote || !destination) { await showMainMenu(userId, chatId); return; }
+
+  // Single-use confirmation: clear state BEFORE executing
+  user.state = 'idle';
+  user.stateData = {};
+  await user.save();
+
+  try {
+    const operationId = await relayService.execute(userId, quote, destination);
+    await toast(userId, chatId,
+      `🚀 <b>Transfer relayed</b>\n\nOperation: <code>${operationId.slice(0, 13)}</code>\nTrack in 🧾 Relay History.`,
+      keyboards.mainMenuKeyboard(user.isAdmin || user.isSuperAdmin));
+  } catch (err: any) {
+    await toast(userId, chatId,
+      `❌ <b>Transfer failed</b>\n\n<i>${String(err.message).slice(0, 300)}</i>\n\nCheck 🧾 Relay History for state.`,
+      keyboards.mainMenuKeyboard(user.isAdmin || user.isSuperAdmin));
+  }
+}
+
+async function showRelayHistory(userId: number, chatId: number, user: any): Promise<void> {
+  const { items } = await relayService.history(userId, 1);
+
+  if (!items.length) {
+    await toast(userId, chatId,
+      `${terminalHeader('RELAY HISTORY')}\n<i>No relay transfers yet.</i>`,
+      keyboards.relayMenuKeyboard(false));
+    return;
+  }
+
+  const lines = items.map((op: any) =>
+    `${op.state === 'COMPLETED' ? '🟢' : op.state === 'FAILED' || op.state === 'EXPIRED' ? '🔴' : '🟡'} ` +
+    `<code>${Precision.fromBaseUnits(BigInt(op.requestedAmountNano), 9)} TON</code> → ` +
+    `<code>${op.destinationAddress.slice(0, 6)}…${op.destinationAddress.slice(-4)}</code>\n` +
+    `   <i>${op.state}</i> · ${op.createdAt.toLocaleDateString()}` +
+    (op.outgoingTxHash ? `\n   🔗 <code>${op.outgoingTxHash.slice(0, 16)}…</code>` : '')
+  );
+
+  await toast(userId, chatId,
+    `${terminalHeader('RELAY HISTORY')}\n${lines.join('\n\n')}`,
+    keyboards.relayMenuKeyboard(true));
+}
+
+/* ═══════════════════════════════════════════════════════════
+   PHASE 5 — ADMIN: TRANSFER RELAY DASHBOARD (Telegram view)
+   ═══════════════════════════════════════════════════════════ */
+
+async function showAdminRelay(userId: number, chatId: number): Promise<void> {
+  try {
+    await requireAdmin(userId);
+    const { RelayAddress } = await import('../models/RelayAddress');
+    const { TransferOperation } = await import('../models/TransferOperation');
+
+    const [totalAddresses, activeAddresses, recoveryRequired, inFlight] = await Promise.all([
+      RelayAddress.countDocuments(),
+      RelayAddress.countDocuments({ status: 'active' }),
+      RelayAddress.countDocuments({ status: 'recovery_required' }),
+      TransferOperation.countDocuments({
+        state: { $in: ['FUNDING', 'FUNDED', 'SENDING', 'RECOVERY_REQUIRED'] },
+      }),
+    ]);
+
+    await render(userId, chatId, [
+      `🚀 <b>RELAY DASHBOARD</b>`,
+      ``,
+      `📋 Total addresses: <b>${totalAddresses}</b>`,
+      `✅ Active: <b>${activeAddresses}</b>`,
+      `🛠 Recovery required: <b>${recoveryRequired}</b>`,
+      `⏳ In-flight operations: <b>${inFlight}</b>`,
+      ``,
+      `<i>Full management via the web admin console → Relay section.</i>`,
+      `<i>Signing material is never displayed here.</i>`,
+    ].join('\n'), keyboards.backKeyboard('admin_panel'), { withImage: true });
+  } catch {
+    await showAdminPanel(userId, chatId);
+  }
+              }
 
       /* ───────────────────────────────────────────────────────────────────────────
    🚀 START HANDLER
