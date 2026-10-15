@@ -2,6 +2,8 @@ import express, { Application } from 'express';
 import path from 'path';
 import { adminRoutes } from './routes';
 import { authMiddleware } from './middleware';
+// ── PHASE 5 addition ──
+import { relayAdminRouter } from './relay-routes';
 
 export function createAdminApp(): Application {
   const app = express();
@@ -18,10 +20,13 @@ export function createAdminApp(): Application {
   // API routes
   app.use('/admin/api', adminRoutes);
 
+  // ── PHASE 5 addition: transfer-relay admin section (same auth) ──
+  app.use('/admin/api/relay', relayAdminRouter);
+
   // Dashboard HTML
   app.get('/admin', (req, res) => {
     res.sendFile(path.join(__dirname, 'dashboard.html'));
   });
 
   return app;
-}
+          }
