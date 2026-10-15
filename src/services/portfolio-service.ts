@@ -1,4 +1,5 @@
 import { TonClient, Address, JettonMaster, JettonWallet } from '@ton/ton';
+import Decimal from 'decimal.js';
 import { config, TON_DECIMALS, ATF_DECIMALS } from '../config';
 import { TokenRegistry } from './token-registry';
 import { PriceService } from './price-service';
@@ -26,7 +27,6 @@ export interface PortfolioSummary {
   ton: PortfolioLine;
   atf: PortfolioLine;
   others: PortfolioLine[];
-  /** One aggregated "Other Assets" value for the main dashboard. */
   othersTotalUsd: string | null;
   totalUsd: string;
   totalNgn: string | null;
@@ -39,10 +39,8 @@ export interface PortfolioSummary {
  *
  * Rules enforced:
  *  - Decimal-safe totals (bigint + Decimal), never float.
- *  - An asset with NO price is reported with valueUsd=null and
- *    valuationStatus='price_unavailable' — it NEVER contributes
- *    to totals (not counted as zero, excluded and clearly identified).
- *  - ATF/TON valuation path is UNCHANGED (existing PriceService).
+ *  - An asset with NO price is reported valueUsd=null, excluded from totals.
+ *  - ATF/TON valuation path UNCHANGED (existing PriceService).
  *  - Duplicate master addresses deduped by canonical Address.parse form.
  */
 export class PortfolioService {
@@ -84,14 +82,10 @@ export class PortfolioService {
       let status: ValuationStatus = 'valued';
 
       if (priceUsd && Number(priceUsd) > 0) {
-        valueUsd = new Precision.constructor === undefined
-          ? this.cryptoToUsd(balanceBase, priceUsd, decimals)
-          : this.cryptoToUsd(balanceBase, priceUsd, decimals);
+        valueUsd = this.cryptoToUsd(balanceBase, priceUsd, decimals);
 
         if (ngnRateStr) {
-          valueNgn = new (require('decimal.js').default || require('decimal.js'))(valueUsd)
-            .times(ngnRateStr)
-            .toFixed(2);
+          valueNgn = new Decimal(valueUsd).times(ngnRateStr).toFixed(2);
         }
       } else {
         status = 'price_unavailable';
@@ -148,9 +142,9 @@ export class PortfolioService {
       try {
         canonical = Address.parse(token.masterAddress).toString();
       } catch {
-        continue; // invalid record excluded
+        continue;
       }
-      if (seen.has(canonical)) continue; // dedupe
+      if (seen.has(canonical)) continue;
       seen.add(canonical);
 
       const balanceBase = await this.readJettonBalance(
@@ -158,7 +152,7 @@ export class PortfolioService {
         canonical
       ).catch(() => null);
 
-      if (balanceBase === null || balanceBase <= 0n) continue; // not held
+      if (balanceBase === null || balanceBase <= 0n) continue;
 
       const doc = await SupportedToken.findOne({ masterAddress: canonical });
 
@@ -177,14 +171,13 @@ export class PortfolioService {
     }
 
     /* ── Totals: only valued assets contribute ── */
-    const D = require('decimal.js');
-    let totalUsdD = new D(tonLine.valueUsd ?? '0').plus(atfLine.valueUsd ?? '0');
-    let othersTotalD: InstanceType<typeof D> | null = null;
+    let totalUsdD = new Decimal(tonLine.valueUsd ?? '0').plus(atfLine.valueUsd ?? '0');
+    let othersTotalD: Decimal | null = null;
 
     for (const line of others) {
       if (line.valueUsd) {
         totalUsdD = totalUsdD.plus(line.valueUsd);
-        othersTotalD = othersTotalD ? othersTotalD.plus(line.valueUsd) : new D(line.valueUsd);
+        othersTotalD = othersTotalD ? othersTotalD.plus(line.valueUsd) : new Decimal(line.valueUsd);
       }
     }
 
@@ -210,8 +203,7 @@ export class PortfolioService {
     priceUsd: string,
     decimals: number
   ): string {
-    const D = require('decimal.js');
-    return new D(Precision.fromBaseUnits(balanceBase, decimals))
+    return new Decimal(Precision.fromBaseUnits(balanceBase, decimals))
       .times(priceUsd)
       .toFixed(2);
   }
@@ -231,4 +223,4 @@ export class PortfolioService {
     );
     return await jettonWallet.getBalance();
   }
-}
+        }
