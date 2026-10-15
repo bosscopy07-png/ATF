@@ -7,7 +7,8 @@
     "build": "tsc && node scripts/copy-admin-dashboard.js",
     "start": "node dist/app.js",
     "dev:server": "APP_MODE=server ts-node src/app.ts",
-    "dev:worker": "APP_MODE=worker ts-node src/app.ts"
+    "dev:worker": "APP_MODE=worker ts-node src/app.ts",
+    "test": "tsc && node --test dist/tests/"
   },
   "dependencies": {
     "@ston-fi/api": "^0.14.0",
