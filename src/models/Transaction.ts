@@ -1,12 +1,23 @@
 import mongoose, { Schema, Document } from 'mongoose';
 
-export type TransactionType = 'deposit' | 'withdrawal' | 'swap' | 'fee' | 'fee_transfer';
+export type TransactionType =
+  | 'deposit'
+  | 'withdrawal'
+  | 'swap'
+  | 'fee'
+  | 'fee_transfer'
+  // ── PHASE 2/4 additions (additive enum extension — existing docs valid) ──
+  | 'transfer_relay'
+  | 'relay_funding'
+  | 'treasury_sweep';
+
 export type TransactionStatus = 'pending' | 'processing' | 'completed' | 'failed';
 
 export interface ITransaction extends Document {
   userId: mongoose.Types.ObjectId;
   type: TransactionType;
-  asset: 'TON' | 'ATF';
+  // 'TOKEN' added additively; legacy TON/ATF docs unchanged
+  asset: 'TON' | 'ATF' | 'TOKEN';
   amount: string;
   fee?: string;
   feeAsset?: string;
@@ -27,8 +38,26 @@ export interface ITransaction extends Document {
 const TransactionSchema = new Schema<ITransaction>(
   {
     userId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
-    type: { type: String, enum: ['deposit', 'withdrawal', 'swap', 'fee', 'fee_transfer'], required: true },
-    asset: { type: String, enum: ['TON', 'ATF'], required: true },
+    type: {
+      type: String,
+      enum: [
+        'deposit',
+        'withdrawal',
+        'swap',
+        'fee',
+        'fee_transfer',
+        // ── additions ──
+        'transfer_relay',
+        'relay_funding',
+        'treasury_sweep',
+      ],
+      required: true,
+    },
+    asset: {
+      type: String,
+      enum: ['TON', 'ATF', 'TOKEN'], // 'TOKEN' added; existing docs unaffected
+      required: true,
+    },
     amount: { type: String, required: true },
     fee: { type: String },
     feeAsset: { type: String },
@@ -49,4 +78,3 @@ const TransactionSchema = new Schema<ITransaction>(
 TransactionSchema.index({ txHash: 1, type: 1 }, { unique: true, sparse: true });
 
 export const Transaction = mongoose.model<ITransaction>('Transaction', TransactionSchema);
-                                      
