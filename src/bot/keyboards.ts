@@ -14,7 +14,7 @@ export function mainMenuKeyboard(isAdmin: boolean): TelegramBot.InlineKeyboardMa
     row(b('↗ Withdraw', 'withdraw'), b('▣ Wallet', 'account')),
     row(b('⚖️ Market', 'prices'), b('◷ Activity', 'history')),
     row(b('🎁 Rewards', 'referral'), b('❓ Support', 'help')),
-    // ── PHASE 1/4 additions: new menu entries (existing rows untouched) ──
+    // ── PHASE 1/4 addition: new menu entries (existing rows untouched) ──
     row(b('📊 Portfolio', 'portfolio'), b('🚀 Transfer Relay', 'transfer_relay')),
     row(b('🔄 Refresh Portfolio', 'refresh_main')),
   ];
@@ -50,15 +50,23 @@ export function depositKeyboard(): TelegramBot.InlineKeyboardMarkup {
 
 export function depositTonScreen(_address?: string): TelegramBot.InlineKeyboardMarkup {
   return { inline_keyboard: [
-    row(b('🔍 Check Deposit Status', 'check_deposit_ton')),
-    row(b('‹ Deposit', 'deposit')),
+    row(b('⟳ Check Deposit', 'check_deposit_ton')),
+    row(b('‹ Deposit Assets', 'deposit')),
   ] };
 }
 
-export function depositAtfScreen(_address?: string): TelegramBot.InlineKeyboardMarkup {
+export function depositAtfScreen(): TelegramBot.InlineKeyboardMarkup {
   return { inline_keyboard: [
-    row(b('🔍 Check Deposit Status', 'check_deposit_atf')),
-    row(b('‹ Deposit', 'deposit')),
+    row(b('⟳ Check Deposit', 'check_deposit_atf')),
+    row(b('‹ Deposit Assets', 'deposit')),
+  ] };
+}
+
+export function withdrawAssetKeyboard(): TelegramBot.InlineKeyboardMarkup {
+  return { inline_keyboard: [
+    row(b('💎 Withdraw TON', 'withdraw_ton')),
+    row(b('🔷 Withdraw ATF', 'withdraw_atf')),
+    row(b('‹ Portfolio', 'back_main')),
   ] };
 }
 
@@ -69,10 +77,18 @@ export function confirmWithdrawalKeyboard(): TelegramBot.InlineKeyboardMarkup {
   ] };
 }
 
-export function withdrawAssetKeyboard(): TelegramBot.InlineKeyboardMarkup {
+export function backKeyboard(callback: string): TelegramBot.InlineKeyboardMarkup {
+  return { inline_keyboard: [row(b('‹ Back', callback))] };
+}
+
+export function cancelKeyboard(callback: string): TelegramBot.InlineKeyboardMarkup {
+  return { inline_keyboard: [row(b('❌ Cancel', callback))] };
+}
+
+export function pricesKeyboard(): TelegramBot.InlineKeyboardMarkup {
   return { inline_keyboard: [
-    row(b('💎 TON', 'withdraw_ton'), b('🔷 ATF', 'withdraw_atf')),
-    row(b('👛 Portfolio', 'back_main')),
+    row(b('⟳ Refresh Market', 'prices')),
+    row(b('‹ Portfolio', 'back_main')),
   ] };
 }
 
@@ -208,6 +224,7 @@ export function portfolioKeyboard(page: number, hasMore: boolean): TelegramBot.I
 
 export function tokenSearchKeyboard(): TelegramBot.InlineKeyboardMarkup {
   return { inline_keyboard: [
+    row(b('🔍 Search Token', 'token_search')),
     row(b('‹ Back', 'swap')),
   ] };
 }
@@ -247,5 +264,5 @@ export function relayConfirmKeyboard(): TelegramBot.InlineKeyboardMarkup {
     row(b('✅ Confirm Transfer', 'relay_confirm')),
     row(b('❌ Cancel', 'transfer_relay')),
   ] };
-        }
-          
+    }
+                  
