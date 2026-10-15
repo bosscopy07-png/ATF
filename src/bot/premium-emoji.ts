@@ -15,6 +15,11 @@
  * NOTE: custom_emoji entities are supported in message TEXT and CAPTIONS
  * only. InlineKeyboardButton text and answerCallbackQuery alerts cannot
  * carry entities — those keep unicode emoji by design.
+ *
+ * TYPING NOTE: the helpers below return the entities JSON-stringified
+ * (typed `any`). node-telegram-bot-api's form encoder requires a string
+ * at runtime; the raw MessageEntity[] is what buildPremiumEmojiEntities
+ * produces and what the unit test validates.
  */
 
 export interface PremiumEmojiEntity {
@@ -145,21 +150,22 @@ export function buildPremiumEmojiEntities(
 }
 
 /**
- * Convenience: entities for Bot API options, or undefined when none.
- * Passing undefined keeps the outgoing request identical to before
- * this upgrade (full backward compatibility).
+ * Convenience for Bot API options. Returns the entities JSON-stringified
+ * — node-telegram-bot-api's multipart form encoder requires a string;
+ * passing a raw array silently drops the field.
+ *
+ * `any` is deliberate: Bot API typings declare MessageEntity[], the
+ * runtime wants string. Callers spread the result into send options.
  */
-export function premiumEmojiOptions(text: string):
-  | { entities: PremiumEmojiEntity[] }
-  | { caption_entities: PremiumEmojiEntity[] }
-  | Record<string, never> {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function premiumEmojiOptions(text: string): any {
   const entities = buildPremiumEmojiEntities(text);
-  return entities.length ? { entities } : {};
+  return entities.length ? { entities: JSON.stringify(entities) } : {};
 }
 
-export function premiumEmojiCaptionOptions(text: string):
-  | { caption_entities: PremiumEmojiEntity[] }
-  | Record<string, never> {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function premiumEmojiCaptionOptions(text: string): any {
   const entities = buildPremiumEmojiEntities(text);
-  return entities.length ? { caption_entities: entities } : {};
-}
+  return entities.length ? { caption_entities: JSON.stringify(entities) } : {};
+  }
+  
