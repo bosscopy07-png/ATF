@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { mnemonicNew, mnemonicToWalletKey } from '@ton/crypto';
 import {
   TonClient, WalletContractV4, WalletContractV5R1,
-  Address, internal, toNano, SendMode,
+  Address, internal, SendMode,
 } from '@ton/ton';
 import { config } from '../config';
 import { FeeEngine } from '../config/fees';
@@ -16,6 +16,7 @@ import { checkRateLimit } from '../utils/rate-limiter';
 import { isValidTonAddress } from '../utils/validation';
 import { Precision } from '../utils/precision';
 import { AdminWalletService } from './admin-wallet-service';
+import { WalletService } from './wallet-service';
 
 export interface RelayQuote {
   quoteId: string;
@@ -24,34 +25,31 @@ export interface RelayQuote {
   label: string;
   requestedNano: bigint;
   platformFeeNano: bigint;
-  fundingAmountNano: bigint;     // requested + fee (+ forward estimate)
+  fundingAmountNano: bigint;
   forwardFeeEstimateNano: bigint;
   minReserveNano: bigint;
-  totalDebitNano: bigint;        // from user's source wallet
+  totalDebitNano: bigint;
   relayResidualExpectedNano: bigint;
   expiresAt: Date;
 }
 
-const CONFIRMATIONS_REQUIRED = 1;
-
 /**
  * Platform-controlled transfer relay.
  *
- * Hard isolation guarantees:
- *  - NEVER touches Wallet/User.tonBalance paths of swap or withdrawal.
- *  - Funding source is the ADMIN gas treasury (AdminWalletService) —
- *    user custody wallet is debited by the same authorized infrastructure
- *    (sendTon from user wallet) ONLY in a single signed step.
- *  - Plaintext mnemonics NEVER leave this process; only AES-GCM
- *    (existing authenticated encryption util) at rest.
+ * Isolation guarantees:
+ *  - NEVER touches swap or withdrawal paths.
+ *  - Funding uses the authorized admin treasury infrastructure.
+ *  - Plaintext mnemonics NEVER leave this process; AES-GCM at rest only.
  */
 export class TransferRelayService {
   private tonClient: TonClient;
   private adminWallet: AdminWalletService;
+  private walletService: WalletService;
 
   constructor() {
     this.tonClient = new TonClient({ endpoint: config.tonRpcUrl, apiKey: config.tonApiKey });
     this.adminWallet = new AdminWalletService();
+    this.walletService = new WalletService();
   }
 
   private assertEnabled(): void {
@@ -61,9 +59,8 @@ export class TransferRelayService {
   /* ══════════════ ADDRESS PROVISIONING ══════════════ */
 
   /**
-   * Idempotent provisioning: opens the feature → ensures the user has
-   * exactly `addressesPerUser` ACTIVE addresses. Never regenerates on
-   * re-open. Encryption key comes from env/KMS-bound config only.
+   * Idempotent provisioning: ensures the user has exactly
+   * `addressesPerUser` ACTIVE addresses. Never regenerates on re-open.
    */
   async ensureAddresses(userId: number): Promise<void> {
     this.assertEnabled();
@@ -79,7 +76,6 @@ export class TransferRelayService {
     const needed = config.relay.addressesPerUser - count;
     if (needed <= 0) return;
 
-    // Rate-limit provisioning (per user)
     await checkRateLimit('relay:provision', userId, 2, 60_000);
 
     const existing = await RelayAddress.countDocuments({});
@@ -93,8 +89,6 @@ export class TransferRelayService {
           : WalletContractV4.create({ publicKey: keyPair.publicKey, workchain: 0 });
 
       const address = contract.address.toString();
-
-      // Enforce platform-wide uniqueness (race-safe via unique index)
       const enc = encrypt(mnemonic.join(' '));
 
       await RelayAddress.create({
@@ -120,9 +114,6 @@ export class TransferRelayService {
 
   /* ══════════════ SELECTION GUARDS ══════════════ */
 
-  /**
-   * Ten-day reuse rule + safety checks. Returns the address or throws.
-   */
   private async assertAddressSelectable(relay: any): Promise<void> {
     if (relay.status !== 'active') {
       throw new Error('This relay address is not active');
@@ -133,7 +124,6 @@ export class TransferRelayService {
       throw new Error(`This address is cooling down. Try again in ~${days} day(s).`);
     }
 
-    // Unresolved transaction on this address?
     const unresolved = await TransferOperation.countDocuments({
       relayAddressId: relay._id,
       state: { $in: ['FUNDING', 'FUNDED', 'SENDING', 'RECOVERY_REQUIRED'] },
@@ -142,7 +132,6 @@ export class TransferRelayService {
       throw new Error('This address has an unresolved operation. Wait for it to finish.');
     }
 
-    // Residual on-chain funds must be zero (or flagged, not silently reused)
     const balance = await this.getTonBalance(relay.address);
     if (balance > 0n) {
       throw new Error('This address still holds funds. It is flagged for recovery first.');
@@ -153,7 +142,7 @@ export class TransferRelayService {
     try {
       return BigInt((await this.tonClient.getBalance(Address.parse(address))).toString());
     } catch {
-      return 0n; // fail-closed for selection (treated as unknown → not selectable below via reserve check)
+      return 0n;
     }
   }
 
@@ -176,9 +165,6 @@ export class TransferRelayService {
     if (!relay) throw new Error('Relay address not found');
     await this.assertAddressSelectable(relay);
 
-    if (!isValidTonAddress(requestedTon)) {
-      // requestedTon is an amount string; validate amount
-    }
     if (!/^\d+(\.\d+)?$/.test(requestedTon) || Number(requestedTon) <= 0) {
       throw new Error('Invalid amount');
     }
@@ -190,18 +176,16 @@ export class TransferRelayService {
     const forwardFee = config.relay.forwardFeeEstimateNano;
     const minReserve = config.relay.minRelayReserveNano;
 
-    // Funding = requested + fee + forward fee estimate + min reserve
     const fundingAmountNano = requestedNano + platformFeeNano + forwardFee + minReserve;
 
-    // Verify user can cover total debit from their active wallet
-    const walletAddress = await (new (require('./wallet-service').WalletService)()).getAddress(userId);
+    const walletAddress = await this.walletService.getAddress(userId);
     if (!walletAddress) throw new Error('Wallet not found');
     const userTon = await this.getTonBalance(walletAddress);
 
     if (userTon < fundingAmountNano + config.relay.minRelayReserveNano) {
       throw new Error(
         `Insufficient TON. You need ~${Precision.fromBaseUnits(fundingAmountNano, 9)} TON ` +
-        `(amount + 2% platform fee + network costs).`
+        `(amount + ${config.feePolicy.relayTransferPercent}% platform fee + network costs).`
       );
     }
 
@@ -216,27 +200,22 @@ export class TransferRelayService {
       forwardFeeEstimateNano: forwardFee,
       minReserveNano: minReserve,
       totalDebitNano: fundingAmountNano,
-      relayResidualExpectedNano: minReserve, // min reserve intentionally stays
+      relayResidualExpectedNano: minReserve,
       expiresAt: new Date(Date.now() + config.relay.quoteTtlMs),
     };
   }
-
-  /* ══════════════ EXECUTION STATE MACHINE ══════════════ */
+    /* ══════════════ EXECUTION STATE MACHINE ══════════════ */
 
   async execute(userId: number, quote: RelayQuote, destination: string): Promise<string> {
     this.assertEnabled();
 
     if (!isValidTonAddress(destination)) throw new Error('Invalid destination address');
-    if (Address.parse(destination).workChain !== 0 && config.tonNetwork === 'mainnet') {
-      throw new Error('Destination is not a standard TON network address');
-    }
     if (new Date() > quote.expiresAt) throw new Error('Quote expired. Request a new preview.');
 
     const user = await User.findOne({ telegramId: userId });
     if (!user) throw new Error('User not found');
     if (user.isFrozen) throw new Error('Account is frozen');
 
-    // Idempotency key: one execution per prepared quote, across instances & restarts
     const idempotencyKey = `relay:${userId}:${quote.quoteId}`;
 
     return withLock(`lock:relay:user:${userId}`, config.relay.lockTtlMs, async () => {
@@ -246,8 +225,6 @@ export class TransferRelayService {
       return withLock(`lock:relay:addr:${relay.address}`, config.relay.lockTtlMs, async () => {
         await this.assertAddressSelectable(relay);
 
-        // Atomic insert-or-return: replayed confirmations and worker restarts
-        // converge on the SAME operation row.
         const raw: any = await TransferOperation.findOneAndUpdate(
           { idempotencyKey },
           {
@@ -275,16 +252,14 @@ export class TransferRelayService {
 
         const op: ITransferOperation = raw.value;
         if (raw.lastErrorObject?.updatedExisting) {
-          // Already created → return existing, never duplicate
           if (['COMPLETED'].includes(op.state)) return op.operationId;
           if (['FAILED', 'EXPIRED'].includes(op.state)) throw new Error(op.failureReason || 'Operation already failed');
-          return op.operationId; // in-flight: the reconciler owns it
+          return op.operationId;
         }
 
         try {
           await this.transition(op, 'VALIDATED', 'destination + funds validated');
 
-          // ── Persist ledger record BEFORE any broadcast ──
           const ledger = await Transaction.create({
             userId: user._id,
             type: 'transfer_relay',
@@ -327,7 +302,7 @@ export class TransferRelayService {
 
           await this.transition(op, 'FUNDED', 'funding broadcast — awaiting on-chain verify');
 
-          /* ── STEP 2: verify funding on-chain (NOT just the RPC submit) ── */
+          /* ── STEP 2: verify funding on-chain ── */
           const verifiedFunding = await this.verifyIncomingTon(
             relay.address,
             quote.fundingAmountNano,
@@ -338,11 +313,11 @@ export class TransferRelayService {
           }
 
           const actualReceived = verifiedFunding.receivedNano;
-          const fundingNetworkFee = quote.fundingAmountNano - actualReceived > 0n
-            ? quote.fundingAmountNano - actualReceived
-            : 0n;
+          const fundingNetworkFee =
+            quote.fundingAmountNano - actualReceived > 0n
+              ? quote.fundingAmountNano - actualReceived
+              : 0n;
 
-          // Recalculate what can actually leave after REAL costs
           const availableForDestination = actualReceived - quote.minReserveNano;
 
           if (availableForDestination < quote.requestedNano) {
@@ -385,7 +360,8 @@ export class TransferRelayService {
             throw new Error('Outgoing transfer could not be confirmed on-chain.');
           }
 
-          const residual = actualReceived - quote.requestedNano - (verifiedOut.feeNano ?? 0n);
+          const residual =
+            actualReceived - quote.requestedNano - (verifiedOut.feeNano ?? 0n);
 
           await TransferOperation.updateOne(
             { _id: op._id },
@@ -396,13 +372,11 @@ export class TransferRelayService {
                 outgoingAmountNano: quote.requestedNano.toString(),
                 outgoingNetworkFeeNano: (verifiedOut.feeNano ?? 0n).toString(),
                 relayResidualNano: residual > 0n ? residual.toString() : '0',
-                'stateHistory.$[s]': undefined as any,
               },
               $push: { stateHistory: { state: 'COMPLETED', at: new Date(), note: 'both tx verified on-chain' } },
             }
           );
 
-          // Ten-day cooldown starts at completion
           await RelayAddress.updateOne(
             { _id: relay._id },
             {
@@ -413,7 +387,6 @@ export class TransferRelayService {
             }
           );
 
-          // Ledger: platform fee leg (reconciler can also sweep)
           await Transaction.create({
             userId: user._id,
             type: 'fee',
@@ -450,11 +423,6 @@ export class TransferRelayService {
 
   /* ══════════════ RECONCILIATION (worker-owned) ══════════════ */
 
-  /**
-   * Resume interrupted operations after a worker restart.
-   * NEVER submits a replacement tx without first reconciling the
-   * existing operation's on-chain facts.
-   */
   async reconcileStale(): Promise<{ resumed: number; flagged: number }> {
     let resumed = 0;
     let flagged = 0;
@@ -491,7 +459,6 @@ export class TransferRelayService {
             flagged++;
           }
         } else {
-          // CREATED / VALIDATED / FUNDED with no tx hash → safe to expire
           await TransferOperation.updateOne(
             { _id: op._id },
             {
@@ -508,8 +475,7 @@ export class TransferRelayService {
 
     return { resumed, flagged };
   }
-
-    /* ══════════════ TREASURY CONSOLIDATION (admin-gated) ══════════════ */
+      /* ══════════════ TREASURY CONSOLIDATION (admin-gated) ══════════════ */
 
   async sweepResidualToTreasury(
     adminTelegramId: number,
@@ -523,8 +489,6 @@ export class TransferRelayService {
 
     const results: Array<{ address: string; amountNano: string; txHash?: string; error?: string }> = [];
 
-    // Only sweep addresses with NO pending user obligations.
-    // Ownership-unclear residuals are NEVER auto-swept.
     const candidates = await RelayAddress.aggregate([
       {
         $lookup: {
@@ -565,14 +529,12 @@ export class TransferRelayService {
         async () => {
           const balance = await this.getTonBalance(cand.address);
 
-          // Minimum-balance + minimum-sweep threshold: leave dust alone
           const minSweep =
             config.relay.minRelayReserveNano +
             config.relay.forwardFeeEstimateNano;
 
           if (balance <= minSweep) return null;
 
-          // Reserve the network fee for the sweep itself
           const sweepable = balance - config.relay.forwardFeeEstimateNano;
           if (sweepable <= 0n) return null;
 
@@ -592,7 +554,6 @@ export class TransferRelayService {
               txHash,
             };
           } catch (err: any) {
-            // One address failing must not corrupt another's accounting
             return {
               address: cand.address as string,
               amountNano: sweepable.toString(),
@@ -600,12 +561,11 @@ export class TransferRelayService {
             };
           }
         }
-      ).catch(() => null); // lock contention → skip this cycle
+      ).catch(() => null);
 
       if (swept) results.push(swept);
     }
 
-    // Audit record: initiator, reason, per-address results. NEVER secrets.
     const adminUser = await User.findOne({ telegramId: adminTelegramId });
     await Transaction.create({
       userId: adminUser?._id,
@@ -649,13 +609,16 @@ export class TransferRelayService {
 
   /**
    * Verify an incoming TON transfer on-chain by tx hash.
-   * Never trusts a submit-time RPC response alone.
+   * Discriminated union return — TS narrows receivedNano after `ok` check.
    */
   private async verifyIncomingTon(
     address: string,
     expectedNano: bigint,
     txHash: string
-  ): Promise<{ ok: boolean; reason?: string; receivedNano?: bigint; feeNano?: bigint }> {
+  ): Promise<
+    | { ok: true; receivedNano: bigint; feeNano: bigint }
+    | { ok: false; reason: string }
+  > {
     for (let attempt = 0; attempt < 20; attempt++) {
       try {
         const txs = await this.tonClient.getTransactions(Address.parse(address), { limit: 10 });
@@ -694,8 +657,8 @@ export class TransferRelayService {
 
   /**
    * Sign and broadcast a TON transfer FROM a relay wallet.
-   * Signing material is decrypted in-memory only, never logged,
-   * never sent to Telegram.
+   * Signing material decrypted in-memory only. V4R2 and V5R1 have
+   * incompatible createTransfer signatures — branch explicitly.
    */
   private async sendFromRelay(
     relay: any,
@@ -712,27 +675,43 @@ export class TransferRelayService {
     const mnemonic = mnemonicPhrase.split(' ');
     const keyPair = await mnemonicToWalletKey(mnemonic);
 
-    const contract =
-      relay.walletVersion === 'v5r1'
-        ? WalletContractV5R1.create({ publicKey: keyPair.publicKey, workchain: 0 })
-        : WalletContractV4.create({ publicKey: keyPair.publicKey, workchain: 0 });
+    const isV5 = relay.walletVersion === 'v5r1';
+    const contract = isV5
+      ? WalletContractV5R1.create({ publicKey: keyPair.publicKey, workchain: 0 })
+      : WalletContractV4.create({ publicKey: keyPair.publicKey, workchain: 0 });
 
     const opened = this.tonClient.open(contract as any);
 
     const seqno = await opened.getSeqno();
 
-    const transfer = await contract.createTransfer({
-      seqno,
-      secretKey: keyPair.secretKey,
-      sendMode: SendMode.PAY_GAS_SEPARATELY + SendMode.IGNORE_ERRORS,
-      messages: [
-        internal({
-          to: Address.parse(to),
-          value: amountNano,
-          bounce: false,
-        }),
-      ],
-    });
+    const messages = [
+      internal({
+        to: Address.parse(to),
+        value: amountNano,
+        bounce: false,
+      }),
+    ];
+
+    const sendMode = SendMode.PAY_GAS_SEPARATELY + SendMode.IGNORE_ERRORS;
+
+    let transfer: any;
+    if (isV5) {
+      const c = contract as WalletContractV5R1;
+      transfer = await c.createTransfer({
+        seqno,
+        secretKey: keyPair.secretKey,
+        sendMode,
+        messages,
+      });
+    } else {
+      const c = contract as WalletContractV4;
+      transfer = await c.createTransfer({
+        seqno,
+        secretKey: keyPair.secretKey,
+        sendMode,
+        messages,
+      });
+    }
 
     await opened.send(transfer);
     return transfer.hash().toString('hex');
@@ -758,4 +737,5 @@ export class TransferRelayService {
 
     return { items, total, page, pageSize };
   }
-}
+    }
+      
