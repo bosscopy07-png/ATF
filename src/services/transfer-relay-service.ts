@@ -509,9 +509,253 @@ export class TransferRelayService {
     return { resumed, flagged };
   }
 
-  /* ══════════════ TREASURY CONSOLIDATION (admin-gated) ══════════════ */
+    /* ══════════════ TREASURY CONSOLIDATION (admin-gated) ══════════════ */
 
   async sweepResidualToTreasury(
     adminTelegramId: number,
     reason: string
-  ): Promise<Array<{ 
+  ): Promise<Array<{ address: string; amountNano: string; txHash?: string; error?: string }>> {
+    if (!config.features.treasurySweep) throw new Error('Treasury sweep is not enabled');
+    if (!config.relay.treasuryAddress || !isValidTonAddress(config.relay.treasuryAddress)) {
+      throw new Error('Treasury address not configured');
+    }
+    if (!reason || reason.trim().length < 5) throw new Error('A reason is required for the audit log');
+
+    const results: Array<{ address: string; amountNano: string; txHash?: string; error?: string }> = [];
+
+    // Only sweep addresses with NO pending user obligations.
+    // Ownership-unclear residuals are NEVER auto-swept.
+    const candidates = await RelayAddress.aggregate([
+      {
+        $lookup: {
+          from: 'transferoperations',
+          let: { rid: '$_id' },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ['$relayAddressId', '$$rid'] },
+                    {
+                      $in: ['$state', [
+                        'CREATED', 'VALIDATED', 'AWAITING_CONFIRMATION',
+                        'FUNDING', 'FUNDED', 'SENDING', 'RECOVERY_REQUIRED',
+                      ]],
+                    },
+                  ],
+                },
+              },
+            },
+          ],
+          as: 'openOps',
+        },
+      },
+      {
+        $match: {
+          openOps: { $size: 0 },
+          status: { $in: ['active', 'recovery_required', 'retired'] },
+        },
+      },
+    ]);
+
+    for (const cand of candidates) {
+      const swept = await withLock(
+        `lock:relay:addr:${cand.address}`,
+        60_000,
+        async () => {
+          const balance = await this.getTonBalance(cand.address);
+
+          // Minimum-balance + minimum-sweep threshold: leave dust alone
+          const minSweep =
+            config.relay.minRelayReserveNano +
+            config.relay.forwardFeeEstimateNano;
+
+          if (balance <= minSweep) return null;
+
+          // Reserve the network fee for the sweep itself
+          const sweepable = balance - config.relay.forwardFeeEstimateNano;
+          if (sweepable <= 0n) return null;
+
+          try {
+            const relay = await RelayAddress.findById(cand._id);
+            if (!relay) return null;
+
+            const txHash = await this.sendFromRelay(
+              relay,
+              config.relay.treasuryAddress,
+              sweepable
+            );
+
+            return {
+              address: cand.address as string,
+              amountNano: sweepable.toString(),
+              txHash,
+            };
+          } catch (err: any) {
+            // One address failing must not corrupt another's accounting
+            return {
+              address: cand.address as string,
+              amountNano: sweepable.toString(),
+              error: String(err.message).slice(0, 200),
+            };
+          }
+        }
+      ).catch(() => null); // lock contention → skip this cycle
+
+      if (swept) results.push(swept);
+    }
+
+    // Audit record: initiator, reason, per-address results. NEVER secrets.
+    const adminUser = await User.findOne({ telegramId: adminTelegramId });
+    await Transaction.create({
+      userId: adminUser?._id,
+      type: 'treasury_sweep',
+      asset: 'TON',
+      amount: results
+        .filter((r) => !r.error)
+        .reduce((acc, r) => acc + BigInt(r.amountNano), 0n)
+        .toString(),
+      status: 'completed',
+      txHash: `sweep-${Date.now()}`,
+      metadata: {
+        adminTelegramId,
+        reason: reason.slice(0, 300),
+        addresses: results.map((r) => ({
+          address: r.address,
+          amountNano: r.amountNano,
+          txHash: r.txHash,
+          error: r.error,
+        })),
+        sweptCount: results.filter((r) => !r.error).length,
+        failedCount: results.filter((r) => r.error).length,
+      },
+    });
+
+    return results;
+  }
+
+  /* ══════════════ INTERNALS ══════════════ */
+
+  private async transition(op: ITransferOperation, to: RelayState, note?: string): Promise<void> {
+    await TransferOperation.updateOne(
+      { _id: op._id },
+      {
+        $set: { state: to },
+        $push: { stateHistory: { state: to, at: new Date(), note } },
+      }
+    );
+    op.state = to;
+  }
+
+  /**
+   * Verify an incoming TON transfer on-chain by tx hash.
+   * Never trusts a submit-time RPC response alone.
+   */
+  private async verifyIncomingTon(
+    address: string,
+    expectedNano: bigint,
+    txHash: string
+  ): Promise<{ ok: boolean; reason?: string; receivedNano?: bigint; feeNano?: bigint }> {
+    for (let attempt = 0; attempt < 20; attempt++) {
+      try {
+        const txs = await this.tonClient.getTransactions(Address.parse(address), { limit: 10 });
+        const match = txs.find(
+          (t) =>
+            t.hash().toString('hex') === txHash ||
+            t.hash().toString('base64') === txHash
+        );
+
+        if (match) {
+          const inMsg = match.inMessage;
+          if (inMsg?.info.type === 'internal') {
+            const value = BigInt(inMsg.info.value.coins.toString());
+            if (value >= expectedNano) {
+              return {
+                ok: true,
+                receivedNano: value,
+                feeNano: BigInt(match.totalFees.coins.toString()),
+              };
+            }
+            return {
+              ok: false,
+              reason: `amount mismatch: got ${value}, expected >= ${expectedNano}`,
+            };
+          }
+          return { ok: false, reason: 'tx is not an incoming internal transfer' };
+        }
+      } catch {
+        // RPC hiccup — retry with backoff
+      }
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+
+    return { ok: false, reason: 'transaction not found on-chain after retries' };
+  }
+
+  /**
+   * Sign and broadcast a TON transfer FROM a relay wallet.
+   * Signing material is decrypted in-memory only, never logged,
+   * never sent to Telegram.
+   */
+  private async sendFromRelay(
+    relay: any,
+    to: string,
+    amountNano: bigint
+  ): Promise<string> {
+    const { decrypt } = require('../utils/encryption');
+
+    const mnemonicPhrase: string = decrypt(
+      relay.encryptedMnemonic,
+      relay.iv,
+      relay.tag
+    );
+    const mnemonic = mnemonicPhrase.split(' ');
+    const keyPair = await mnemonicToWalletKey(mnemonic);
+
+    const contract =
+      relay.walletVersion === 'v5r1'
+        ? WalletContractV5R1.create({ publicKey: keyPair.publicKey, workchain: 0 })
+        : WalletContractV4.create({ publicKey: keyPair.publicKey, workchain: 0 });
+
+    const opened = this.tonClient.open(contract as any);
+
+    const seqno = await opened.getSeqno();
+
+    const transfer = await contract.createTransfer({
+      seqno,
+      secretKey: keyPair.secretKey,
+      sendMode: SendMode.PAY_GAS_SEPARATELY + SendMode.IGNORE_ERRORS,
+      messages: [
+        internal({
+          to: Address.parse(to),
+          value: amountNano,
+          bounce: false,
+        }),
+      ],
+    });
+
+    await opened.send(transfer);
+    return transfer.hash().toString('hex');
+  }
+
+  /* ── User-facing history ── */
+
+  async history(userId: number, page = 1) {
+    const user = await User.findOne({ telegramId: userId });
+    if (!user) throw new Error('User not found');
+
+    const pageSize = 8;
+    const [items, total] = await Promise.all([
+      TransferOperation.find({ userId: user._id })
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * pageSize)
+        .limit(pageSize)
+        .select(
+          'operationId relayAddress destinationAddress requestedAmountNano state fundingTxHash outgoingTxHash createdAt'
+        ),
+      TransferOperation.countDocuments({ userId: user._id }),
+    ]);
+
+    return { items, total, page, pageSize };
+  }
+}
