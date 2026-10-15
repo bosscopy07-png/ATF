@@ -1,6 +1,6 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { config } from '../config';
-import { setBot, handleStart, handleCallback, handleText } from './handlers';
+import { setBot, handleStart, handleCallback, handleText, delUserMsg } from './handlers';
 import { setDepositBot } from '../services/deposit-service';
 
 let botInstance: TelegramBot;
@@ -17,13 +17,14 @@ export async function startBot(): Promise<void> {
   const bot = new TelegramBot(config.telegramBotToken, { polling: true });
   setBotInstance(bot);
   setBot(bot);
-  setDepositBot(bot); // ← INJECTED: so deposit-service can send notifications
+  setDepositBot(bot);
 
   bot.on('message', (msg) => {
     if (msg.text === '/start') {
-      handleStart(msg);
+      handleStart(msg).finally(() => delUserMsg(msg));
     } else {
-      handleText(msg);
+      // Delete the user's message AFTER handling (single-message chat hygiene)
+      handleText(msg).finally(() => delUserMsg(msg));
     }
   });
 
