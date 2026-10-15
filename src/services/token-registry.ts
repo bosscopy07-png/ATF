@@ -17,7 +17,6 @@ export interface TokenRef {
  * - Discovery: STON.fi asset list (provider reality, not fabricated).
  * - Verification: provider flags mapped onto our 4-state lifecycle.
  *   'suspicious'/'blacklisted' tokens are NEVER returned for swap/search.
- * - Balance reads for arbitrary jettons happen in portfolio-service.
  */
 export class TokenRegistry {
   private static cache: { tokens: TokenRef[]; at: number } | null = null;
@@ -109,7 +108,9 @@ export class TokenRegistry {
     }
   }
 
-  private static mapVerification(raw: any): 'verified' | 'community' | 'suspicious' {
+  private static mapVerification(
+    raw: any
+  ): 'verified' | 'community' | 'suspicious' | 'blacklisted' {
     const v = String(raw ?? '').toLowerCase();
     if (v === 'whitelist' || v === 'verified' || v === 'trusted') return 'verified';
     if (v === 'blacklist' || v === 'scam' || v === 'fake') return 'blacklisted';
@@ -140,7 +141,6 @@ export class TokenRegistry {
     let filter: any;
 
     try {
-      // Exact address search
       const normalized = Address.parse(q).toString();
       filter = { masterAddress: normalized, isActive: true };
     } catch {
@@ -176,4 +176,5 @@ export class TokenRegistry {
       return null;
     }
   }
-}
+      }
+              
