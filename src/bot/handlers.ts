@@ -511,3 +511,333 @@ async function startSwapInput(userId: number, chatId: number, direction: 'ton_to
   await render(userId, chatId, caption, keyboards.backKeyboard('swap'), { withImage: true });
                         }
   
+async function handleSwapInput(userId: number, chatId: number, text: string): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (!user) return;
+
+  const direction = user.state.replace('swap_input_', '') as 'ton_to_atf' | 'atf_to_ton';
+  if (!isValidAmount(text)) {
+    await toast(userId, chatId, '❌ Enter a valid positive number.', keyboards.backKeyboard('swap'));
+    return;
+  }
+
+  try {
+    const confirmation = await swapService.prepareSwap({
+      userId,
+      direction,
+      amount: text.trim(),
+    });
+
+    user.state = `swap_confirm_${direction}`;
+    user.stateData = { confirmation, inputAmount: text.trim() };
+    await user.save();
+
+    const [atfPrice, tonPrice] = await Promise.all([
+      priceService.getAtfPriceUsd().catch(() => null),
+      priceService.getTonPriceUsd().catch(() => null),
+    ]);
+
+    const isTonToAtf = direction === 'ton_to_atf';
+    let receiveUsd: string | null = null;
+    if (isTonToAtf && atfPrice) {
+      receiveUsd = priceService.convertCryptoToUsd(confirmation.expectedOutput, atfPrice.price, ATF_DECIMALS);
+    } else if (!isTonToAtf && tonPrice) {
+      receiveUsd = priceService.convertCryptoToUsd(confirmation.expectedOutput, tonPrice.price, TON_DECIMALS);
+    }
+
+    const caption = [
+      `📋 <b>SWAP QUOTE</b>`,
+      ``,
+      `<b>You Pay:</b> <code>${Precision.formatDisplay(confirmation.inputAmount)} ${isTonToAtf ? 'TON' : 'ATF'}</code>`,
+      `<b>Platform Fee:</b> <code>${Precision.formatDisplay(confirmation.platformFee)} ${isTonToAtf ? 'TON' : 'ATF'}</code>`,
+      `<b>Swap Net:</b> <code>${Precision.formatDisplay(confirmation.netSwapAmount)} ${isTonToAtf ? 'TON' : 'ATF'}</code>`,
+      ``,
+      `<b>You Receive:</b> <code>${Precision.formatDisplay(confirmation.expectedOutput)} ${isTonToAtf ? 'ATF' : 'TON'}</code>`,
+      receiveUsd ? `<i>≈ $${receiveUsd}</i>` : '',
+      `<b>Minimum:</b> <code>${Precision.formatDisplay(confirmation.minOutput)} ${isTonToAtf ? 'ATF' : 'TON'}</code>`,
+      isTonToAtf ? `<b>Network Cost:</b> <code>${Precision.formatDisplay(confirmation.dexCosts)} TON</code>` : '',
+      ``,
+      `<b>Rate:</b> ${confirmation.rate}`,
+      `⏳ Expires in <b>${Math.max(0, Math.floor((confirmation.expiresAt.getTime() - Date.now()) / 1000))}s</b>`,
+    ].filter(Boolean).join('\n');
+
+    await render(userId, chatId, caption, keyboards.confirmSwapKeyboard(), { withImage: true });
+  } catch (error: any) {
+    let msg = error.message || 'Swap failed';
+    if (error.message?.includes('Minimum')) {
+      msg = `📌 Minimum swap is <b>${config.minSwapTon} TON</b>`;
+    } else if (error.message?.includes('gas') || error.message?.includes('treasury')) {
+      msg = `⛽ <b>Insufficient gas</b>\n\nPlease top up your TON balance.`;
+    }
+    await toast(userId, chatId, `❌ ${msg}`, keyboards.backKeyboard('swap'));
+  }
+}
+
+async function executeSwap(userId: number, chatId: number): Promise<void> {
+  const user = await User.findOne({ telegramId: userId });
+  if (!user || !user.state.startsWith('swap_confirm_')) {
+    await showMainMenu(userId, chatId);
+    return;
+  }
+
+  const direction = user.state.replace('swap_confirm_', '') as 'ton_to_atf' | 'atf_to_ton';
+  const { confirmation } = user.stateData || {};
+  if (!confirmation || new Date() > confirmation.expiresAt) {
+    await clearState(userId);
+    await toast(userId, chatId, '⏳ Quote expired. Start again.', keyboards.backKeyboard('swap'));
+    return;
+  }
+
+  await render(userId, chatId, `🔄 <b>Executing Swap...</b>\n\nBroadcasting to TON blockchain ⛓️`, { inline_keyboard: [] }, { withImage: true });
+
+  try {
+    const txId = await swapService.executeSwap(userId, confirmation, direction);
+    await Transaction.findByIdAndUpdate(txId, { status: 'completed' });
+    const txRecord = await Transaction.findById(txId);
+    const txHash = txRecord?.txHash || '';
+    const link = explorerLink(txHash);
+    const isTonToAtf = direction === 'ton_to_atf';
+
+    const caption = [
+      `✅ <b>Swap Executed</b>`,
+      ``,
+      `<b>Sent:</b> ${Precision.formatDisplay(confirmation.inputAmount)} ${isTonToAtf ? 'TON' : 'ATF'}`,
+      `<b>Receive:</b> ${Precision.formatDisplay(confirmation.expectedOutput)} ${isTonToAtf ? 'ATF' : 'TON'}`,
+      `<b>Speed:</b> ~3–6s`,
+      `<b>Asset:</b> ${isTonToAtf ? 'ATF' : 'TON'}`,
+      link ? `🔗 <a href="${link}">View on Explorer</a>` : '',
+      ``,
+      `<i>Transaction done. Kindly check your wallet ✅</i>`,
+    ].filter(Boolean).join('\n');
+
+    await clearState(userId);
+    await render(userId, chatId, caption, keyboards.backKeyboard('back_main'), { withImage: true });
+  } catch (error: any) {
+    await toast(userId, chatId, `❌ <b>Swap Failed</b>\n\n${error.message}`, keyboards.backKeyboard('swap'));
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   PHASE 2 — MULTI-TOKEN SWAP UI
+   ═══════════════════════════════════════════════════════════ */
+
+const PAGE_SIZE_TOKENS = 8;
+
+async function showTokenList(userId: number, chatId: number, direction: string, page: number): Promise<void> {
+  if (!config.features.multiTokenSwap) {
+    await toast(userId, chatId, '⏳ <i>Coming soon.</i>', keyboards.tokenSearchKeyboard());
+    return;
+  }
+
+  try {
+    // List first page of tradeable tokens (empty query = browse)
+    const { items, total } = await TokenRegistry.search('', page, PAGE_SIZE_TOKENS);
+
+    await toast(userId, chatId,
+      [
+        terminalHeader('SELECT TOKEN'),
+        `Page ${page} · ${total} token(s)`,
+        ``,
+        `<i>Only verified &amp; community tokens with executable routes are listed.</i>`,
+      ].join('\n'),
+      keyboards.tokenListKeyboard(
+        items.map((t) => ({ masterAddress: t.masterAddress, symbol: t.symbol })),
+        page,
+        page * PAGE_SIZE_TOKENS < total,
+        direction
+      ));
+  } catch (err: any) {
+    await toast(userId, chatId,
+      `❌ <i>Token list unavailable: ${String(err.message).slice(0, 200)}</i>`,
+      keyboards.tokenSearchKeyboard());
+  }
+}
+
+async function handleTokenSearchInput(userId: number, chatId: number, user: any, text: string): Promise<void> {
+  const direction = user.stateData?.direction ?? 'ton_to_token';
+
+  if (!config.features.multiTokenSwap) {
+    await toast(userId, chatId, '⏳ <i>Coming soon.</i>', keyboards.tokenSearchKeyboard());
+    return;
+  }
+
+  const query = text.trim().slice(0, 60);
+  if (!query) {
+    await toast(userId, chatId,
+      `${terminalHeader('TOKEN SEARCH')}\nType the token <b>name</b>, <b>symbol</b>, or exact <b>contract address</b>.`,
+      keyboards.tokenSearchKeyboard());
+    return;
+  }
+
+  try {
+    const { items, total } = await TokenRegistry.search(query, 1, PAGE_SIZE_TOKENS);
+
+    if (!total) {
+      await toast(userId, chatId,
+        `${terminalHeader('TOKEN SEARCH')}\n❌ No supported token or route found for <b>${query.slice(0, 40)}</b>.\n\n<i>Search by name, symbol, or exact contract address.</i>`,
+        keyboards.tokenSearchKeyboard());
+      return;
+    }
+
+    await toast(userId, chatId,
+      `${terminalHeader('TOKEN SEARCH')}\n${total} result(s) for <b>${query.slice(0, 40)}</b>:`,
+      keyboards.tokenListKeyboard(
+        items.map((t) => ({ masterAddress: t.masterAddress, symbol: t.symbol })),
+        1,
+        total > PAGE_SIZE_TOKENS,
+        direction
+      ));
+  } catch (err: any) {
+    await toast(userId, chatId,
+      `❌ <i>Search failed: ${String(err.message).slice(0, 200)}</i>`,
+      keyboards.tokenSearchKeyboard());
+  }
+}
+
+async function startTokenSwapInput(userId: number, chatId: number, direction: string, master: string): Promise<void> {
+  if (!config.features.multiTokenSwap) {
+    await toast(userId, chatId, '⏳ <i>Coming soon.</i>', keyboards.tokenSearchKeyboard());
+    return;
+  }
+
+  const token = await TokenRegistry.resolve(master);
+  if (!token) {
+    await toast(userId, chatId,
+      `${terminalHeader('SWAP')}\n❌ <i>Token unavailable, unverified, or route unsupported.</i>`,
+      keyboards.tokenSearchKeyboard());
+    return;
+  }
+
+  const user = await User.findOne({ telegramId: userId });
+  if (!user) return;
+
+  user.state = 'swap_token_amount';
+  user.stateData = {
+    direction,
+    tokenMaster: token.masterAddress,
+    tokenSymbol: token.symbol,
+    tokenDecimals: token.decimals,
+  };
+  await user.save();
+
+  const inputName = direction === 'ton_to_token' ? 'TON' : token.symbol;
+
+  await toast(userId, chatId,
+    [
+      terminalHeader('SWAP'),
+      `💱 <b>${direction === 'ton_to_token' ? 'TON → ' + token.symbol : token.symbol + ' → TON'}</b>`,
+      ``,
+      `Enter the amount of <b>${inputName}</b> to swap:`,
+    ].join('\n'),
+    keyboards.cancelKeyboard('swap'));
+}
+
+async function handleTokenSwapAmount(userId: number, chatId: number, user: any, text: string): Promise<void> {
+  const { direction, tokenMaster, tokenSymbol, tokenDecimals } = user.stateData || {};
+  if (!direction || !tokenMaster) { await showMainMenu(userId, chatId); return; }
+
+  const amount = text.trim();
+  if (!isValidAmount(amount) || Number(amount) <= 0) {
+    await toast(userId, chatId,
+      `${terminalHeader('SWAP')}\n❌ <i>Invalid amount. Enter a positive number.</i>`,
+      keyboards.cancelKeyboard('swap'));
+    return;
+  }
+
+  let confirmation: any;
+  try {
+    confirmation = await swapService.prepareTokenSwap(
+      userId, direction, tokenMaster, tokenDecimals, amount
+    );
+  } catch (err: any) {
+    await toast(userId, chatId,
+      `${terminalHeader('SWAP')}\n❌ <i>${String(err.message).slice(0, 300)}</i>`,
+      keyboards.tokenSearchKeyboard());
+    return;
+  }
+
+  user.state = 'swap_token_confirm';
+  user.stateData = { ...user.stateData, confirmation };
+  await user.save();
+
+  const fp = confirmation.feePlan;
+  const inputSymbol = direction === 'ton_to_token' ? 'TON' : tokenSymbol;
+  const outputSymbol = direction === 'ton_to_token' ? tokenSymbol : 'TON';
+
+  const feeLines: string[] = [];
+  if (fp.platformFeeInputBase && fp.platformFeeInputBase !== '0') {
+    feeLines.push(
+      `🧾 Platform fee (${fp.platformPercent}%): <code>${confirmation.platformFee}</code> ${inputSymbol} <i>(from input)</i>`
+    );
+  } else {
+    feeLines.push(
+      `🧾 Platform fee (${fp.platformPercent}%): <code>${Precision.fromBaseUnits(BigInt(fp.platformFeeOutputBase), tokenDecimals)}</code> ${outputSymbol} <i>(from output)</i>`
+    );
+  }
+  if (fp.tonOutputFeeBase && fp.tonOutputFeeBase !== '0') {
+    feeLines.push(
+      `🧾 TON output fee (${config.feePolicy.tokenToTonOutputPercent}%): <code>${Precision.fromBaseUnits(BigInt(fp.tonOutputFeeBase), TON_DECIMALS)}</code> TON`
+    );
+  }
+
+  await toast(userId, chatId,
+    [
+      terminalHeader('CONFIRM SWAP'),
+      `💱 <b>${inputSymbol} → ${outputSymbol}</b>`,
+      ``,
+      `You send: <code>${confirmation.inputAmount}</code> ${inputSymbol}`,
+      ...feeLines,
+      `Minimum received: <code>${confirmation.minOutput}</code> ${outputSymbol}`,
+      `Expected received: <code>${confirmation.expectedOutput}</code> ${outputSymbol}`,
+      `DEX costs: <code>${confirmation.dexCosts}</code> TON`,
+      ``,
+      `<i>Quote valid until ${new Date(confirmation.expiresAt).toLocaleTimeString()}. Quote and balances are revalidated before execution.</i>`,
+    ].join('\n'),
+    { inline_keyboard: [
+      [{ text: '✅ Confirm Swap', callback_data: 'confirm_token_swap' }],
+      [{ text: '❌ Cancel', callback_data: 'swap' }],
+    ] });
+}
+
+async function executeTokenSwap(userId: number, chatId: number, user: any): Promise<void> {
+  const st = user.stateData || {};
+  const { confirmation, tokenDecimals } = st;
+
+  if (!config.features.multiTokenSwap || !confirmation) {
+    await showMainMenu(userId, chatId);
+    return;
+  }
+
+  // Single-use confirmation: clear state BEFORE executing so a replayed
+  // callback can never trigger a second path even if idempotency is bypassed.
+  user.state = 'idle';
+  user.stateData = {};
+  await user.save();
+
+  await render(userId, chatId,
+    `🔄 <b>Executing Swap...</b>\n\nBroadcasting to TON blockchain ⛓️`,
+    { inline_keyboard: [] }, { withImage: true });
+
+  try {
+    const txId = await swapService.executeTokenSwap(userId, confirmation, tokenDecimals);
+    const txRecord = await Transaction.findById(txId);
+    const txHash = txRecord?.txHash || '';
+    const link = explorerLink(txHash);
+
+    await render(userId, chatId,
+      [
+        `✅ <b>Swap Submitted</b>`,
+        ``,
+        `<b>Sent:</b> ${confirmation.inputAmount}`,
+        `<b>Expected receive:</b> ${confirmation.expectedOutput}`,
+        link ? `🔗 <a href="${link}">View on Explorer</a>` : '',
+        ``,
+        `<i>Track final status in ◷ Activity.</i>`,
+      ].filter(Boolean).join('\n'),
+      keyboards.backKeyboard('back_main'), { withImage: true });
+  } catch (err: any) {
+    await toast(userId, chatId,
+      `❌ <b>Swap Failed</b>\n\n<i>${String(err.message).slice(0, 300)}</i>`,
+      keyboards.tokenSearchKeyboard());
+  }
+                                                                                                   }
