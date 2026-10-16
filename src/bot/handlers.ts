@@ -81,7 +81,7 @@ export async function handleCallback(query: TelegramBot.CallbackQuery): Promise<
     return;
   }
 
-  /* ── PHASE 4: Transfer Relay ── */
+  /* ── PHASE 4: Transfer Relay (user) ── */
   if (data === 'transfer_relay') { await relayScreens.showRelayHome(userId, chatId, user); return; }
   if (data === 'relay_addresses') { await relayScreens.showRelayAddresses(userId, chatId, user); return; }
   if (data.startsWith('relay_sel_')) {
@@ -198,10 +198,29 @@ export async function handleCallback(query: TelegramBot.CallbackQuery): Promise<
   if (data === 'admin_audit') { await adminScreens.showAuditLogs(userId, chatId); return; }
   if (data === 'admin_settings') { await adminScreens.showSystemSettings(userId, chatId); return; }
   if (data === 'admin_sweep') { await adminScreens.startSweepByAddress(userId, chatId); return; }
-  if (data === 'admin_relay') { await relayScreens.showAdminRelay(userId, chatId); return; }
   if (data === 'admin_broadcast') { await adminScreens.startBroadcast(userId, chatId); return; }
   if (data === 'sweep_asset_ton') { await adminScreens.handleSweepAssetSelect(userId, chatId, 'TON'); return; }
   if (data === 'sweep_asset_atf') { await adminScreens.handleSweepAssetSelect(userId, chatId, 'ATF'); return; }
+
+  /* ── PHASE 5: Admin Relay Dashboard ── */
+  if (data === 'admin_relay_addrs') { await relayScreens.showAdminRelayAddresses(userId, chatId, 1); return; }
+  if (data.startsWith('admin_relay_addrs_page_')) {
+    await relayScreens.showAdminRelayAddresses(userId, chatId, parseInt(data.replace('admin_relay_addrs_page_', ''), 10));
+    return;
+  }
+  if (data.startsWith('radm_addr_')) {
+    await relayScreens.showAdminRelayAddressDetail(userId, chatId, data.replace('radm_addr_', ''));
+    return;
+  }
+  if (data.startsWith('radm_sweepyes_')) {
+    await relayScreens.executeRelayAddressSweep(userId, chatId, data.replace('radm_sweepyes_', ''));
+    return;
+  }
+  if (data.startsWith('radm_sweep_')) {
+    await relayScreens.confirmRelayAddressSweep(userId, chatId, data.replace('radm_sweep_', ''));
+    return;
+  }
+  if (data === 'admin_relay') { await relayScreens.showAdminRelay(userId, chatId); return; }
 
   await showMainMenu(userId, chatId);
 }
@@ -256,4 +275,4 @@ export async function delUserMsg(msg: TelegramBot.Message): Promise<void> {
     await getBot().deleteMessage(msg.chat.id, msg.message_id);
   } catch { /* ignore */ }
 }
-  
+   
