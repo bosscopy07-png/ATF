@@ -175,7 +175,7 @@ export async function executeRelayTransfer(userId: number, chatId: number, user:
     console.error('[Relay] execute failed:', err);
     await toast(userId, chatId,
       `❌ <b>Transfer failed</b>\n\n<i>${String(err.message).slice(0, 300)}</i>\n\nCheck 🧾 Relay History for state.`,
-      keyboards.mainMenuKeyboard(user.isAdmin || user.isSuperAdmin));
+      keyboards.backKeyboard('transfer_relay'));
   }
 }
 
@@ -237,5 +237,5 @@ export async function showAdminRelay(userId: number, chatId: number): Promise<vo
     const m = await import('./admin-screens');
     await m.showAdminPanel(userId, chatId);
   }
-}
-  
+    }
+                                                                                          
