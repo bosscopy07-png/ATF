@@ -85,7 +85,20 @@ export function assetRow(emoji: string, symbol: string, balance: string | null, 
 
 export function sourceBadge(p: any): string {
   const name = sourceLabel({ ...p, source: cleanSource(p) });
-  return `<i>${name}${isStale(p) ? ' · ⏳ stale' : ''}</i>`;
+  return `<i>src · ${name}${isStale(p) ? ' · ⏳ stale' : ''}</i>`;
+}
+
+/** Transaction amount → display string. Tolerates legacy DB rows stored as
+ *  decimal display strings (e.g. '0.100000000') instead of integer base
+ *  units — BigInt() on those throws, so we fall back to formatting as-is. */
+export function txAmount(amount: any, decimals: number): string {
+  const raw = String(amount ?? '0');
+  try {
+    return Precision.formatDisplay(Precision.fromBaseUnits(BigInt(raw), decimals));
+  } catch {
+    const n = Number(raw);
+    return Number.isFinite(n) ? Precision.formatDisplay(n.toFixed(decimals)) : raw;
+  }
 }
 
 export function marketMovement(price: any): string {
@@ -254,7 +267,7 @@ export async function clearState(userId: number): Promise<void> {
   }
 }
 
-/* ── USER LIFECYCLE ── */
+/* ── USER LIFECYCLE ──*/
 export async function getOrCreateUser(msg: TelegramBot.Message): Promise<any> {
   const telegramId = msg.from?.id;
   if (!telegramId) throw new Error('No telegram ID');
@@ -332,7 +345,6 @@ export function explorerRow(txHash: string): string {
 }
 
 /* ── WALLET HELPERS ──*/
-
 export async function getActiveWallet(userId: number): Promise<any> {
   const user = await User.findOne({ telegramId: userId });
   if (!user) return null;
