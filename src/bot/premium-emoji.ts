@@ -5,22 +5,31 @@
  * Telegram Premium custom-emoji equivalent and returns Bot API
  * MessageEntity[] of type "custom_emoji".
  *
+ * ── CURRENT STATUS: DISABLED BY DEFAULT ──
+ * The supplied custom_emoji_ids were harvested from a non-Premium source
+ * and are rejected/ignored by Telegram. Until valid Premium-pack IDs are
+ * installed (PREMIUM_EMOJI_ENABLED=true + corrected PREMIUM_EMOJI_MAP),
+ * this layer returns [] and every message goes out as plain unicode —
+ * requests are byte-identical to the pre-upgrade behavior.
+ *
  * Safety properties:
  *  - Pure function, no I/O, no logging of message content.
- *  - Returns [] when nothing matches → callers omit entities entirely,
- *    keeping requests identical to pre-upgrade behavior.
+ *  - Returns [] when disabled or when nothing matches → callers omit
+ *    entities entirely.
  *  - Offsets are UTF-16 code units, exactly what the Bot API requires.
  *  - Unmapped emoji stay as standard unicode (no breakage, no guessing).
  *
  * NOTE: custom_emoji entities are supported in message TEXT and CAPTIONS
  * only. InlineKeyboardButton text and answerCallbackQuery alerts cannot
  * carry entities — those keep unicode emoji by design.
- *
- * TYPING NOTE: the helpers below return the entities JSON-stringified
- * (typed `any`). node-telegram-bot-api's form encoder requires a string
- * at runtime; the raw MessageEntity[] is what buildPremiumEmojiEntities
- * produces and what the unit test validates.
  */
+
+/**
+ * ⛔ Master switch. Keep 'false' until valid Premium-pack IDs are in
+ * PREMIUM_EMOJI_MAP below. Set PREMIUM_EMOJI_ENABLED=true in env to turn on.
+ */
+const PREMIUM_EMOJI_ENABLED: boolean =
+  (process.env.PREMIUM_EMOJI_ENABLED || 'false') === 'true';
 
 export interface PremiumEmojiEntity {
   type: 'custom_emoji';
@@ -31,7 +40,10 @@ export interface PremiumEmojiEntity {
 
 /**
  * Emoji char → Telegram Premium custom_emoji_id.
- * IDs supplied by platform owner; add/replace here ONLY.
+ *
+ * ⚠️ IDs MUST come from a real Telegram Premium custom-emoji pack.
+ * How to harvest valid IDs — see the guide in the project notes. When
+ * disabled (default), this map is never read.
  */
 export const PREMIUM_EMOJI_MAP: Record<string, string> = {
   '🎯': '5877235236416266965',
@@ -127,11 +139,12 @@ const PATTERN = new RegExp(
 
 /**
  * Build custom_emoji entities for a text/caption.
- * Returns a NEW sorted, non-overlapping array (safe to pass to Bot API).
+ * Returns [] when the layer is disabled (default) — fully backward compatible.
  */
 export function buildPremiumEmojiEntities(
   text: string
 ): PremiumEmojiEntity[] {
+  if (!PREMIUM_EMOJI_ENABLED) return [];   // ⛔ master switch
   if (!text) return [];
 
   const entities: PremiumEmojiEntity[] = [];
@@ -150,12 +163,9 @@ export function buildPremiumEmojiEntities(
 }
 
 /**
- * Convenience for Bot API options. Returns the entities JSON-stringified
- * — node-telegram-bot-api's multipart form encoder requires a string;
- * passing a raw array silently drops the field.
- *
- * `any` is deliberate: Bot API typings declare MessageEntity[], the
- * runtime wants string. Callers spread the result into send options.
+ * Convenience for Bot API options. Returns entities JSON-stringified —
+ * node-telegram-bot-api's multipart form encoder requires a string.
+ * `any` is deliberate: Bot API typings declare MessageEntity[].
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function premiumEmojiOptions(text: string): any {
@@ -168,4 +178,4 @@ export function premiumEmojiCaptionOptions(text: string): any {
   const entities = buildPremiumEmojiEntities(text);
   return entities.length ? { caption_entities: JSON.stringify(entities) } : {};
   }
-  
+    
