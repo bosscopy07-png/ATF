@@ -70,6 +70,19 @@ export function movementLine(p: any): string {
   return `${c > 0 ? '🟢' : c < 0 ? '🔴' : '⚪'} ${c > 0 ? '+' : ''}${c.toFixed(2)}%`;
 }
 
+/** Compact 2-line asset block: balance on line 1, "value · 24h movement" on line 2.
+ *  Unavailable balance and unavailable price are distinct states — never $0.00. */
+export function assetRow(emoji: string, symbol: string, balance: string | null, usd: string | null, price: any): string[] {
+  if (balance === null) {
+    return [`${emoji} <b>${symbol}</b>  <i>⏳ balance unavailable</i>`];
+  }
+  const value = usd !== null ? `<code>$${fmtMoney(usd)}</code>` : '<i>price unavailable</i>';
+  return [
+    `${emoji} <b>${symbol}</b>  <code>${Precision.formatDisplay(balance)}</code>`,
+    `   ├ 💵 ${value} · 📊 ${movementLine(price)}`,
+  ];
+}
+
 export function sourceBadge(p: any): string {
   const name = sourceLabel({ ...p, source: cleanSource(p) });
   return `<i>${name}${isStale(p) ? ' · ⏳ stale' : ''}</i>`;
@@ -100,8 +113,19 @@ export function terminalHeader(title: string, subtitle?: string): string {
   ].filter(Boolean).join('\n');
 }
 
-/* ── Bot instance ── */
+/** Compact step header for multi-step flows (brand + title, no rule line). */
+export function stepHeader(title: string, subtitle?: string): string {
+  return [
+    `◈ <b>ATF NEXUS</b> · <b>${title}</b>`,
+    subtitle ? `<i>${subtitle}</i>` : '',
+  ].filter(Boolean).join('\n');
+}
 
+/** Compact "Label: value" row — the standard confirm/quote line format. */
+export const kv = (label: string, value: string): string =>
+  `<b>${label}:</b> ${value}`;
+
+/* ── Bot instance ──
 let botInstance: TelegramBot;
 
 export function setBot(bot: TelegramBot): void {
@@ -230,8 +254,7 @@ export async function clearState(userId: number): Promise<void> {
   }
 }
 
-/* ── USER LIFECYCLE ── */
-
+/* ── USER LIFECYCLE ──
 export async function getOrCreateUser(msg: TelegramBot.Message): Promise<any> {
   const telegramId = msg.from?.id;
   if (!telegramId) throw new Error('No telegram ID');
@@ -302,8 +325,13 @@ export function explorerLink(txHash: string): string {
   return `https://tonscan.org/tx/${txHash}`;
 }
 
-/* ── WALLET HELPERS ── */
+/** Explorer link row for success screens — '' when the hash is unusable. */
+export function explorerRow(txHash: string): string {
+  const link = explorerLink(txHash);
+  return link ? `🔗 <a href="${link}">View on Explorer</a>` : '';
+}
 
+/* ── WALLET HELPERS ──
 export async function getActiveWallet(userId: number): Promise<any> {
   const user = await User.findOne({ telegramId: userId });
   if (!user) return null;
@@ -341,4 +369,5 @@ export function reviveRelayQuote(raw: any): RelayQuote {
     relayResidualExpectedNano: BigInt(raw.relayResidualExpectedNano ?? '0'),
     expiresAt: new Date(raw.expiresAt),
   };
-}
+  }
+  
