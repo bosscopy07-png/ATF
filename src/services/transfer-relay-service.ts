@@ -6,11 +6,11 @@ import {
 } from '@ton/ton';
 import { config } from '../config';
 import { FeeEngine } from '../config/fees';
-import { AdminAction } from '../models/AdminAction';
 import { RelayAddress } from '../models/RelayAddress';
 import { TransferOperation, RelayState, ITransferOperation } from '../models/TransferOperation';
 import { User } from '../models/User';
 import { Transaction } from '../models/Transaction';
+import { AdminAction } from '../models/AdminAction';
 import { encrypt } from '../utils/encryption';
 import { withLock } from '../utils/distributed-lock';
 import { checkRateLimit } from '../utils/rate-limiter';
@@ -42,10 +42,15 @@ export interface RelayQuote {
  *  - Funding uses the authorized admin treasury infrastructure.
  *  - Plaintext mnemonics NEVER leave this process; AES-GCM at rest only.
  *
- * VERIFICATION NOTE: AdminWalletService.sendTon returns an internal
- * "address_seqno" reference, NOT a tx hash. On-chain verification therefore
- * matches by SENDER ADDRESS + AMOUNT on the receiving side, and falls back
- * to a balance check where the receiving address is guaranteed fresh.
+ * VERIFICATION NOTE: AdminWalletService.sendTon returns "address_seqno"
+ * (an internal reference), NOT a tx hash. On-chain verification therefore
+ * matches by SENDER ADDRESS + AMOUNT on the receiving side, with a balance
+ * fallback where the receiving address is guaranteed fresh.
+ *
+ * STATE NOTE: only FUNDING/FUNDED/SENDING count as in-flight. A CREATED or
+ * VALIDATED operation never broadcast anything — it cannot be executing
+ * concurrently (callers hold the per-address lock for the whole operation)
+ * and must never block selection or sweeps.
  */
 export class TransferRelayService {
   private tonClient: TonClient;
@@ -126,6 +131,8 @@ export class TransferRelayService {
       throw new Error(`This address is cooling down. Try again in ~${days} day(s).`);
     }
 
+    // Only genuinely in-flight or fund-holding states block selection.
+    // CREATED/VALIDATED ops never broadcast and are cleaned by the reconciler.
     const unresolved = await TransferOperation.countDocuments({
       relayAddressId: relay._id,
       state: { $in: ['FUNDING', 'FUNDED', 'SENDING', 'RECOVERY_REQUIRED'] },
@@ -206,8 +213,7 @@ export class TransferRelayService {
       expiresAt: new Date(Date.now() + config.relay.quoteTtlMs),
     };
   }
-
-  /* ══════════════ EXECUTION STATE MACHINE ══════════════ */
+    /* ══════════════ EXECUTION STATE MACHINE ══════════════ */
 
   async execute(userId: number, quote: RelayQuote, destination: string): Promise<string> {
     this.assertEnabled();
@@ -528,7 +534,7 @@ export class TransferRelayService {
                   op.state === 'SENDING' ||
                   op.state === 'RECOVERY_REQUIRED';
 
-                                  const nextState: RelayState = mustRecover ? 'RECOVERY_REQUIRED' : 'FAILED';
+                const nextState: RelayState = mustRecover ? 'RECOVERY_REQUIRED' : 'FAILED';
 
                 await TransferOperation.updateOne(
                   { _id: op._id },
@@ -617,6 +623,7 @@ export class TransferRelayService {
             flagged++;
           }
         } else {
+          // CREATED / VALIDATED with no broadcast → dead, expire safely
           await TransferOperation.updateOne(
             { _id: op._id },
             {
@@ -632,9 +639,8 @@ export class TransferRelayService {
     }
 
     return { resumed, flagged };
-  }
-
-  /* ══════════════ TREASURY CONSOLIDATION (admin-gated) ══════════════ */
+                          }
+    /* ══════════════ TREASURY CONSOLIDATION (admin-gated) ══════════════ */
 
   async sweepResidualToTreasury(
     adminTelegramId: number,
@@ -752,14 +758,16 @@ export class TransferRelayService {
 
     return results;
   }
+
   /**
    * Admin recovery sweep: move the full spendable balance of ONE relay
    * address to the admin fee wallet. Super-admin gated at the UI layer.
    *
-   * Safety: refuses while any operation is in a broadcast-pending state
-   * (CREATED/VALIDATED/AWAITING_CONFIRMATION/FUNDING/FUNDED/SENDING).
-   * Operations in RECOVERY_REQUIRED/FAILED/EXPIRED do not block — this
-   * sweep IS their recovery path. Audit-logged via AdminAction.
+   * Safety: refuses only while an operation is in a broadcast-pending
+   * state (FUNDING/FUNDED/SENDING). CREATED/VALIDATED ops never broadcast
+   * and cannot be executing concurrently — the caller holds the
+   * per-address lock, which execute() also requires for its entire body.
+   * Audit-logged via AdminAction.
    */
   async sweepAddressToAdmin(
     relayId: string,
@@ -771,11 +779,10 @@ export class TransferRelayService {
     if (!relay) throw new Error('Relay address not found');
 
     return withLock(`lock:relay:addr:${relay.address}`, 60_000, async () => {
+      // Only genuinely broadcast-pending states block a sweep.
       const inFlight = await TransferOperation.countDocuments({
         relayAddressId: relay._id,
-        state: {
-          $in: ['CREATED', 'VALIDATED', 'AWAITING_CONFIRMATION', 'FUNDING', 'FUNDED', 'SENDING'],
-        },
+        state: { $in: ['FUNDING', 'FUNDED', 'SENDING'] },
       });
       if (inFlight > 0) {
         throw new Error('This address has in-flight operations. Wait for them to finish before sweeping.');
@@ -819,7 +826,7 @@ export class TransferRelayService {
   /** Public read for the admin dashboard (live on-chain balance). */
   async getAddressBalance(address: string): Promise<bigint> {
     return this.getTonBalance(address);
-}
+  }
 
   /* ══════════════ INTERNALS ══════════════ */
 
@@ -983,5 +990,5 @@ export class TransferRelayService {
 
     return { items, total, page, pageSize };
   }
-                        }
-             
+              }
+        
