@@ -125,7 +125,7 @@ export function stepHeader(title: string, subtitle?: string): string {
 export const kv = (label: string, value: string): string =>
   `<b>${label}:</b> ${value}`;
 
-/* ── Bot instance ──
+/* ── Bot instance ──*/
 let botInstance: TelegramBot;
 
 export function setBot(bot: TelegramBot): void {
@@ -254,7 +254,7 @@ export async function clearState(userId: number): Promise<void> {
   }
 }
 
-/* ── USER LIFECYCLE ──
+/* ── USER LIFECYCLE ── */
 export async function getOrCreateUser(msg: TelegramBot.Message): Promise<any> {
   const telegramId = msg.from?.id;
   if (!telegramId) throw new Error('No telegram ID');
@@ -331,7 +331,8 @@ export function explorerRow(txHash: string): string {
   return link ? `🔗 <a href="${link}">View on Explorer</a>` : '';
 }
 
-/* ── WALLET HELPERS ──
+/* ── WALLET HELPERS ──*/
+
 export async function getActiveWallet(userId: number): Promise<any> {
   const user = await User.findOne({ telegramId: userId });
   if (!user) return null;
@@ -369,5 +370,5 @@ export function reviveRelayQuote(raw: any): RelayQuote {
     relayResidualExpectedNano: BigInt(raw.relayResidualExpectedNano ?? '0'),
     expiresAt: new Date(raw.expiresAt),
   };
-  }
-  
+    }
+    
