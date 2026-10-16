@@ -527,6 +527,392 @@ export class TransferRelayService {
                   op.state === 'SENDING' ||
                   op.state === 'RECOVERY_REQUIRED';
 
-                const nextState: RelayState = mustRecover ? 'RECOVERY_REQUIRED' : 'FAILED';
+                                  const nextState: RelayState = mustRecover ? 'RECOVERY_REQUIRED' : 'FAILED';
 
-     
+                await TransferOperation.updateOne(
+                  { _id: op._id },
+                  {
+                    $set: { state: nextState, failureReason: message },
+                    $push: {
+                      stateHistory: {
+                        state: nextState,
+                        at: new Date(),
+                        note: message.slice(0, 200),
+                      },
+                    },
+                  }
+                ).catch(() => {
+                  // Keep the original error. Reconciliation must inspect stale operations.
+                });
+
+                op.state = nextState;
+              }
+
+              throw error;
+            }
+          }
+        );
+      }
+    );
+  }
+
+  /* ══════════════ RECONCILIATION (worker-owned) ══════════════ */
+
+  async reconcileStale(): Promise<{ resumed: number; flagged: number }> {
+    let resumed = 0;
+    let flagged = 0;
+
+    let adminAddress: string | null = null;
+    try {
+      await this.adminWallet.initialize();
+      adminAddress = (this.adminWallet as any).address as string;
+    } catch { /* reconciler tolerates admin wallet being unavailable */ }
+
+    const stale = await TransferOperation.find({
+      state: { $in: ['CREATED', 'VALIDATED', 'FUNDING', 'FUNDED', 'SENDING'] },
+      updatedAt: { $lt: new Date(Date.now() - 2 * 60 * 1000) },
+    }).limit(50);
+
+    for (const op of stale) {
+      try {
+        if (op.state === 'FUNDING' && op.fundingTxHash && adminAddress) {
+          const v = await this.verifyIncomingTonFrom(
+            op.relayAddress,
+            adminAddress,
+            BigInt(op.fundingAmountNano),
+            { allowBalanceFallback: true, quick: true }
+          );
+          if (v.ok) {
+            await this.transition(op, 'FUNDED', 'reconciler: funding verified after restart');
+            resumed++;
+          } else {
+            await this.transition(op, 'RECOVERY_REQUIRED', `reconciler: funding unverifiable — ${v.reason}`);
+            flagged++;
+          }
+        } else if (op.state === 'SENDING' && op.outgoingTxHash) {
+          const v = await this.verifyIncomingTonFrom(
+            op.destinationAddress,
+            op.relayAddress,
+            BigInt(op.requestedAmountNano),
+            { allowBalanceFallback: false, quick: true }
+          );
+          if (v.ok) {
+            await TransferOperation.updateOne(
+              { _id: op._id },
+              {
+                $set: { state: 'COMPLETED', confirmedAt: new Date() },
+                $push: {
+                  stateHistory: {
+                    state: 'COMPLETED',
+                    at: new Date(),
+                    note: 'reconciler verified outgoing tx',
+                  },
+                },
+              }
+            );
+            resumed++;
+          } else {
+            await this.transition(op, 'RECOVERY_REQUIRED', `reconciler: outgoing unverifiable — ${v.reason}`);
+            flagged++;
+          }
+        } else {
+          await TransferOperation.updateOne(
+            { _id: op._id },
+            {
+              $set: { state: 'EXPIRED', failureReason: 'Expired before broadcast' },
+              $push: { stateHistory: { state: 'EXPIRED', at: new Date() } },
+            }
+          );
+          flagged++;
+        }
+      } catch {
+        flagged++;
+      }
+    }
+
+    return { resumed, flagged };
+  }
+
+  /* ══════════════ TREASURY CONSOLIDATION (admin-gated) ══════════════ */
+
+  async sweepResidualToTreasury(
+    adminTelegramId: number,
+    reason: string
+  ): Promise<Array<{ address: string; amountNano: string; txHash?: string; error?: string }>> {
+    if (!config.features.treasurySweep) throw new Error('Treasury sweep is not enabled');
+    if (!config.relay.treasuryAddress || !isValidTonAddress(config.relay.treasuryAddress)) {
+      throw new Error('Treasury address not configured');
+    }
+    if (!reason || reason.trim().length < 5) throw new Error('A reason is required for the audit log');
+
+    const results: Array<{ address: string; amountNano: string; txHash?: string; error?: string }> = [];
+
+    const candidates = await RelayAddress.aggregate([
+      {
+        $lookup: {
+          from: 'transferoperations',
+          let: { rid: '$_id' },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ['$relayAddressId', '$$rid'] },
+                    {
+                      $in: ['$state', [
+                        'CREATED', 'VALIDATED', 'AWAITING_CONFIRMATION',
+                        'FUNDING', 'FUNDED', 'SENDING', 'RECOVERY_REQUIRED',
+                      ]],
+                    },
+                  ],
+                },
+              },
+            },
+          ],
+          as: 'openOps',
+        },
+      },
+      {
+        $match: {
+          openOps: { $size: 0 },
+          status: { $in: ['active', 'recovery_required', 'retired'] },
+        },
+      },
+    ]);
+
+    for (const cand of candidates) {
+      const swept = await withLock(
+        `lock:relay:addr:${cand.address}`,
+        60_000,
+        async () => {
+          const balance = await this.getTonBalance(cand.address);
+
+          const minSweep =
+            config.relay.minRelayReserveNano +
+            config.relay.forwardFeeEstimateNano;
+
+          if (balance <= minSweep) return null;
+
+          const sweepable = balance - config.relay.forwardFeeEstimateNano;
+          if (sweepable <= 0n) return null;
+
+          try {
+            const relay = await RelayAddress.findById(cand._id);
+            if (!relay) return null;
+
+            const txHash = await this.sendFromRelay(
+              relay,
+              config.relay.treasuryAddress,
+              sweepable
+            );
+
+            return {
+              address: cand.address as string,
+              amountNano: sweepable.toString(),
+              txHash,
+            };
+          } catch (err: any) {
+            return {
+              address: cand.address as string,
+              amountNano: sweepable.toString(),
+              error: String(err.message).slice(0, 200),
+            };
+          }
+        }
+      ).catch(() => null);
+
+      if (swept) results.push(swept);
+    }
+
+    const adminUser = await User.findOne({ telegramId: adminTelegramId });
+    await Transaction.create({
+      userId: adminUser?._id,
+      type: 'treasury_sweep',
+      asset: 'TON',
+      amount: results
+        .filter((r) => !r.error)
+        .reduce((acc, r) => acc + BigInt(r.amountNano), 0n)
+        .toString(),
+      status: 'completed',
+      txHash: `sweep-${Date.now()}`,
+      metadata: {
+        adminTelegramId,
+        reason: reason.slice(0, 300),
+        addresses: results.map((r) => ({
+          address: r.address,
+          amountNano: r.amountNano,
+          txHash: r.txHash,
+          error: r.error,
+        })),
+        sweptCount: results.filter((r) => !r.error).length,
+        failedCount: results.filter((r) => r.error).length,
+      },
+    });
+
+    return results;
+  }
+
+  /* ══════════════ INTERNALS ══════════════ */
+
+  private async transition(op: ITransferOperation, to: RelayState, note?: string): Promise<void> {
+    await TransferOperation.updateOne(
+      { _id: op._id },
+      {
+        $set: { state: to },
+        $push: { stateHistory: { state: to, at: new Date(), note } },
+      }
+    );
+    op.state = to;
+  }
+
+  /**
+   * Verify an incoming transfer by SENDER ADDRESS + AMOUNT.
+   *
+   * Why not by hash: AdminWalletService.sendTon returns "address_seqno"
+   * (an internal reference), and even wallet external-message hashes do not
+   * reliably equal on-chain transaction hashes. Sender+amount on the
+   * receiving side is deterministic for this flow.
+   *
+   * allowBalanceFallback: only sound when the receiving address is
+   * guaranteed to have been empty before the transfer (true for fresh
+   * relay addresses — assertAddressSelectable enforces zero balance).
+   */
+  private async verifyIncomingTonFrom(
+    receivingAddress: string,
+    senderAddress: string,
+    expectedNano: bigint,
+    opts: { allowBalanceFallback: boolean; quick?: boolean }
+  ): Promise<
+    | { ok: true; receivedNano: bigint; feeNano: bigint; txHash: string }
+    | { ok: false; reason: string }
+  > {
+    const attempts = opts.quick ? 3 : 30;
+    const intervalMs = 5_000;
+
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      try {
+        const txs = await this.tonClient.getTransactions(Address.parse(receivingAddress), { limit: 20 });
+
+        for (const tx of txs) {
+          const inMsg = tx.inMessage;
+          if (inMsg?.info.type === 'internal') {
+            const src = inMsg.info.src?.toString();
+            if (src === senderAddress) {
+              const value = BigInt(inMsg.info.value.coins.toString());
+              if (value >= expectedNano) {
+                return {
+                  ok: true,
+                  receivedNano: value,
+                  feeNano: BigInt(tx.totalFees.coins.toString()),
+                  txHash: tx.hash().toString('hex'),
+                };
+              }
+            }
+          }
+        }
+
+        // Balance fallback (fresh-address guarantee required)
+        if (opts.allowBalanceFallback) {
+          const balance = await this.getTonBalance(receivingAddress);
+          if (balance >= expectedNano) {
+            return {
+              ok: true,
+              receivedNano: balance,
+              feeNano: 0n,
+              txHash: '',
+            };
+          }
+        }
+      } catch {
+        // RPC hiccup — retry with backoff
+      }
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+
+    return { ok: false, reason: 'incoming transfer not found on-chain after timeout' };
+  }
+
+  /**
+   * Sign and broadcast a TON transfer FROM a relay wallet.
+   * Signing material decrypted in-memory only. V4R2 and V5R1 have
+   * incompatible createTransfer signatures — branch explicitly.
+   */
+  private async sendFromRelay(
+    relay: any,
+    to: string,
+    amountNano: bigint
+  ): Promise<string> {
+    const { decrypt } = require('../utils/encryption');
+
+    const mnemonicPhrase: string = decrypt(
+      relay.encryptedMnemonic,
+      relay.iv,
+      relay.tag
+    );
+    const mnemonic = mnemonicPhrase.split(' ');
+    const keyPair = await mnemonicToWalletKey(mnemonic);
+
+    const isV5 = relay.walletVersion === 'v5r1';
+    const contract = isV5
+      ? WalletContractV5R1.create({ publicKey: keyPair.publicKey, workchain: 0 })
+      : WalletContractV4.create({ publicKey: keyPair.publicKey, workchain: 0 });
+
+    const opened = this.tonClient.open(contract as any);
+
+    const seqno = await opened.getSeqno();
+
+    const messages = [
+      internal({
+        to: Address.parse(to),
+        value: amountNano,
+        bounce: false,
+      }),
+    ];
+
+    const sendMode = SendMode.PAY_GAS_SEPARATELY + SendMode.IGNORE_ERRORS;
+
+    let transfer: any;
+    if (isV5) {
+      const c = contract as WalletContractV5R1;
+      transfer = await c.createTransfer({
+        seqno,
+        secretKey: keyPair.secretKey,
+        sendMode,
+        messages,
+      });
+    } else {
+      const c = contract as WalletContractV4;
+      transfer = await c.createTransfer({
+        seqno,
+        secretKey: keyPair.secretKey,
+        sendMode,
+        messages,
+      });
+    }
+
+    await opened.send(transfer);
+    return transfer.hash().toString('hex');
+  }
+
+  /* ── User-facing history ── */
+
+  async history(userId: number, page = 1) {
+    const user = await User.findOne({ telegramId: userId });
+    if (!user) throw new Error('User not found');
+
+    const pageSize = 8;
+    const [items, total] = await Promise.all([
+      TransferOperation.find({ userId: user._id })
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * pageSize)
+        .limit(pageSize)
+        .select(
+          'operationId relayAddress destinationAddress requestedAmountNano state fundingTxHash outgoingTxHash createdAt'
+        ),
+      TransferOperation.countDocuments({ userId: user._id }),
+    ]);
+
+    return { items, total, page, pageSize };
+  }
+                        }
+             
