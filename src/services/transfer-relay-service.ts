@@ -6,6 +6,7 @@ import {
 } from '@ton/ton';
 import { config } from '../config';
 import { FeeEngine } from '../config/fees';
+import { AdminAction } from '../models/AdminAction';
 import { RelayAddress } from '../models/RelayAddress';
 import { TransferOperation, RelayState, ITransferOperation } from '../models/TransferOperation';
 import { User } from '../models/User';
@@ -751,6 +752,74 @@ export class TransferRelayService {
 
     return results;
   }
+  /**
+   * Admin recovery sweep: move the full spendable balance of ONE relay
+   * address to the admin fee wallet. Super-admin gated at the UI layer.
+   *
+   * Safety: refuses while any operation is in a broadcast-pending state
+   * (CREATED/VALIDATED/AWAITING_CONFIRMATION/FUNDING/FUNDED/SENDING).
+   * Operations in RECOVERY_REQUIRED/FAILED/EXPIRED do not block — this
+   * sweep IS their recovery path. Audit-logged via AdminAction.
+   */
+  async sweepAddressToAdmin(
+    relayId: string,
+    adminTelegramId: number
+  ): Promise<{ address: string; amountNano: string; txHash: string }> {
+    this.assertEnabled();
+
+    const relay = await RelayAddress.findById(relayId);
+    if (!relay) throw new Error('Relay address not found');
+
+    return withLock(`lock:relay:addr:${relay.address}`, 60_000, async () => {
+      const inFlight = await TransferOperation.countDocuments({
+        relayAddressId: relay._id,
+        state: {
+          $in: ['CREATED', 'VALIDATED', 'AWAITING_CONFIRMATION', 'FUNDING', 'FUNDED', 'SENDING'],
+        },
+      });
+      if (inFlight > 0) {
+        throw new Error('This address has in-flight operations. Wait for them to finish before sweeping.');
+      }
+
+      const balance = await this.getTonBalance(relay.address);
+      const sweepable = balance - config.relay.forwardFeeEstimateNano; // reserve network fee
+      if (sweepable <= 0n) {
+        throw new Error('Nothing to sweep — balance is below the network-fee threshold.');
+      }
+
+      const txHash = await this.sendFromRelay(
+        relay,
+        config.adminFeeWalletAddress,
+        sweepable
+      );
+
+      await AdminAction.create({
+        adminId: adminTelegramId,
+        action: 'RELAY_ADDRESS_SWEEP',
+        target: relay.address,
+        result: 'success',
+        metadata: {
+          relayId: relay._id.toString(),
+          label: relay.label,
+          amountNano: sweepable.toString(),
+          txHash,
+          toAddress: config.adminFeeWalletAddress,
+          reason: 'admin_recovery_sweep',
+        },
+      });
+
+      return {
+        address: relay.address,
+        amountNano: sweepable.toString(),
+        txHash,
+      };
+    });
+  }
+
+  /** Public read for the admin dashboard (live on-chain balance). */
+  async getAddressBalance(address: string): Promise<bigint> {
+    return this.getTonBalance(address);
+}
 
   /* ══════════════ INTERNALS ══════════════ */
 
