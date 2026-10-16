@@ -6,6 +6,8 @@ import { createAdminApp } from './admin';
 import { BlockchainMonitor } from './services/blockchain-monitor';
 import { startReconciler, stopReconciler } from './jobs/reconciler';
 import { GasRecoveryRetryJob } from './jobs/gas-recovery-retry';
+// ── PHASE 4 addition: relay operation reconciler (runs in BOTH modes) ──
+import { RelayReconcilerJob } from './jobs/relay-reconciler';
 
 // ─── Service Registry & Lifecycle ─────────────────────────────────────────
 
@@ -106,6 +108,16 @@ async function startServer(): Promise<void> {
     health: async () => ({ status: 'healthy' }), // Extend in bot module if needed
   });
 
+  // ── PHASE 4 addition: relay reconciler runs in server mode too, so stale
+  //    relay operations self-expire even without a dedicated worker. ──
+  const relayReconciler = new RelayReconcilerJob();
+  manager.register({
+    name: 'relay_reconciler',
+    start: async () => relayReconciler.start(),
+    stop: async () => relayReconciler.stop(),
+    health: async () => ({ status: 'healthy' }),
+  });
+
   // HTTP service
   const app = express();
   const adminApp = createAdminApp();
@@ -196,6 +208,15 @@ async function startWorker(): Promise<void> {
     name: 'gas_recovery_retry',
     start: async () => gasRecoveryRetry.start(),
     stop: async () => gasRecoveryRetry.stop(),
+    health: async () => ({ status: 'healthy' }),
+  });
+
+  // ── PHASE 4 addition: relay reconciler (worker mode) ──
+  const relayReconciler = new RelayReconcilerJob();
+  manager.register({
+    name: 'relay_reconciler',
+    start: async () => relayReconciler.start(),
+    stop: async () => relayReconciler.stop(),
     health: async () => ({ status: 'healthy' }),
   });
 
@@ -316,5 +337,3 @@ bootstrap().catch((error) => {
   console.error('[Bootstrap] Unhandled bootstrap error:', error);
   process.exit(1);
 });
-
-                        
