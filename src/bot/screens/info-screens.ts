@@ -1,3 +1,4 @@
+
 /**
  * Info screens — transaction history, market prices, help, referral,
  * and the PHASE 1 full-portfolio screen.
@@ -74,18 +75,18 @@ export async function showPrices(userId: number, chatId: number): Promise<void> 
   ]);
 
   const caption = [
-    terminalHeader('MARKET', 'live prices · 24h movement · source'),
+    terminalHeader('MARKET', 'live prices · 24h movement'),
     '',
     tonPrice
-      ? `💎 <b>TON</b>  <code>$${tonPrice.price.toFixed(2)}</code> · ${movementLine(tonPrice)}\n   ${sourceBadge(tonPrice)}`
+      ? `💎 <b>TON</b>  <code>$${tonPrice.price.toFixed(2)}</code> · ${movementLine(tonPrice)}`
       : `💎 <b>TON</b>  <i>⏳ unavailable</i>`,
     '',
     atfPrice
-      ? `🔷 <b>ATF</b>  <code>$${atfPrice.price.toFixed(6)}</code> · ${movementLine(atfPrice)}\n   ${sourceBadge(atfPrice)}`
+      ? `🔷 <b>ATF</b>  <code>$${atfPrice.price.toFixed(6)}</code> · ${movementLine(atfPrice)}`
       : `🔷 <b>ATF</b>  <i>⏳ unavailable</i>`,
     '',
     ngnRate
-      ? `🇳🇬 <b>USD/NGN</b>  <code>₦${ngnRate.price.toFixed(2)}</code>\n   ${sourceBadge(ngnRate)}`
+      ? `🇳🇬 <b>USD/NGN</b>  <code>₦${ngnRate.price.toFixed(2)}</code>`
       : `🇳🇬 <b>USD/NGN</b>  <i>⏳ unavailable</i>`,
   ].join('\n');
 
@@ -151,7 +152,12 @@ export async function showReferral(userId: number, chatId: number): Promise<void
 export async function showPortfolio(userId: number, chatId: number, page: number): Promise<void> {
   if (!config.features.portfolioScreen) {
     const user = await User.findOne({ telegramId: userId });
-    await toast(userId, chatId, '⏳ <i>coming soon</i>', keyboards.mainMenuKeyboard(user?.isAdmin || user?.isSuperAdmin || false));
+    await toast(
+      userId,
+      chatId,
+      '⏳ <i>coming soon</i>',
+      keyboards.mainMenuKeyboard(user?.isAdmin || user?.isSuperAdmin || false)
+    );
     return;
   }
 
@@ -160,7 +166,12 @@ export async function showPortfolio(userId: number, chatId: number, page: number
 
   const walletAddress = await walletService.getAddress(userId);
   if (!walletAddress) {
-    await toast(userId, chatId, `${terminalHeader('PORTFOLIO')}\n<i>No wallet connected.</i>`, keyboards.mainMenuKeyboard(user.isAdmin || user.isSuperAdmin));
+    await toast(
+      userId,
+      chatId,
+      `${terminalHeader('PORTFOLIO')}\n<i>No wallet connected.</i>`,
+      keyboards.mainMenuKeyboard(user.isAdmin || user.isSuperAdmin)
+    );
     return;
   }
 
@@ -169,12 +180,20 @@ export async function showPortfolio(userId: number, chatId: number, page: number
     const { ton, atf } = await walletService.getBalance(walletAddress);
     summary = await portfolioService.buildPortfolio(walletAddress, ton, atf);
   } catch {
-    await toast(userId, chatId, `${terminalHeader('PORTFOLIO')}\n⚠️ <i>Could not load portfolio — try again.</i>`, keyboards.mainMenuKeyboard(user.isAdmin || user.isSuperAdmin));
+    await toast(
+      userId,
+      chatId,
+      `${terminalHeader('PORTFOLIO')}\n⚠️ <i>Could not load portfolio — try again.</i>`,
+      keyboards.mainMenuKeyboard(user.isAdmin || user.isSuperAdmin)
+    );
     return;
   }
 
   if (user.lastAction !== 'portfolio') {
-    await User.updateOne({ _id: user._id }, { $set: { lastAction: 'portfolio' } }).catch(() => {});
+    await User.updateOne(
+      { _id: user._id },
+      { $set: { lastAction: 'portfolio' } }
+    ).catch(() => {});
   }
 
   const PAGE_SIZE = 5;
@@ -185,9 +204,11 @@ export async function showPortfolio(userId: number, chatId: number, page: number
       line.valuationStatus === 'price_unavailable'
         ? `\n   ⚠️ <i>price unavailable — excluded from total</i>`
         : '';
+
     const priceLine = line.priceUsd
       ? `$${new Intl.NumberFormat('en-US', { maximumFractionDigits: 6 }).format(Number(line.priceUsd))}`
       : '—';
+
     lines.push(
       `🪙 <b>${line.symbol}</b> · ${line.name}\n` +
       `   <code>${line.balanceDisplay}</code>\n` +
@@ -215,5 +236,5 @@ export async function showPortfolio(userId: number, chatId: number, page: number
   ].filter(Boolean).join('\n');
 
   await toast(userId, chatId, text, keyboards.portfolioKeyboard(page, hasMore));
-                            }
-                            
+       }
+        
