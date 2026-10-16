@@ -7,7 +7,7 @@ import {
   TelegramBot, User, Transaction, Referral, Precision, config, TON_DECIMALS, ATF_DECIMALS,
   priceService, portfolioService, walletService,
   render, toast,
-  terminalHeader, movementLine, sourceBadge, explorerLink,
+  terminalHeader, movementLine, sourceBadge, explorerLink, txAmount,
   formatAddressShort,
 } from '../context';
 import * as keyboards from '../keyboards';
@@ -39,12 +39,12 @@ export async function showHistory(userId: number, chatId: number, page: number):
 
   const lines = display.map((tx: any) => {
     const icon = tx.type === 'deposit' ? '📥' : tx.type === 'withdrawal' ? '📤' : '🔄';
-    const amt = Precision.fromBaseUnits(BigInt(tx.amount), tx.asset === 'TON' ? TON_DECIMALS : ATF_DECIMALS);
+    const amt = txAmount(tx.amount, tx.asset === 'TON' ? TON_DECIMALS : ATF_DECIMALS);
     const shortHash = tx.txHash && !tx.txHash.includes('-')
       ? `<a href="${explorerLink(tx.txHash)}">${tx.txHash.slice(0, 6)}…${tx.txHash.slice(-4)}</a>`
       : '···';
     const statusIcon = tx.status === 'completed' ? '✅' : tx.status === 'pending' ? '⏳' : '❌';
-    return `${icon} <b>${tx.type.toUpperCase()}</b>  <code>${Precision.formatDisplay(amt)} ${tx.asset}</code>\n   ${statusIcon} ${tx.status} · ${shortHash}`;
+    return `${icon} <b>${tx.type.toUpperCase()}</b>  <code>${amt} ${tx.asset}</code>\n   ${statusIcon} ${tx.status} · ${shortHash}`;
   });
 
   const caption = [
@@ -215,4 +215,5 @@ export async function showPortfolio(userId: number, chatId: number, page: number
   ].filter(Boolean).join('\n');
 
   await toast(userId, chatId, text, keyboards.portfolioKeyboard(page, hasMore));
-}
+                            }
+                            
