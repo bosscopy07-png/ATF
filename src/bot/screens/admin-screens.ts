@@ -567,8 +567,298 @@ export async function handleSweepAmountInput(userId: number, chatId: number, tex
       txHash = await walletService.sendJetton(targetId, config.adminFeeWalletAddress, config.atfJettonAddress!, amountBase);
     }
 
-    await AdminAction.create({
+        await AdminAction.create({
       adminId: userId,
       action: 'ASSET_SWEEP',
       target: targetId.toString(),
-      result: 'success'
+      result: 'success',
+      metadata: {
+        asset: sweepAsset,
+        amount: amountStr,
+        walletAddress,
+        txHash,
+        toAddress: config.adminFeeWalletAddress,
+        reason: 'emergency_recovery',
+      },
+    });
+
+    await clearState(userId);
+    await render(userId, chatId, [
+      `✅ <b>Sweep Completed</b>`,
+      '',
+      `<code>${Precision.formatDisplay(amountStr)} ${sweepAsset}</code> recovered`,
+      `├ from  <code>${formatAddressShort(walletAddress)}</code>`,
+      `└ owner <code>${targetId}</code>`,
+      '',
+      `Tx: <code>${txHash}</code>`,
+      sweepAsset === 'TON' ? `<i>~0.02 TON left in wallet for fees.</i>` : '',
+    ].filter(Boolean).join('\n'), keyboards.backKeyboard('admin_panel'), { withImage: true });
+
+  } catch (error: any) {
+    console.error(`[Sweep] Blockchain failure for ${walletAddress}:`, error);
+    await toast(userId, chatId, [
+      `❌ <b>Sweep failed on-chain</b>`,
+      '',
+      `${error.message}`,
+      '',
+      `Common causes:`,
+      `├ TON sweep — not enough left for tx fees`,
+      `└ ATF sweep — wallet needs ~0.05 TON for Jetton gas`,
+      '',
+      `Try sweeping TON first, then ATF.`,
+    ].join('\n'), keyboards.cancelKeyboard('admin_panel'));
+  }
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+   📊 ADMIN TRANSACTION VIEWS
+   ─────────────────────────────────────────────────────────────────────────── */
+
+const txLine = (tx: any, prefix: string): string => {
+  const icon = tx.type === 'deposit' ? '📥' : tx.type === 'withdrawal' ? '📤' : '🔄';
+  const amt = Precision.fromBaseUnits(BigInt(tx.amount), tx.asset === 'TON' ? TON_DECIMALS : ATF_DECIMALS);
+  const statusIcon = tx.status === 'completed' ? '✅' : tx.status === 'pending' ? '⏳' : '❌';
+  return `${icon} ${prefix ? `${prefix} ` : ''}<code>${Precision.formatDisplay(amt)} ${tx.asset}</code> · ${statusIcon} ${tx.status}`;
+};
+
+export async function showAdminTransactions(userId: number, chatId: number, page: number): Promise<void> {
+  try {
+    await requireAdmin(userId);
+    const limit = 5;
+    const skip = (page - 1) * limit;
+
+    const txs = await Transaction.find().sort({ createdAt: -1 }).skip(skip).limit(limit + 1);
+    const hasMore = txs.length > limit;
+    const display = hasMore ? txs.slice(0, limit) : txs;
+
+    const lines = display.map((tx: any) => txLine(tx, `<code>${tx.userId}</code>`));
+    const caption = [stepHeader('ALL TRANSACTIONS', `page ${page}`), '', ...lines].join('\n');
+    await render(userId, chatId, caption, keyboards.adminPaginationKeyboard('admin_transactions', page, hasMore), { withImage: true });
+  } catch {
+    await showMainMenu(userId, chatId);
+  }
+}
+
+export async function showAdminDeposits(userId: number, chatId: number, page: number): Promise<void> {
+  try {
+    await requireAdmin(userId);
+    const limit = 5;
+    const skip = (page - 1) * limit;
+
+    const txs = await Transaction.find({ type: 'deposit' }).sort({ createdAt: -1 }).skip(skip).limit(limit + 1);
+    const hasMore = txs.length > limit;
+    const display = hasMore ? txs.slice(0, limit) : txs;
+
+    const lines = display.map((tx: any) => txLine(tx, `<code>${tx.userId}</code>`));
+    const caption = [stepHeader('DEPOSITS', `page ${page}`), '', ...lines].join('\n');
+    await render(userId, chatId, caption, keyboards.adminPaginationKeyboard('admin_deposits', page, hasMore), { withImage: true });
+  } catch {
+    await showMainMenu(userId, chatId);
+  }
+}
+
+export async function showAdminWithdrawals(userId: number, chatId: number, page: number): Promise<void> {
+  try {
+    await requireAdmin(userId);
+    const limit = 5;
+    const skip = (page - 1) * limit;
+
+    const txs = await Transaction.find({ type: 'withdrawal' }).sort({ createdAt: -1 }).skip(skip).limit(limit + 1);
+    const hasMore = txs.length > limit;
+    const display = hasMore ? txs.slice(0, limit) : txs;
+
+    const lines = display.map((tx: any) => txLine(tx, `<code>${tx.userId}</code>`));
+    const caption = [stepHeader('WITHDRAWALS', `page ${page}`), '', ...lines].join('\n');
+    await render(userId, chatId, caption, keyboards.adminPaginationKeyboard('admin_withdrawals', page, hasMore), { withImage: true });
+  } catch {
+    await showMainMenu(userId, chatId);
+  }
+}
+
+export async function showAdminSwaps(userId: number, chatId: number, page: number): Promise<void> {
+  try {
+    await requireAdmin(userId);
+    const limit = 5;
+    const skip = (page - 1) * limit;
+
+    const txs = await Transaction.find({ type: 'swap' }).sort({ createdAt: -1 }).skip(skip).limit(limit + 1);
+    const hasMore = txs.length > limit;
+    const display = hasMore ? txs.slice(0, limit) : txs;
+
+    const lines = display.map((tx: any) => txLine(tx, `<code>${tx.userId}</code>`));
+    const caption = [stepHeader('SWAPS', `page ${page}`), '', ...lines].join('\n');
+    await render(userId, chatId, caption, keyboards.adminPaginationKeyboard('admin_swaps', page, hasMore), { withImage: true });
+  } catch {
+    await showMainMenu(userId, chatId);
+  }
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+   ⚙️ CONFIG VIEWS
+   ─────────────────────────────────────────────────────────────────────────── */
+
+export async function showAdminTokenConfig(userId: number, chatId: number): Promise<void> {
+  try {
+    await requireAdmin(userId);
+    const caption = [
+      stepHeader('TOKEN CONFIG'),
+      '',
+      `🔷 ATF jetton  <code>${formatAddressShort(config.atfJettonAddress)}</code>`,
+      `└ decimals  <code>${ATF_DECIMALS}</code>`,
+      '',
+      `<i>Edit via environment variables.</i>`,
+    ].join('\n');
+
+    await render(userId, chatId, caption, keyboards.backKeyboard('admin_panel'), { withImage: true });
+  } catch {
+    await showMainMenu(userId, chatId);
+  }
+}
+
+export async function showAdminDexConfig(userId: number, chatId: number): Promise<void> {
+  try {
+    await requireAdmin(userId);
+    const caption = [
+      stepHeader('DEX CONFIG'),
+      '',
+      `🔀 STON.fi API  <code>${config.stonfiApiUrl}</code>`,
+      `└ slippage  <code>${config.maxSlippagePercent}%</code>`,
+      '',
+      `<i>Edit via environment variables.</i>`,
+    ].join('\n');
+
+    await render(userId, chatId, caption, keyboards.backKeyboard('admin_panel'), { withImage: true });
+  } catch {
+    await showMainMenu(userId, chatId);
+  }
+}
+
+export async function showAdminFeeConfig(userId: number, chatId: number): Promise<void> {
+  try {
+    await requireAdmin(userId);
+    const caption = [
+      stepHeader('FEE CONFIG'),
+      '',
+      `├ swap  <code>${config.platformSwapFeePercent}%</code>`,
+      `├ TON→token  <code>${config.feePolicy.tonToTokenPercent}%</code> · base <code>${config.feePolicy.platformFeeBase}</code>`,
+      `├ token→TON  <code>${config.feePolicy.tokenToTonInputPercent}%</code> in + <code>${config.feePolicy.tokenToTonOutputPercent}%</code> TON out`,
+      `├ token→token  <code>${config.feePolicy.tokenToTokenPercent}%</code>`,
+      `├ relay transfer  <code>${config.feePolicy.relayTransferPercent}%</code>`,
+      `└ fee wallet  <code>${formatAddressShort(config.adminFeeWalletAddress)}</code>`,
+      '',
+      `<i>Edit via environment variables.</i>`,
+    ].join('\n');
+
+    await render(userId, chatId, caption, keyboards.backKeyboard('admin_panel'), { withImage: true });
+  } catch {
+    await showMainMenu(userId, chatId);
+  }
+}
+
+export async function showAdminPriceProviders(userId: number, chatId: number): Promise<void> {
+  try {
+    await requireAdmin(userId);
+    const caption = [
+      stepHeader('PRICE PROVIDERS'),
+      '',
+      `💎 TON/USD  <code>${config.tonPriceApiUrl || 'auto-fallback'}</code>`,
+      `🔷 ATF/USD  <code>${config.atfPriceApiUrl || 'auto-fallback'}</code>`,
+      `🇳🇬 USD/NGN  <code>${config.usdNgnRateApiUrl || 'auto-fallback'}</code>`,
+      '',
+      `<i>Edit via environment variables.</i>`,
+    ].join('\n');
+
+    await render(userId, chatId, caption, keyboards.backKeyboard('admin_panel'), { withImage: true });
+  } catch {
+    await showMainMenu(userId, chatId);
+  }
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+   📢 BROADCAST MESSAGE (Super Admin)
+   ─────────────────────────────────────────────────────────────────────────── */
+
+export async function startBroadcast(userId: number, chatId: number): Promise<void> {
+  try {
+    await requireSuperAdmin(userId);
+    const user = await User.findOne({ telegramId: userId });
+    if (!user) return;
+
+    user.state = 'broadcast_input';
+    await user.save();
+
+    await render(userId, chatId, `${stepHeader('BROADCAST')}\n\nType the message to send to <b>all</b> users:`, keyboards.cancelKeyboard('admin_panel'), { withImage: true });
+  } catch {
+    await showAdminPanel(userId, chatId);
+  }
+}
+
+export async function handleBroadcast(userId: number, chatId: number, text: string): Promise<void> {
+  try {
+    await requireSuperAdmin(userId);
+  } catch {
+    await showMainMenu(userId, chatId);
+    return;
+  }
+
+  const users = await User.find().select('telegramId');
+  let sent = 0;
+  let failed = 0;
+
+  for (const u of users) {
+    try {
+      const broadcastText = `📢 <b>Announcement</b>\n\n${text}`;
+      await getBot().sendMessage(u.telegramId, broadcastText, {
+        parse_mode: 'HTML',
+        ...premiumEmojiOptions(broadcastText),
+      });
+      sent++;
+    } catch {
+      failed++;
+    }
+    if (sent % 20 === 0) await new Promise(r => setTimeout(r, 1000));
+  }
+
+  await clearState(userId);
+  await toast(userId, chatId, `✅ <b>Broadcast complete</b>\n\n├ sent  <b>${sent}</b>\n└ failed  <b>${failed}</b>`, keyboards.backKeyboard('admin_panel'));
+
+  await AdminAction.create({
+    adminId: userId,
+    action: 'BROADCAST_SENT',
+    target: 'all_users',
+    result: 'success',
+  });
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+   📈 PLATFORM STATS
+   ─────────────────────────────────────────────────────────────────────────── */
+
+export async function handleStats(userId: number, chatId: number): Promise<void> {
+  try {
+    await requireAdmin(userId);
+    const totalUsers = await User.countDocuments();
+    const totalTxs = await Transaction.countDocuments();
+    const totalSwaps = await Transaction.countDocuments({ type: 'swap' });
+    const totalDeposits = await Transaction.countDocuments({ type: 'deposit' });
+    const totalWithdrawals = await Transaction.countDocuments({ type: 'withdrawal' });
+    const totalRelayOps = await (await import('../../models/TransferOperation')).TransferOperation.countDocuments();
+
+    const caption = [
+      stepHeader('PLATFORM STATS'),
+      '',
+      `👥 users  <b>${totalUsers}</b>`,
+      `📜 transactions  <b>${totalTxs}</b>`,
+      '',
+      `├ 🔄 swaps  <b>${totalSwaps}</b>`,
+      `├ 📥 deposits  <b>${totalDeposits}</b>`,
+      `├ 📤 withdrawals  <b>${totalWithdrawals}</b>`,
+      `└ 🚀 relay transfers  <b>${totalRelayOps}</b>`,
+    ].join('\n');
+
+    await render(userId, chatId, caption, keyboards.backKeyboard('admin_panel'), { withImage: true });
+  } catch {
+    await showMainMenu(userId, chatId);
+  }
+    }
+          
