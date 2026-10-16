@@ -6,7 +6,7 @@ import {
   TelegramBot, User, Precision, config, TON_DECIMALS, ATF_DECIMALS,
   priceService, walletService,
   render, clearState,
-  fmtMoney, movementLine, terminalHeader, withTimeout,
+  fmtMoney, movementLine, terminalHeader, assetRow, withTimeout,
   WALLET_BALANCE_TIMEOUT_MS, getActiveWallet, formatAddressShort,
 } from '../context';
 import * as keyboards from '../keyboards';
@@ -46,21 +46,6 @@ export async function showMainMenu(userId: number, chatId: number): Promise<void
     : null;
   const totalNgn = totalUsd !== null && ngnRate ? priceService.convertUsdToNgn(totalUsd, ngnRate.price) : null;
 
-  // Compact 2-line asset row: balance on line 1, value + 24h movement on line 2.
-  // Balance unavailable and price unavailable are distinguished — neither is ever rendered as $0.00.
-  const assetBlock = (emoji: string, symbol: string, balance: string | null, usd: string | null, price: any): string[] => {
-    if (balance === null) {
-      return [`${emoji} <b>${symbol}</b>  <i>⏳ balance unavailable</i>`];
-    }
-    const value = usd !== null
-      ? `<code>$${fmtMoney(usd)}</code>`
-      : '<i>price unavailable</i>';
-    return [
-      `${emoji} <b>${symbol}</b>  <code>${Precision.formatDisplay(balance)}</code>`,
-      `   ├ 💵 ${value} · 📊 ${movementLine(price)}`,
-    ];
-  };
-
   const totalRow = totalUsd !== null
     ? `💵 <code>$${fmtMoney(totalUsd)}</code>${totalNgn ? `  ·  🇳🇬 <code>₦${fmtMoney(totalNgn, 0)}</code>` : ''}`
     : `<i>⏳ unavailable</i>`;
@@ -71,9 +56,9 @@ export async function showMainMenu(userId: number, chatId: number): Promise<void
     `◉ <b>TOTAL PORTFOLIO</b>`,
     totalRow,
     '',
-    ...assetBlock('💎', 'TON', tonBalance, tonUsd, tonPrice),
+    ...assetRow('💎', 'TON', tonBalance, tonUsd, tonPrice),
     '',
-    ...assetBlock('🔷', 'ATF', atfBalance, atfUsd, atfPrice),
+    ...assetRow('🔷', 'ATF', atfBalance, atfUsd, atfPrice),
     '',
     `━━━━━━━━━━━━━━━━━━━━`,
     `◉ <b>MARKET</b>`,
@@ -84,8 +69,7 @@ export async function showMainMenu(userId: number, chatId: number): Promise<void
     wallet
       ? `◉ 🗝 <b>WALLET</b>  <code>${formatAddressShort(wallet.address)}</code>${wallet.walletVersion ? ` · <code>${wallet.walletVersion.toUpperCase()}</code>` : ''}`
       : `⚠️ <b>No active wallet</b> — tap ▣ Wallet to create or import one`,
-  ].join('
-');
+  ].join('\n');
 
   await render(userId, chatId, caption, keyboards.mainMenuKeyboard(user.isAdmin || user.isSuperAdmin), { withImage: true });
 }
@@ -102,9 +86,7 @@ export async function restoreLastAction(userId: number, chatId: number): Promise
     await render(
       userId,
       chatId,
-      '🔙 <b>Welcome back</b>
-
-Your previous session was reset — you can continue below.',
+      '🔙 <b>Welcome back</b>'\n\n'Your previous session was reset — you can continue below.',
       keyboards.mainMenuKeyboard(user.isAdmin || user.isSuperAdmin)
     );
     return;
@@ -122,5 +104,5 @@ Your previous session was reset — you can continue below.',
     case 'transfer_relay': { const m = await import('./relay-screens'); await m.showRelayHome(userId, chatId, user); break; }
     default: await showMainMenu(userId, chatId);
   }
-                                                                                                                   }
-  
+        }
+      
