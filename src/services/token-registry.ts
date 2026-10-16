@@ -17,6 +17,8 @@ export interface TokenRef {
  * - Discovery: STON.fi asset list (provider reality, not fabricated).
  * - Verification: provider flags mapped onto our 4-state lifecycle.
  *   'suspicious'/'blacklisted' tokens are NEVER returned for swap/search.
+ * - Self-healing: search() refreshes from the provider when the local
+ *   registry is empty (e.g., first boot after deploy).
  */
 export class TokenRegistry {
   private static cache: { tokens: TokenRef[]; at: number } | null = null;
@@ -33,6 +35,7 @@ export class TokenRegistry {
 
   /**
    * Refresh registry from STON.fi. Fail-soft: keeps last good cache.
+   * Defensive against multiple response shapes and price-field names.
    */
   static async refresh(): Promise<void> {
     try {
@@ -41,21 +44,27 @@ export class TokenRegistry {
         params: { limit: 300 },
       });
 
-      const rows: any[] = Array.isArray(res.data)
-        ? res.data
-        : (res.data?.asset_list ?? res.data?.assets ?? []);
+      const payload: any = res.data;
+      const rows: any[] = Array.isArray(payload)
+        ? payload
+        : (payload?.asset_list ?? payload?.assets ?? payload?.data ?? []);
+
+      console.log(`[TokenRegistry] refresh: ${rows.length} assets from provider`);
 
       for (const raw of rows) {
         try {
-          const masterAddress = raw.contract_address ?? raw.address;
+          const masterAddress =
+            raw.contract_address ?? raw.address ?? raw.jetton_address ?? raw.master;
           if (!masterAddress) continue;
 
           const normalized = this.normalize(masterAddress);
 
           const verification = this.mapVerification(raw.verification);
           const symbol = String(raw.symbol ?? '').toUpperCase();
-          const name = String(raw.name ?? symbol);
+          const name = String(raw.name ?? raw.display_name ?? symbol);
           const decimals = Number(raw.decimals ?? 9);
+          const price =
+            raw.dex_price_usd ?? raw.price_usd ?? raw.usd_price ?? raw.price ?? null;
 
           if (!symbol || !Number.isInteger(decimals)) continue;
           if (verification === 'blacklisted') {
@@ -74,13 +83,10 @@ export class TokenRegistry {
                 name,
                 decimals,
                 verification,
-                imageUrl: raw.image_url ?? undefined,
+                imageUrl: raw.image_url ?? raw.image ?? undefined,
                 priceSource: 'ston.fi',
                 priceUpdatedAt: new Date(),
-                lastPriceUsd:
-                  raw.dex_price_usd != null
-                    ? String(raw.dex_price_usd)
-                    : undefined,
+                lastPriceUsd: price != null ? String(price) : undefined,
                 isActive: verification !== 'suspicious',
               },
             },
@@ -129,6 +135,7 @@ export class TokenRegistry {
 
   /**
    * Search by name, symbol, or exact master address. Paginated.
+   * Self-heals: populates the registry on first use if empty.
    */
   static async search(
     query: string,
@@ -137,6 +144,11 @@ export class TokenRegistry {
   ): Promise<{ items: ISupportedToken[]; total: number }> {
     const q = query.trim();
     if (!q) return { items: [], total: 0 };
+
+    // Self-heal: refresh from provider if the registry was never populated
+    if ((await SupportedToken.estimatedDocumentCount()) === 0) {
+      await this.refresh().catch(() => {});
+    }
 
     let filter: any;
 
@@ -176,5 +188,4 @@ export class TokenRegistry {
       return null;
     }
   }
-      }
-              
+}
