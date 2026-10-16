@@ -206,29 +206,101 @@ export class TransferRelayService {
   }
     /* ══════════════ EXECUTION STATE MACHINE ══════════════ */
 
-  async execute(userId: number, quote: RelayQuote, destination: string): Promise<string> {
-    this.assertEnabled();
+                
+          
+async execute(
+  userId: number,
+  quote: RelayQuote,
+  destination: string,
+): Promise<string> {
+  this.assertEnabled();
 
-    if (!isValidTonAddress(destination)) throw new Error('Invalid destination address');
-    if (new Date() > quote.expiresAt) throw new Error('Quote expired. Request a new preview.');
+  if (!isValidTonAddress(destination)) {
+    throw new Error('Invalid destination address');
+  }
 
-    const user = await User.findOne({ telegramId: userId });
-    if (!user) throw new Error('User not found');
-    if (user.isFrozen) throw new Error('Account is frozen');
+  if (Date.now() > quote.expiresAt.getTime()) {
+    throw new Error('Quote expired. Request a new preview.');
+  }
 
-    const idempotencyKey = `relay:${userId}:${quote.quoteId}`;
+  const user = await User.findOne({ telegramId: userId });
 
-    return withLock(`lock:relay:user:${userId}`, config.relay.lockTtlMs, async () => {
-      const relay = await RelayAddress.findOne({ _id: quote.relayAddressId, userId: user._id });
+  if (!user) throw new Error('User not found');
+  if (user.isFrozen) throw new Error('Account is frozen');
+
+  const normalizedDestination = Address.parse(destination).toString();
+  const idempotencyKey = `relay:${userId}:${quote.quoteId}`;
+
+  return withLock(
+    `lock:relay:user:${userId}`,
+    config.relay.lockTtlMs,
+    async () => {
+      const relay = await RelayAddress.findOne({
+        _id: quote.relayAddressId,
+        userId: user._id,
+      });
+
       if (!relay) throw new Error('Relay address not found');
 
-      return withLock(`lock:relay:addr:${relay.address}`, config.relay.lockTtlMs, async () => {
-        await this.assertAddressSelectable(relay);
+      if (relay.address !== quote.relayAddress) {
+        throw new Error('Quote relay address does not match the selected address');
+      }
 
-        const raw: any = await TransferOperation.findOneAndUpdate(
-          { idempotencyKey },
-          {
-            $setOnInsert: {
+      return withLock(
+        `lock:relay:addr:${relay.address}`,
+        config.relay.lockTtlMs,
+        async () => {
+          /*
+           * Check for an existing operation BEFORE address selection.
+           * A previous operation may have already funded this address.
+           */
+          const existing = await TransferOperation.findOne({
+            idempotencyKey,
+          });
+
+          if (existing) {
+            if (existing.state === 'COMPLETED') {
+              return existing.operationId;
+            }
+
+            if (
+              existing.state === 'RECOVERY_REQUIRED' ||
+              existing.state === 'FUNDING' ||
+              existing.state === 'FUNDED' ||
+              existing.state === 'SENDING'
+            ) {
+              throw new Error(
+                `Operation ${existing.operationId} is ${existing.state}. ` +
+                'Reconcile its on-chain transactions before attempting another transfer.',
+              );
+            }
+
+            if (
+              existing.state === 'FAILED' ||
+              existing.state === 'EXPIRED'
+            ) {
+              throw new Error(
+                existing.failureReason ||
+                'This operation has failed. Reconcile it before creating another transfer.',
+              );
+            }
+
+            throw new Error(
+              `Operation ${existing.operationId} already exists in state ${existing.state}. ` +
+              'It will not be executed again automatically.',
+            );
+          }
+
+          await this.assertAddressSelectable(relay);
+
+          /*
+           * Atomic creation relies on a UNIQUE index on idempotencyKey.
+           * Never interpret an arbitrary database error as a new operation.
+           */
+          let op: ITransferOperation;
+
+          try {
+            op = await TransferOperation.create({
               operationId: crypto.randomUUID(),
               idempotencyKey,
               userId: user._id,
@@ -241,185 +313,343 @@ export class TransferRelayService {
               forwardFeeEstimateNano: quote.forwardFeeEstimateNano.toString(),
               minReserveNano: quote.minReserveNano.toString(),
               totalDebitNano: quote.totalDebitNano.toString(),
-              destinationAddress: Address.parse(destination).toString(),
+              destinationAddress: normalizedDestination,
               expiresAt: new Date(Date.now() + 30 * 60 * 1000),
               retryCount: 0,
-              stateHistory: [{ state: 'CREATED', at: new Date() }],
-            },
-          },
-          { upsert: true, new: true, rawResult: true }
-        );
+              stateHistory: [
+                { state: 'CREATED', at: new Date() },
+              ],
+            }) as ITransferOperation;
+          } catch (error: any) {
+            if (error?.code === 11000) {
+              throw new Error(
+                'A concurrent request created this operation. ' +
+                'Check its status before retrying.',
+              );
+            }
 
-        const op: ITransferOperation = raw.value;
-        if (raw.lastErrorObject?.updatedExisting) {
-          if (['COMPLETED'].includes(op.state)) return op.operationId;
-          if (['FAILED', 'EXPIRED'].includes(op.state)) throw new Error(op.failureReason || 'Operation already failed');
-          return op.operationId;
-        }
-
-        try {
-          await this.transition(op, 'VALIDATED', 'destination + funds validated');
-
-          const ledger = await Transaction.create({
-            userId: user._id,
-            type: 'transfer_relay',
-            asset: 'TON',
-            amount: Precision.fromBaseUnits(quote.requestedNano, 9),
-            fee: Precision.fromBaseUnits(quote.platformFeeNano, 9),
-            feeAsset: 'TON',
-            feePercentage: config.feePolicy.relayTransferPercent,
-            feeWallet: config.adminFeeWalletAddress,
-            feeStatus: 'pending',
-            status: 'processing',
-            txHash: `relay-pending-${op.operationId}`,
-            toAddress: destination,
-            metadata: {
-              operationId: op.operationId,
-              relayAddress: relay.address,
-              fundingAmount: Precision.fromBaseUnits(quote.fundingAmountNano, 9),
-              platformFee: Precision.fromBaseUnits(quote.platformFeeNano, 9),
-              relayService: true,
-            },
-          });
-
-          await this.transition(op, 'FUNDING', 'broadcasting funding tx');
-
-          /* ── STEP 1: FUNDING via authorized admin infrastructure ── */
-          await this.adminWallet.initialize();
-          const fundingTxHash = await this.adminWallet.sendTon(
-            relay.address,
-            quote.fundingAmountNano
-          );
-
-          await TransferOperation.updateOne(
-            { _id: op._id },
-            { $set: { fundingTxHash } }
-          );
-          await Transaction.updateOne(
-            { _id: ledger._id },
-            { $set: { metadata: { ...ledger.metadata, fundingTxHash } } }
-          );
-
-          await this.transition(op, 'FUNDED', 'funding broadcast — awaiting on-chain verify');
-
-          /* ── STEP 2: verify funding on-chain ── */
-          const verifiedFunding = await this.verifyIncomingTon(
-            relay.address,
-            quote.fundingAmountNano,
-            fundingTxHash
-          );
-          if (!verifiedFunding.ok) {
-            throw new Error(`Funding verification failed: ${verifiedFunding.reason}`);
+            throw error;
           }
 
-          const actualReceived = verifiedFunding.receivedNano;
-          const fundingNetworkFee =
-            quote.fundingAmountNano - actualReceived > 0n
-              ? quote.fundingAmountNano - actualReceived
-              : 0n;
+          let ledger: any = null;
+          let fundingBroadcastAttempted = false;
+          let outgoingBroadcastAttempted = false;
 
-          const availableForDestination = actualReceived - quote.minReserveNano;
+          try {
+            await this.transition(
+              op,
+              'VALIDATED',
+              'Destination and quote validated',
+            );
 
-          if (availableForDestination < quote.requestedNano) {
-            await this.transition(op, 'RECOVERY_REQUIRED', 'insufficient after real network costs');
-            throw new Error('Network costs exceeded the estimate. Operation flagged for recovery.');
-          }
-
-          await TransferOperation.updateOne(
-            { _id: op._id },
-            {
-              $set: {
-                fundingActualNano: actualReceived.toString(),
-                fundingNetworkFeeNano: fundingNetworkFee.toString(),
+            ledger = await Transaction.create({
+              userId: user._id,
+              type: 'transfer_relay',
+              asset: 'TON',
+              amount: Precision.fromBaseUnits(
+                quote.requestedNano,
+                9,
+              ),
+              fee: Precision.fromBaseUnits(
+                quote.platformFeeNano,
+                9,
+              ),
+              feeAsset: 'TON',
+              feePercentage: config.feePolicy.relayTransferPercent,
+              feeWallet: config.adminFeeWalletAddress,
+              feeStatus: 'pending',
+              status: 'processing',
+              txHash: `relay-pending-${op.operationId}`,
+              toAddress: normalizedDestination,
+              metadata: {
+                operationId: op.operationId,
+                relayAddress: relay.address,
+                fundingAmount: Precision.fromBaseUnits(
+                  quote.fundingAmountNano,
+                  9,
+                ),
+                platformFee: Precision.fromBaseUnits(
+                  quote.platformFeeNano,
+                  9,
+                ),
+                relayService: true,
               },
-            }
-          );
+            });
 
-          await this.transition(op, 'SENDING', 'broadcasting outgoing transfer');
+            /*
+             * Persist the funding state BEFORE calling the treasury sender.
+             * A timeout can happen after the network has accepted a transaction.
+             */
+            await this.transition(
+              op,
+              'FUNDING',
+              'Preparing treasury funding broadcast',
+            );
 
-          /* ── STEP 3: outgoing transfer FROM the relay wallet ── */
-          const outgoingTxHash = await this.sendFromRelay(
-            relay,
-            Address.parse(destination).toString(),
-            quote.requestedNano
-          );
+            await this.adminWallet.initialize();
 
-          await TransferOperation.updateOne(
-            { _id: op._id },
-            { $set: { outgoingTxHash } }
-          );
+            fundingBroadcastAttempted = true;
 
-          /* ── STEP 4: verify destination tx on-chain ── */
-          const verifiedOut = await this.verifyIncomingTon(
-            destination,
-            quote.requestedNano,
-            outgoingTxHash
-          );
-          if (!verifiedOut.ok) {
-            await this.transition(op, 'RECOVERY_REQUIRED', 'outgoing tx unconfirmed');
-            throw new Error('Outgoing transfer could not be confirmed on-chain.');
-          }
+            const fundingTxHash = await this.adminWallet.sendTon(
+              relay.address,
+              quote.fundingAmountNano,
+            );
 
-          const residual =
-            actualReceived - quote.requestedNano - (verifiedOut.feeNano ?? 0n);
+            await TransferOperation.updateOne(
+              { _id: op._id },
+              { $set: { fundingTxHash } },
+            );
 
-          await TransferOperation.updateOne(
-            { _id: op._id },
-            {
-              $set: {
-                state: 'COMPLETED',
-                confirmedAt: new Date(),
-                outgoingAmountNano: quote.requestedNano.toString(),
-                outgoingNetworkFeeNano: (verifiedOut.feeNano ?? 0n).toString(),
-                relayResidualNano: residual > 0n ? residual.toString() : '0',
+            await Transaction.updateOne(
+              { _id: ledger._id },
+              {
+                $set: {
+                  metadata: {
+                    ...ledger.metadata,
+                    fundingTxHash,
+                  },
+                },
               },
-              $push: { stateHistory: { state: 'COMPLETED', at: new Date(), note: 'both tx verified on-chain' } },
+            );
+
+            await this.transition(
+              op,
+              'FUNDED',
+              'Funding transaction submitted; awaiting on-chain verification',
+            );
+
+            const verifiedFunding = await this.verifyIncomingTon(
+              relay.address,
+              quote.fundingAmountNano,
+              fundingTxHash,
+            );
+
+            if (!verifiedFunding.ok) {
+              await this.transition(
+                op,
+                'RECOVERY_REQUIRED',
+                `Funding verification uncertain: ${verifiedFunding.reason}`,
+              );
+
+              throw new Error(
+                'Funding could not be confirmed. Operation requires reconciliation.',
+              );
             }
-          );
 
-          await RelayAddress.updateOne(
-            { _id: relay._id },
-            {
-              $set: {
-                nextEligibleAt: new Date(Date.now() + config.relay.reuseCooldownDays * 86_400_000),
-                lastActivityAt: new Date(),
-              },
+            const actualReceived = verifiedFunding.receivedNano;
+
+            const fundingNetworkFee =
+              quote.fundingAmountNano > actualReceived
+                ? quote.fundingAmountNano - actualReceived
+                : 0n;
+
+            const availableForDestination =
+              actualReceived - quote.minReserveNano;
+
+            if (availableForDestination < quote.requestedNano) {
+              await TransferOperation.updateOne(
+                { _id: op._id },
+                {
+                  $set: {
+                    fundingActualNano: actualReceived.toString(),
+                    fundingNetworkFeeNano: fundingNetworkFee.toString(),
+                    state: 'RECOVERY_REQUIRED',
+                  },
+                  $push: {
+                    stateHistory: {
+                      state: 'RECOVERY_REQUIRED',
+                      at: new Date(),
+                      note: 'Insufficient balance after funding verification',
+                    },
+                  },
+                },
+              );
+
+              throw new Error(
+                'Network costs exceeded the estimate. Operation flagged for recovery.',
+              );
             }
-          );
 
-          await Transaction.create({
-            userId: user._id,
-            type: 'fee',
-            asset: 'TON',
-            amount: Precision.fromBaseUnits(quote.platformFeeNano, 9),
-            status: 'completed',
-            txHash: `relay-fee-${op.operationId}`,
-            metadata: { operationId: op.operationId, relayAddress: relay.address, feeKind: 'relay_platform_fee' },
-          });
-
-          await Transaction.updateOne(
-            { _id: ledger._id },
-            { $set: { status: 'completed', txHash: outgoingTxHash, reconciledAt: new Date() } }
-          );
-
-          return op.operationId;
-        } catch (err: any) {
-          const message = err?.message || String(err);
-          const current = await TransferOperation.findOne({ _id: op._id });
-          if (current && !['COMPLETED', 'RECOVERY_REQUIRED'].includes(current.state)) {
             await TransferOperation.updateOne(
               { _id: op._id },
               {
-                $set: { state: 'FAILED', failureReason: message.slice(0, 500) },
-                $push: { stateHistory: { state: 'FAILED', at: new Date(), note: message.slice(0, 200) } },
-              }
+                $set: {
+                  fundingActualNano: actualReceived.toString(),
+                  fundingNetworkFeeNano: fundingNetworkFee.toString(),
+                },
+              },
             );
+
+            await this.transition(
+              op,
+              'SENDING',
+              'Preparing outgoing relay transfer',
+            );
+
+            /*
+             * Mark the broadcast as attempted before calling sendFromRelay.
+             * The sender may broadcast successfully and then time out.
+             */
+            outgoingBroadcastAttempted = true;
+
+            const outgoingTxHash = await this.sendFromRelay(
+              relay,
+              normalizedDestination,
+              quote.requestedNano,
+            );
+
+            await TransferOperation.updateOne(
+              { _id: op._id },
+              { $set: { outgoingTxHash } },
+            );
+
+            const verifiedOut = await this.verifyIncomingTon(
+              normalizedDestination,
+              quote.requestedNano,
+              outgoingTxHash,
+            );
+
+            if (!verifiedOut.ok) {
+              await this.transition(
+                op,
+                'RECOVERY_REQUIRED',
+                `Outgoing verification uncertain: ${verifiedOut.reason}`,
+              );
+
+              throw new Error(
+                'Outgoing transfer could not be confirmed. Operation requires recovery.',
+              );
+            }
+
+            /*
+             * The destination has been verified. Persist completion before
+             * secondary bookkeeping so bookkeeping errors cannot trigger a resend.
+             */
+            const residual =
+              actualReceived -
+              quote.requestedNano -
+              (verifiedOut.feeNano ?? 0n);
+
+            await TransferOperation.updateOne(
+              { _id: op._id },
+              {
+                $set: {
+                  state: 'COMPLETED',
+                  confirmedAt: new Date(),
+                  outgoingAmountNano: quote.requestedNano.toString(),
+                  outgoingNetworkFeeNano: (
+                    verifiedOut.feeNano ?? 0n
+                  ).toString(),
+                  relayResidualNano: (
+                    residual > 0n ? residual : 0n
+                  ).toString(),
+                },
+                $push: {
+                  stateHistory: {
+                    state: 'COMPLETED',
+                    at: new Date(),
+                    note: 'Outgoing transaction verified on-chain',
+                  },
+                },
+              },
+            );
+
+            op.state = 'COMPLETED';
+
+            await RelayAddress.updateOne(
+              { _id: relay._id },
+              {
+                $set: {
+                  nextEligibleAt: new Date(
+                    Date.now() +
+                    config.relay.reuseCooldownDays * 86_400_000,
+                  ),
+                  lastActivityAt: new Date(),
+                },
+              },
+            );
+
+            await Transaction.create({
+              userId: user._id,
+              type: 'fee',
+              asset: 'TON',
+              amount: Precision.fromBaseUnits(
+                quote.platformFeeNano,
+                9,
+              ),
+              status: 'completed',
+              txHash: `relay-fee-${op.operationId}`,
+              metadata: {
+                operationId: op.operationId,
+                relayAddress: relay.address,
+                feeKind: 'relay_platform_fee',
+              },
+            });
+
+            await Transaction.updateOne(
+              { _id: ledger._id },
+              {
+                $set: {
+                  status: 'completed',
+                  txHash: outgoingTxHash,
+                  reconciledAt: new Date(),
+                },
+              },
+            );
+
+            return op.operationId;
+          } catch (error: any) {
+            const message = String(
+              error?.message || error,
+            ).slice(0, 500);
+
+            /*
+             * Never mark an uncertain broadcast as an ordinary failure.
+             * Preserve the operation for reconciliation instead.
+             */
+            if (op.state !== 'COMPLETED') {
+              const mustRecover =
+                fundingBroadcastAttempted ||
+                outgoingBroadcastAttempted ||
+                op.state === 'FUNDING' ||
+                op.state === 'FUNDED' ||
+                op.state === 'SENDING' ||
+                op.state === 'RECOVERY_REQUIRED';
+
+              const nextState: RelayState = mustRecover
+                ? 'RECOVERY_REQUIRED'
+                : 'FAILED';
+
+              await TransferOperation.updateOne(
+                { _id: op._id },
+                {
+                  $set: {
+                    state: nextState,
+                    failureReason: message,
+                  },
+                  $push: {
+                    stateHistory: {
+                      state: nextState,
+                      at: new Date(),
+                      note: message.slice(0, 200),
+                    },
+                  },
+                },
+              ).catch(() => {
+                // Keep the original error. Reconciliation must inspect stale operations.
+              });
+
+              op.state = nextState;
+            }
+
+            throw error;
           }
-          throw err;
+        },
+      );
+    },
+  );
         }
-      });
-    });
-  }
+                
 
   /* ══════════════ RECONCILIATION (worker-owned) ══════════════ */
 
