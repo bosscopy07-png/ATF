@@ -153,6 +153,11 @@ export async function handleCallback(query: TelegramBot.CallbackQuery): Promise<
   if (data === 'admin_give') { await adminScreens.startGiveAdmin(userId, chatId); return; }
   if (data === 'admin_remove') { await adminScreens.startRemoveAdmin(userId, chatId); return; }
   if (data === 'admin_list') { await adminScreens.showAdminList(userId, chatId); return; }
+  if (data === 'admin_search') { await adminScreens.startUserSearch(userId, chatId); return; }
+  if (data.startsWith('admin_msg_')) {
+    await adminScreens.startAdminMessage(userId, chatId, parseInt(data.replace('admin_msg_', ''), 10));
+    return;
+  }
   if (data === 'admin_users') { await adminScreens.showUserList(userId, chatId, 1); return; }
   if (data.startsWith('admin_users_page_')) {
     await adminScreens.showUserList(userId, chatId, parseInt(data.replace('admin_users_page_', ''), 10));
@@ -246,6 +251,8 @@ export async function handleText(msg: TelegramBot.Message): Promise<void> {
   if (user.state === 'admin_give_input') { await adminScreens.handleGiveAdmin(userId, chatId, text); return; }
   if (user.state === 'admin_remove_input') { await adminScreens.handleRemoveAdmin(userId, chatId, text); return; }
   if (user.state === 'broadcast_input') { await adminScreens.handleBroadcast(userId, chatId, text); return; }
+  if (user.state === 'admin_user_search') { await adminScreens.handleUserSearch(userId, chatId, text); return; }
+  if (user.state === 'admin_msg_input') { await adminScreens.handleAdminMessage(userId, chatId, user, text); return; }
   if (user.state === 'sweep_address_input') { await adminScreens.handleSweepAddressInput(userId, chatId, text); return; }
   if (user.state === 'sweep_amount_input') { await adminScreens.handleSweepAmountInput(userId, chatId, text); return; }
 
@@ -279,5 +286,5 @@ export async function delUserMsg(msg: TelegramBot.Message): Promise<void> {
   try {
     await getBot().deleteMessage(msg.chat.id, msg.message_id);
   } catch { /* ignore */ }
-  }
+     }
    
