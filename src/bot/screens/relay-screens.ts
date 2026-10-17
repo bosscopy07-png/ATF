@@ -481,7 +481,16 @@ export async function executeRelayAddressSweep(userId: number, chatId: number, r
       `└ tx  <code>${result.txHash}</code>`,
       '',
       `<i>Funds recovered to admin fee wallet.</i>`,
-    ].join('\n'), {
+        ].join('\n'), {
       inline_keyboard: [
         [{ text: '‹ Address Detail', callback_data: `radm_addr_${relayId}` }],
-        [{ text: '‹ Addresses', callback_dat
+        [{ text: '‹ Addresses', callback_data: 'admin_relay_addrs' }],
+      ],
+    }, { withImage: true });
+  } catch (err: any) {
+    console.error('[Relay] admin sweep failed:', err);
+    await toast(userId, chatId,
+      `❌ <b>Sweep failed</b>\n\n<i>${String(err.message).slice(0, 300)}</i>`,
+      { inline_keyboard: [[{ text: '‹ Back', callback_data: `radm_addr_${relayId}` }]] });
+  }
+}
