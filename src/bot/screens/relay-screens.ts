@@ -172,6 +172,7 @@ export async function fundRelayFromWallet(userId: number, chatId: number, user: 
       `❌ <b>Could not fund the relay</b>\n\n<i>${String(err.message).slice(0, 300)}</i>`,
       { inline_keyboard: [
         [{ text: '⟳ Retry', callback_data: 'relay_fundgo' }],
+        [{ text: '♻️ Reclaim TON', callback_data: 'relay_reclaim' }],
         [{ text: '‹ Relay', callback_data: 'transfer_relay' }],
       ] });
   }
@@ -233,8 +234,12 @@ export async function executeRelayTransfer(userId: number, chatId: number, user:
     // Loud failure: full stack to the log so root causes are visible
     console.error('[Relay] execute failed:', err);
     await toast(userId, chatId,
-      `❌ <b>Transfer failed</b>\n\n<i>${String(err.message).slice(0, 300)}</i>\n\nCheck 🧾 Relay History for state.`,
-      keyboards.backKeyboard('transfer_relay'));
+      `❌ <b>Transfer failed</b>\n\n<i>${String(err.message).slice(0, 300)}</i>\n\nRecover any stranded funds with ♻️ Reclaim.`,
+      { inline_keyboard: [
+        [{ text: '♻️ Reclaim TON', callback_data: 'relay_reclaim' }],
+        [{ text: '🧾 Relay History', callback_data: 'relay_history' }],
+        [{ text: '🏠 Main Menu', callback_data: 'back_main' }],
+      ] });
   }
 }
 
@@ -259,6 +264,65 @@ export async function showRelayHistory(userId: number, chatId: number, user: any
   await toast(userId, chatId,
     `${terminalHeader('RELAY HISTORY')}\n${lines.join('\n\n')}`,
     keyboards.relayMenuKeyboard(true));
+}
+
+/* ── ♻️ Reclaim (error/abandoned funding recovery) ── */
+
+export async function showRelayReclaim(userId: number, chatId: number, user: any): Promise<void> {
+  if (!config.features.transferRelay) { await showMainMenu(userId, chatId); return; }
+
+  try {
+    const r = await relayService.getReclaimable(userId);
+
+    if (!r) {
+      await toast(userId, chatId,
+        `${terminalHeader('RECLAIM')}\n<i>No reclaimable funds right now — this appears when a relay holds funds outside an active transfer (error, expiry, or leftover).</i>`,
+        keyboards.relayMenuKeyboard(true));
+      return;
+    }
+
+    await toast(userId, chatId,
+      [
+        stepHeader('RECLAIM TON', formatAddressShort(r.address)),
+        '',
+        `💎 on relay  <code>${Precision.fromBaseUnits(r.balanceNano, 9)} TON</code>`,
+        `├ platform fee kept  <code>${Precision.fromBaseUnits(r.feeNano, 9)} TON</code>`,
+        `└ network reserve    <code>${Precision.fromBaseUnits(config.relay.forwardFeeEstimateNano, 9)} TON</code>`,
+        '',
+        `♻️ <b>you receive  <code>${Precision.fromBaseUnits(r.reclaimNano, 9)} TON</code></b>`,
+        '',
+        `<i>Reclaimed from the actual balance — the platform fee stays per policy, the reserve stays on the address.</i>`,
+      ].join('\n'),
+      { inline_keyboard: [
+        [{ text: `♻️ Reclaim ${Precision.fromBaseUnits(r.reclaimNano, 9)} TON`, callback_data: `relay_reclaimgo_${r.relayId}` }],
+        [{ text: '❌ Cancel', callback_data: 'transfer_relay' }],
+      ] });
+  } catch (err: any) {
+    await toast(userId, chatId,
+      `❌ <i>${String(err.message).slice(0, 300)}</i>`,
+      keyboards.backKeyboard('transfer_relay'));
+  }
+}
+
+export async function executeRelayReclaim(userId: number, chatId: number, user: any, relayId: string): Promise<void> {
+  try {
+    const result = await relayService.reclaimFunds(userId, relayId);
+
+    await toast(userId, chatId,
+      [
+        `✅ <b>RECLAIM COMPLETE</b>`,
+        '',
+        `♻️ returned to your wallet  <code>${Precision.fromBaseUnits(BigInt(result.reclaimNano), 9)} TON</code>`,
+        `├ platform fee → admin  <code>${Precision.fromBaseUnits(BigInt(result.feeNano), 9)} TON</code>`,
+        `└ tx  <code>${result.txHash.slice(0, 20)}…</code>`,
+      ].join('\n'),
+      keyboards.relayMenuKeyboard(true));
+  } catch (err: any) {
+    console.error('[Relay] reclaim failed:', err);
+    await toast(userId, chatId,
+      `❌ <b>Reclaim failed</b>\n\n<i>${String(err.message).slice(0, 300)}</i>`,
+      keyboards.backKeyboard('transfer_relay'));
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -418,68 +482,4 @@ export async function showAdminRelayAddressDetail(userId: number, chatId: number
   }
 }
 
-/** Sweep confirmation screen (explicit second step — no accidental sweeps). */
-export async function confirmRelayAddressSweep(userId: number, chatId: number, relayId: string): Promise<void> {
-  try {
-    await requireSuperAdmin(userId);   // sweeping moves funds — super admin only
-    const { RelayAddress } = await import('../../models/RelayAddress');
-
-    const relay = await RelayAddress.findById(relayId);
-    if (!relay) {
-      await toast(userId, chatId, '❌ Relay address not found.', { inline_keyboard: [[{ text: '‹ Addresses', callback_data: 'admin_relay_addrs' }]] });
-      return;
-    }
-
-    const balanceNano = await relayService.getAddressBalance(relay.address).catch(() => 0n);
-    const sweepable = balanceNano - config.relay.forwardFeeEstimateNano;
-    if (sweepable <= 0n) {
-      await toast(userId, chatId, 'Nothing to sweep — balance below network-fee threshold.', { inline_keyboard: [[{ text: '‹ Back', callback_data: `radm_addr_${relayId}` }]] });
-      return;
-    }
-
-    await render(userId, chatId, [
-      stepHeader('CONFIRM RECOVERY SWEEP', relay.label),
-      '',
-      `├ from  <code>${formatAddressShort(relay.address)}</code>`,
-      `├ amount  <code>${Precision.fromBaseUnits(sweepable, 9)} TON</code>`,
-      `└ to admin fee wallet  <code>${formatAddressShort(config.adminFeeWalletAddress)}</code>`,
-      '',
-      `<i>The network reserve (${Precision.fromBaseUnits(config.relay.forwardFeeEstimateNano, 9)} TON) stays on the address.</i>`,
-    ].join('\n'), {
-      inline_keyboard: [
-        [{ text: '✅ Confirm Sweep', callback_data: `radm_sweepyes_${relayId}` }],
-        [{ text: '❌ Cancel', callback_data: `radm_addr_${relayId}` }],
-      ],
-    }, { withImage: true });
-  } catch {
-    await showAdminRelay(userId, chatId);
-  }
-}
-
-/** Execute the sweep. */
-export async function executeRelayAddressSweep(userId: number, chatId: number, relayId: string): Promise<void> {
-  try {
-    await requireSuperAdmin(userId);
-    const result = await relayService.sweepAddressToAdmin(relayId, userId);
-
-    await render(userId, chatId, [
-      `✅ <b>SWEEP COMPLETED</b>`,
-      '',
-      `├ address  <code>${formatAddressShort(result.address)}</code>`,
-      `├ swept  <code>${Precision.fromBaseUnits(BigInt(result.amountNano), 9)} TON</code>`,
-      `└ tx  <code>${result.txHash}</code>`,
-      '',
-      `<i>Funds recovered to admin fee wallet.</i>`,
-    ].join('\n'), {
-      inline_keyboard: [
-        [{ text: '‹ Address Detail', callback_data: `radm_addr_${relayId}` }],
-        [{ text: '‹ Addresses', callback_data: 'admin_relay_addrs' }],
-      ],
-    }, { withImage: true });
-    } catch (err: any) {
-    console.error('[Relay] admin sweep failed:', err);
-    await toast(userId, chatId,
-      `❌ <b>Sweep failed</b>\n\n<i>${String(err.message).slice(0, 300)}</i>`,
-      { inline_keyboard: [[{ text: '‹ Back', callback_data: `radm_addr_${relayId}` }]] });
-  }
-}
+/** Sweep confirmation screen (explicit second step — no
