@@ -25,11 +25,15 @@ export interface ITransferOperation extends Document {
   stateHistory: Array<{ state: RelayState; at: Date; note?: string }>;
 
   requestedAmountNano: string;        // what destination should receive
-  platformFeeNano: string;            // 2%
-  fundingAmountNano: string;          // total sent to relay wallet
-  forwardFeeEstimateNano: string;
-  minReserveNano: string;
-  totalDebitNano: string;             // requested + fee (+ funding carry)
+  platformFeeNano: string;            // 2% — sent to admin fee wallet
+  fundingAmountNano: string;          // total debited from user wallet (requested + fee + reserve)
+  forwardFeeEstimateNano: string;     // estimated network reserve
+  minReserveNano: string;             // configured minimum wallet reserve
+  totalDebitNano: string;             // same as fundingAmountNano (kept for audit clarity)
+  /**
+   * Optional at creation: the operation row is created during FUNDING,
+   * before the user has entered a destination. execute() fills it in.
+   */
   destinationAddress: string;
 
   fundingTxHash?: string;
@@ -76,7 +80,9 @@ const TransferOperationSchema = new Schema<ITransferOperation>(
     forwardFeeEstimateNano: { type: String, required: true },
     minReserveNano: { type: String, required: true },
     totalDebitNano: { type: String, required: true },
-    destinationAddress: { type: String, required: true },
+    // Optional: created at funding time, before the destination is known.
+    // execute() sets it. Existing documents (all have it) remain valid.
+    destinationAddress: { type: String, required: false },
 
     fundingTxHash: { type: String, index: true },
     fundingActualNano: { type: String },
