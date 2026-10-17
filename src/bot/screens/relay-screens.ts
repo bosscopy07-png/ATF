@@ -1,7 +1,10 @@
 /**
- * PHASE 4 — Transfer Relay UI (user) + PHASE 5 relay dashboard (admin):
- * summary, paginated address list with live balances, per-address detail,
- * and one-tap recovery sweep to the admin fee wallet.
+ * PHASE 4 — Transfer Relay UI (user-funded two-phase flow) + PHASE 5
+ * admin relay dashboard (interactive).
+ *
+ * Flow: amount → user funds relay address on-chain → check receipt →
+ * destination → confirm → single relay tx (platform fee to admin wallet +
+ * requested amount to destination) → verified completion.
  * Imports context + main-menu (static). No cycles.
  */
 import {
@@ -18,7 +21,7 @@ import { showMainMenu } from './main-menu';
 import * as keyboards from '../keyboards';
 
 /* ───────────────────────────────────────────────────────────────────────────
-   🚀 TRANSFER RELAY UI (user-facing)
+   🚀 TRANSFER RELAY UI (user-facing, two-phase)
    ─────────────────────────────────────────────────────────────────────────── */
 
 export async function showRelayHome(userId: number, chatId: number, user: any): Promise<void> {
@@ -50,10 +53,15 @@ export async function showRelayHome(userId: number, chatId: number, user: any): 
       '',
       `📋 <b>${addresses.length}</b> relay address${addresses.length !== 1 ? 'es' : ''} ready`,
       '',
-      `├ each used address rests <code>${config.relay.reuseCooldownDays}</code> days before reuse`,
+      `▸ <b>HOW IT WORKS</b>`,
+      `1️⃣ pick an address &amp; amount`,
+      `2️⃣ fund the relay address on-chain`,
+      `3️⃣ enter the destination — we relay it`,
+      '',
+      `├ used addresses rest <code>${config.relay.reuseCooldownDays}</code> days before reuse`,
       `└ platform-managed — reliable, but <b>not</b> anonymous`,
       '',
-      `<i>Select an address below to start a transfer.</i>`,
+      `<i>Select an address below to start.</i>`,
     ].join('\n'),
     keyboards.relayMenuKeyboard(addresses.length > 0));
 }
@@ -74,13 +82,15 @@ export async function showRelayAddresses(userId: number, chatId: number, user: a
     { inline_keyboard: rows });
 }
 
+/* ── Phase 1: amount → funding instructions ── */
+
 export async function startRelayAmount(userId: number, chatId: number, user: any, relayId: string): Promise<void> {
   user.state = 'relay_amount';
   user.stateData = { relayId };
   await user.save();
 
   await toast(userId, chatId,
-    `${stepHeader('TRANSFER RELAY', 'step 1/2 · amount')}\nHow much <b>TON</b> should reach the destination?`,
+    `${stepHeader('TRANSFER RELAY', 'step 1/3 · amount')}\nHow much <b>TON</b> should reach the destination?`,
     keyboards.cancelKeyboard('transfer_relay'));
 }
 
@@ -105,20 +115,80 @@ export async function handleRelayAmount(userId: number, chatId: number, user: an
     return;
   }
 
-  user.state = 'relay_address';
+  user.state = 'relay_wait_fund';
   user.stateData = { relayId, quote };
   await user.save();
 
   await toast(userId, chatId,
     [
-      stepHeader('TRANSFER RELAY', 'step 2/2 · destination'),
+      stepHeader('FUND THE RELAY', 'step 2/3 · send from any wallet'),
       '',
-      `📤 via <b>${quote.label}</b> <code>${formatAddressShort(quote.relayAddress)}</code>`,
+      `▸ <b>RECEIVES AT DESTINATION</b>`,
+      `💎 <code>${Precision.fromBaseUnits(quote.requestedNano, 9)} TON</code>`,
       '',
-      `Now enter the <b>destination TON address</b>:`,
+      `├ platform fee (${config.feePolicy.relayTransferPercent}%)  <code>${Precision.fromBaseUnits(quote.platformFeeNano, 9)} TON</code>`,
+      `└ est. network reserve  <code>${Precision.fromBaseUnits(quote.forwardFeeEstimateNano, 9)} TON</code>`,
+      '',
+      `▸ <b>SEND EXACTLY THIS</b>`,
+      `<code>${Precision.fromBaseUnits(quote.fundingAmountNano, 9)} TON</code>`,
+      `→ <code>${quote.relayAddress}</code>`,
+      '',
+      `<i>From any wallet — yours or elsewhere. Once sent, tap the button below. Unused reserve stays on the relay address.</i>`,
     ].join('\n'),
-    keyboards.cancelKeyboard('transfer_relay'));
+    { inline_keyboard: [
+      [{ text: '✅ I\u2019ve Sent — Check Deposit', callback_data: 'relay_fundcheck' }],
+      [{ text: '❌ Cancel', callback_data: 'transfer_relay' }],
+    ] });
 }
+
+/* ── Phase 1b: funding check (button-tap, re-checkable) ── */
+
+export async function checkRelayFunding(userId: number, chatId: number, user: any): Promise<void> {
+  const rawQuote = user.stateData?.quote;
+  if (!rawQuote) { await showMainMenu(userId, chatId); return; }
+  const quote = reviveRelayQuote(rawQuote);
+
+  try {
+    const status = await relayService.checkFunding(quote);
+
+    if (!status.ok) {
+      await toast(userId, chatId,
+        [
+          stepHeader('WAITING FOR FUNDS'),
+          '',
+          `├ relay balance  <code>${Precision.fromBaseUnits(status.balanceNano, 9)} TON</code>`,
+          `└ required       <code>${Precision.fromBaseUnits(status.requiredNano, 9)} TON</code>`,
+          '',
+          `<i>Not received yet — send exactly the required amount, then check again. Already sent? Wait ~30s and re-check.</i>`,
+        ].join('\n'),
+        { inline_keyboard: [
+          [{ text: '⟳ Check Again', callback_data: 'relay_fundcheck' }],
+          [{ text: '❌ Cancel', callback_data: 'transfer_relay' }],
+        ] });
+      return;
+    }
+
+    // Funded — move to destination entry
+    user.state = 'relay_address';
+    await user.save();
+
+    await toast(userId, chatId,
+      [
+        `✅ <b>FUNDS RECEIVED</b>`,
+        '',
+        `<code>${Precision.fromBaseUnits(status.balanceNano, 9)} TON</code> on <code>${formatAddressShort(quote.relayAddress)}</code>`,
+        '',
+        `Now enter the <b>destination TON address</b>:`,
+      ].join('\n'),
+      keyboards.cancelKeyboard('transfer_relay'));
+  } catch (err: any) {
+    await toast(userId, chatId,
+      `❌ <i>${String(err.message).slice(0, 300)}</i>`,
+      keyboards.backKeyboard('transfer_relay'));
+  }
+}
+
+/* ── Phase 2: destination → confirm → execute ── */
 
 export async function handleRelayAddress(userId: number, chatId: number, user: any, text: string): Promise<void> {
   const rawQuote = user.stateData?.quote;
@@ -140,19 +210,17 @@ export async function handleRelayAddress(userId: number, chatId: number, user: a
 
   await toast(userId, chatId,
     [
-      stepHeader('CONFIRM TRANSFER', quote.label),
+      stepHeader('CONFIRM TRANSFER', 'step 3/3'),
       '',
       `🏁 destination  <code>${formatAddressShort(destination)}</code>`,
       `📤 via relay    <code>${formatAddressShort(quote.relayAddress)}</code>`,
       '',
-      `▸ <b>COSTS</b>`,
-      `💎 arrives at destination  <code>${Precision.fromBaseUnits(quote.requestedNano, 9)} TON</code>`,
-      `├ platform fee (${config.feePolicy.relayTransferPercent}%)  <code>${Precision.fromBaseUnits(quote.platformFeeNano, 9)} TON</code>`,
-      `└ est. network  <code>~${Precision.fromBaseUnits(quote.forwardFeeEstimateNano + config.relay.minRelayReserveNano, 9)} TON</code>`,
+      `▸ <b>DISTRIBUTION</b>`,
+      `💎 to destination  <code>${Precision.fromBaseUnits(quote.requestedNano, 9)} TON</code>`,
+      `├ platform fee (${config.feePolicy.relayTransferPercent}%)  <code>${Precision.fromBaseUnits(quote.platformFeeNano, 9)} TON</code> → admin`,
+      `└ network costs  <i>from relay reserve (est. ${Precision.fromBaseUnits(quote.forwardFeeEstimateNano, 9)} TON)</i>`,
       '',
-      `💰 <b>total debit  <code>${Precision.fromBaseUnits(quote.totalDebitNano, 9)} TON</code></b>`,
-      '',
-      `<i>Platform fee and network costs are distinct. Network costs are estimates — the destination receives the requested amount only if on-chain conditions satisfy it, otherwise the operation is flagged for recovery, never silently short-paid.</i>`,
+      `<i>One on-chain transaction from the relay pays the platform fee and your transfer together. Unused reserve remains on the relay.</i>`,
     ].join('\n'),
     keyboards.relayConfirmKeyboard());
 }
@@ -255,10 +323,7 @@ export async function showAdminRelayAddresses(userId: number, chatId: number, pa
 
     const pageSize = RELAY_ADMIN_PAGE_SIZE;
     const [items, total] = await Promise.all([
-      RelayAddress.find()
-        .sort({ createdAt: 1 })
-        .skip((page - 1) * pageSize)
-        .limit(pageSize),
+      RelayAddress.find().sort({ createdAt: 1 }).skip((page - 1) * pageSize).limit(pageSize),
       RelayAddress.countDocuments(),
     ]);
 
@@ -419,14 +484,4 @@ export async function executeRelayAddressSweep(userId: number, chatId: number, r
     ].join('\n'), {
       inline_keyboard: [
         [{ text: '‹ Address Detail', callback_data: `radm_addr_${relayId}` }],
-        [{ text: '‹ Addresses', callback_data: 'admin_relay_addrs' }],
-      ],
-    }, { withImage: true });
-  } catch (err: any) {
-    console.error('[Relay] admin sweep failed:', err);
-    await toast(userId, chatId,
-      `❌ <b>Sweep failed</b>\n\n<i>${String(err.message).slice(0, 300)}</i>`,
-      { inline_keyboard: [[{ text: '‹ Back', callback_data: `radm_addr_${relayId}` }]] });
-  }
-      }
-      
+        [{ text: '‹ Addresses', callback_dat
