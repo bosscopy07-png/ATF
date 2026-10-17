@@ -16,7 +16,6 @@ import { withLock } from '../utils/distributed-lock';
 import { checkRateLimit } from '../utils/rate-limiter';
 import { isValidTonAddress } from '../utils/validation';
 import { Precision } from '../utils/precision';
-import { AdminWalletService } from './admin-wallet-service';
 import { WalletService } from './wallet-service';
 
 export interface RelayQuote {
@@ -26,7 +25,7 @@ export interface RelayQuote {
   label: string;
   requestedNano: bigint;
   platformFeeNano: bigint;
-  fundingAmountNano: bigint;
+  fundingAmountNano: bigint;   // total the user must send: requested + fee + network reserve
   forwardFeeEstimateNano: bigint;
   minReserveNano: bigint;
   totalDebitNano: bigint;
@@ -35,31 +34,30 @@ export interface RelayQuote {
 }
 
 /**
- * Platform-controlled transfer relay.
+ * Platform-controlled transfer relay — USER-FUNDED design.
  *
- * Isolation guarantees:
- *  - NEVER touches swap or withdrawal paths.
- *  - Funding uses the authorized admin treasury infrastructure.
+ * Flow:
+ *  1. User picks an amount → bot shows a fresh relay address and the
+ *     exact total to send (requested + 2% platform fee + network reserve).
+ *  2. User funds the relay address from ANY wallet.
+ *  3. User provides the destination → confirms.
+ *  4. ONE on-chain transaction from the relay pays the platform fee to the
+ *     admin fee wallet and the requested amount to the destination.
+ *  5. Destination receipt verified on-chain → COMPLETED + 10-day cooldown.
+ *
+ * Guarantees:
+ *  - No admin treasury involvement (no gas advance, no init churn).
  *  - Plaintext mnemonics NEVER leave this process; AES-GCM at rest only.
- *
- * VERIFICATION NOTE: AdminWalletService.sendTon returns "address_seqno"
- * (an internal reference), NOT a tx hash. On-chain verification therefore
- * matches by SENDER ADDRESS + AMOUNT on the receiving side, with a balance
- * fallback where the receiving address is guaranteed fresh.
- *
- * STATE NOTE: only FUNDING/FUNDED/SENDING count as in-flight. A CREATED or
- * VALIDATED operation never broadcast anything — it cannot be executing
- * concurrently (callers hold the per-address lock for the whole operation)
- * and must never block selection or sweeps.
+ *  - Idempotent at every stage; per-user and per-address locks.
+ *  - Only FUNDING-adjacent broadcast state is SENDING. CREATED/VALIDATED
+ *    never broadcast and must never block selection or sweeps.
  */
 export class TransferRelayService {
   private tonClient: TonClient;
-  private adminWallet: AdminWalletService;
   private walletService: WalletService;
 
   constructor() {
     this.tonClient = new TonClient({ endpoint: config.tonRpcUrl, apiKey: config.tonApiKey });
-    this.adminWallet = new AdminWalletService();
     this.walletService = new WalletService();
   }
 
@@ -135,15 +133,16 @@ export class TransferRelayService {
     // CREATED/VALIDATED ops never broadcast and are cleaned by the reconciler.
     const unresolved = await TransferOperation.countDocuments({
       relayAddressId: relay._id,
-      state: { $in: ['FUNDING', 'FUNDED', 'SENDING', 'RECOVERY_REQUIRED'] },
+      state: { $in: ['SENDING', 'RECOVERY_REQUIRED'] },
     });
     if (unresolved > 0) {
       throw new Error('This address has an unresolved operation. Wait for it to finish.');
     }
 
+    // Recoverable dust (≤ network reserve) is fine — it can't cover a transfer.
     const balance = await this.getTonBalance(relay.address);
-    if (balance > 0n) {
-      throw new Error('This address still holds funds. It is flagged for recovery first.');
+    if (balance > config.relay.forwardFeeEstimateNano) {
+      throw new Error('This address still holds funds. Sweep it via the admin dashboard first.');
     }
   }
 
@@ -185,18 +184,8 @@ export class TransferRelayService {
     const forwardFee = config.relay.forwardFeeEstimateNano;
     const minReserve = config.relay.minRelayReserveNano;
 
-    const fundingAmountNano = requestedNano + platformFeeNano + forwardFee + minReserve;
-
-    const walletAddress = await this.walletService.getAddress(userId);
-    if (!walletAddress) throw new Error('Wallet not found');
-    const userTon = await this.getTonBalance(walletAddress);
-
-    if (userTon < fundingAmountNano + config.relay.minRelayReserveNano) {
-      throw new Error(
-        `Insufficient TON. You need ~${Precision.fromBaseUnits(fundingAmountNano, 9)} TON ` +
-        `(amount + ${config.feePolicy.relayTransferPercent}% platform fee + network costs).`
-      );
-    }
+    // Total the user must send to the relay address.
+    const fundingAmountNano = requestedNano + platformFeeNano + forwardFee;
 
     return {
       quoteId: crypto.randomUUID(),
@@ -212,6 +201,23 @@ export class TransferRelayService {
       relayResidualExpectedNano: minReserve,
       expiresAt: new Date(Date.now() + config.relay.quoteTtlMs),
     };
+  }
+
+  /**
+   * Phase-1b check: has the relay address received the required funds?
+   * Balance-based — the address is guaranteed fresh (selection enforced
+   * near-zero balance), so balance ≥ required means the user funded it.
+   */
+  async checkFunding(quote: RelayQuote): Promise<{ ok: boolean; balanceNano: bigint; requiredNano: bigint }> {
+    this.assertEnabled();
+
+    const relay = await RelayAddress.findById(quote.relayAddressId);
+    if (!relay) throw new Error('Relay address not found');
+
+    const requiredNano = quote.fundingAmountNano;
+    const balanceNano = await this.getTonBalance(relay.address);
+
+    return { ok: balanceNano >= requiredNano, balanceNano, requiredNano };
   }
     /* ══════════════ EXECUTION STATE MACHINE ══════════════ */
 
@@ -257,8 +263,6 @@ export class TransferRelayService {
               if (existing.state === 'COMPLETED') return existing.operationId;
               if (
                 existing.state === 'RECOVERY_REQUIRED' ||
-                existing.state === 'FUNDING' ||
-                existing.state === 'FUNDED' ||
                 existing.state === 'SENDING'
               ) {
                 throw new Error(
@@ -310,7 +314,6 @@ export class TransferRelayService {
             }
 
             let ledger: any = null;
-            let fundingBroadcastAttempted = false;
             let outgoingBroadcastAttempted = false;
 
             try {
@@ -338,59 +341,19 @@ export class TransferRelayService {
                 },
               });
 
-              await this.transition(op, 'FUNDING', 'Preparing treasury funding broadcast');
-
-              await this.adminWallet.initialize();
-              const adminAddress = (this.adminWallet as any).address as string;
-
-              fundingBroadcastAttempted = true;
-
-              // NOTE: sendTon returns "address_seqno" (internal reference), not a tx hash.
-              const fundingRef = await this.adminWallet.sendTon(
-                relay.address,
-                quote.fundingAmountNano
-              );
-
-              await TransferOperation.updateOne(
-                { _id: op._id },
-                { $set: { fundingTxHash: fundingRef } }
-              );
-
-              await Transaction.updateOne(
-                { _id: ledger._id },
-                { $set: { metadata: { ...ledger.metadata, fundingRef } } }
-              );
-
-              await this.transition(
-                op,
-                'FUNDED',
-                'Funding transaction submitted; awaiting on-chain verification'
-              );
-
-              /* ── Verify funding by SENDER + AMOUNT (hash refs are not tx hashes) ── */
-              const verifiedFunding = await this.verifyIncomingTonFrom(
-                relay.address,
-                adminAddress,
-                quote.fundingAmountNano,
-                { allowBalanceFallback: true }
-              );
-
-              if (!verifiedFunding.ok) {
-                await this.transition(
-                  op,
-                  'RECOVERY_REQUIRED',
-                  `Funding verification uncertain: ${verifiedFunding.reason}`
+              /* ── User-funded relay: confirm the deposit landed, then send ── */
+              const fundingCheck = await this.checkFunding(quote);
+              if (!fundingCheck.ok) {
+                throw new Error(
+                  `Relay not funded yet (${Precision.fromBaseUnits(fundingCheck.balanceNano, 9)} of ` +
+                  `${Precision.fromBaseUnits(fundingCheck.requiredNano, 9)} TON). Check Relay History.`
                 );
-                throw new Error('Funding could not be confirmed. Operation requires reconciliation.');
               }
 
-              const actualReceived = verifiedFunding.receivedNano;
-              const fundingNetworkFee =
-                quote.fundingAmountNano > actualReceived
-                  ? quote.fundingAmountNano - actualReceived
-                  : 0n;
+              const actualReceived = fundingCheck.balanceNano;
 
-              const availableForDestination = actualReceived - quote.minReserveNano;
+              const availableForDestination =
+                actualReceived - quote.platformFeeNano - quote.forwardFeeEstimateNano;
 
               if (availableForDestination < quote.requestedNano) {
                 await TransferOperation.updateOne(
@@ -398,14 +361,13 @@ export class TransferRelayService {
                   {
                     $set: {
                       fundingActualNano: actualReceived.toString(),
-                      fundingNetworkFeeNano: fundingNetworkFee.toString(),
                       state: 'RECOVERY_REQUIRED',
                     },
                     $push: {
                       stateHistory: {
                         state: 'RECOVERY_REQUIRED',
                         at: new Date(),
-                        note: 'Insufficient balance after funding verification',
+                        note: 'Insufficient balance after funding check',
                       },
                     },
                   }
@@ -418,21 +380,21 @@ export class TransferRelayService {
                 {
                   $set: {
                     fundingActualNano: actualReceived.toString(),
-                    fundingNetworkFeeNano: fundingNetworkFee.toString(),
-                    // Store the REAL tx hash once known (may be '' on balance fallback)
-                    ...(verifiedFunding.txHash ? { fundingTxHash: verifiedFunding.txHash } : {}),
                   },
                 }
               );
 
-              await this.transition(op, 'SENDING', 'Preparing outgoing relay transfer');
+              await this.transition(op, 'SENDING', 'Relay funded — preparing outgoing transfer');
 
               outgoingBroadcastAttempted = true;
 
-              const outgoingRef = await this.sendFromRelay(
+              // ONE transaction: platform fee → admin wallet, requested → destination
+              const outgoingRef = await this.sendFromRelayMulti(
                 relay,
-                normalizedDestination,
-                quote.requestedNano
+                [
+                  { to: config.adminFeeWalletAddress, value: quote.platformFeeNano },
+                  { to: normalizedDestination, value: quote.requestedNano },
+                ]
               );
 
               await TransferOperation.updateOne(
@@ -458,7 +420,7 @@ export class TransferRelayService {
               }
 
               const residual =
-                actualReceived - quote.requestedNano - (verifiedOut.feeNano ?? 0n);
+                actualReceived - quote.requestedNano - quote.platformFeeNano - (verifiedOut.feeNano ?? 0n);
 
               await TransferOperation.updateOne(
                 { _id: op._id },
@@ -527,10 +489,7 @@ export class TransferRelayService {
 
               if (op.state !== 'COMPLETED') {
                 const mustRecover =
-                  fundingBroadcastAttempted ||
                   outgoingBroadcastAttempted ||
-                  op.state === 'FUNDING' ||
-                  op.state === 'FUNDED' ||
                   op.state === 'SENDING' ||
                   op.state === 'RECOVERY_REQUIRED';
 
@@ -569,34 +528,14 @@ export class TransferRelayService {
     let resumed = 0;
     let flagged = 0;
 
-    let adminAddress: string | null = null;
-    try {
-      await this.adminWallet.initialize();
-      adminAddress = (this.adminWallet as any).address as string;
-    } catch { /* reconciler tolerates admin wallet being unavailable */ }
-
     const stale = await TransferOperation.find({
-      state: { $in: ['CREATED', 'VALIDATED', 'FUNDING', 'FUNDED', 'SENDING'] },
+      state: { $in: ['CREATED', 'VALIDATED', 'SENDING'] },
       updatedAt: { $lt: new Date(Date.now() - 2 * 60 * 1000) },
     }).limit(50);
 
     for (const op of stale) {
       try {
-        if (op.state === 'FUNDING' && op.fundingTxHash && adminAddress) {
-          const v = await this.verifyIncomingTonFrom(
-            op.relayAddress,
-            adminAddress,
-            BigInt(op.fundingAmountNano),
-            { allowBalanceFallback: true, quick: true }
-          );
-          if (v.ok) {
-            await this.transition(op, 'FUNDED', 'reconciler: funding verified after restart');
-            resumed++;
-          } else {
-            await this.transition(op, 'RECOVERY_REQUIRED', `reconciler: funding unverifiable — ${v.reason}`);
-            flagged++;
-          }
-        } else if (op.state === 'SENDING' && op.outgoingTxHash) {
+        if (op.state === 'SENDING' && op.outgoingTxHash) {
           const v = await this.verifyIncomingTonFrom(
             op.destinationAddress,
             op.relayAddress,
@@ -639,8 +578,8 @@ export class TransferRelayService {
     }
 
     return { resumed, flagged };
-                          }
-    /* ══════════════ TREASURY CONSOLIDATION (admin-gated) ══════════════ */
+              }
+                  /* ══════════════ TREASURY CONSOLIDATION (admin-gated) ══════════════ */
 
   async sweepResidualToTreasury(
     adminTelegramId: number,
@@ -668,7 +607,7 @@ export class TransferRelayService {
                     {
                       $in: ['$state', [
                         'CREATED', 'VALIDATED', 'AWAITING_CONFIRMATION',
-                        'FUNDING', 'FUNDED', 'SENDING', 'RECOVERY_REQUIRED',
+                        'SENDING', 'RECOVERY_REQUIRED',
                       ]],
                     },
                   ],
@@ -763,11 +702,10 @@ export class TransferRelayService {
    * Admin recovery sweep: move the full spendable balance of ONE relay
    * address to the admin fee wallet. Super-admin gated at the UI layer.
    *
-   * Safety: refuses only while an operation is in a broadcast-pending
-   * state (FUNDING/FUNDED/SENDING). CREATED/VALIDATED ops never broadcast
-   * and cannot be executing concurrently — the caller holds the
-   * per-address lock, which execute() also requires for its entire body.
-   * Audit-logged via AdminAction.
+   * Safety: refuses only while an operation is broadcast-pending (SENDING).
+   * CREATED/VALIDATED ops never broadcast and cannot be executing
+   * concurrently — the caller holds the per-address lock, which execute()
+   * also requires for its entire body. Audit-logged via AdminAction.
    */
   async sweepAddressToAdmin(
     relayId: string,
@@ -779,13 +717,12 @@ export class TransferRelayService {
     if (!relay) throw new Error('Relay address not found');
 
     return withLock(`lock:relay:addr:${relay.address}`, 60_000, async () => {
-      // Only genuinely broadcast-pending states block a sweep.
       const inFlight = await TransferOperation.countDocuments({
         relayAddressId: relay._id,
-        state: { $in: ['FUNDING', 'FUNDED', 'SENDING'] },
+        state: { $in: ['SENDING'] },
       });
       if (inFlight > 0) {
-        throw new Error('This address has in-flight operations. Wait for them to finish before sweeping.');
+        throw new Error('This address has an in-flight operation. Wait for it to finish before sweeping.');
       }
 
       const balance = await this.getTonBalance(relay.address);
@@ -844,14 +781,8 @@ export class TransferRelayService {
   /**
    * Verify an incoming transfer by SENDER ADDRESS + AMOUNT.
    *
-   * Why not by hash: AdminWalletService.sendTon returns "address_seqno"
-   * (an internal reference), and even wallet external-message hashes do not
-   * reliably equal on-chain transaction hashes. Sender+amount on the
-   * receiving side is deterministic for this flow.
-   *
-   * allowBalanceFallback: only sound when the receiving address is
-   * guaranteed to have been empty before the transfer (true for fresh
-   * relay addresses — assertAddressSelectable enforces zero balance).
+   * Addresses are compared canonically (bounceable EQ form) because the
+   * same key can appear as EQ.../UQ... and raw string equality misses it.
    */
   private async verifyIncomingTonFrom(
     receivingAddress: string,
@@ -865,6 +796,10 @@ export class TransferRelayService {
     const attempts = opts.quick ? 3 : 30;
     const intervalMs = 5_000;
 
+    const canonicalSender = (() => {
+      try { return Address.parse(senderAddress).toString(); } catch { return senderAddress; }
+    })();
+
     for (let attempt = 0; attempt < attempts; attempt++) {
       try {
         const txs = await this.tonClient.getTransactions(Address.parse(receivingAddress), { limit: 20 });
@@ -872,8 +807,10 @@ export class TransferRelayService {
         for (const tx of txs) {
           const inMsg = tx.inMessage;
           if (inMsg?.info.type === 'internal') {
-            const src = inMsg.info.src?.toString();
-            if (src === senderAddress) {
+            const src = inMsg.info.src
+              ? (() => { try { return Address.parse(inMsg.info.src.toString()).toString(); } catch { return inMsg.info.src.toString(); } })()
+              : null;
+            if (src === canonicalSender) {
               const value = BigInt(inMsg.info.value.coins.toString());
               if (value >= expectedNano) {
                 return {
@@ -909,14 +846,25 @@ export class TransferRelayService {
   }
 
   /**
-   * Sign and broadcast a TON transfer FROM a relay wallet.
-   * Signing material decrypted in-memory only. V4R2 and V5R1 have
-   * incompatible createTransfer signatures — branch explicitly.
+   * Sign and broadcast a single-message transfer FROM a relay wallet.
+   * Used by admin recovery sweeps. V4R2/V5R1 branched explicitly.
    */
   private async sendFromRelay(
     relay: any,
     to: string,
     amountNano: bigint
+  ): Promise<string> {
+    return this.sendFromRelayMulti(relay, [{ to, value: amountNano }]);
+  }
+
+  /**
+   * Sign and broadcast a multi-message transfer FROM a relay wallet.
+   * All messages go out in ONE transaction (single seqno increment).
+   * Signing material decrypted in-memory only, never logged.
+   */
+  private async sendFromRelayMulti(
+    relay: any,
+    transfers: Array<{ to: string; value: bigint }>
   ): Promise<string> {
     const { decrypt } = require('../utils/encryption');
 
@@ -937,13 +885,13 @@ export class TransferRelayService {
 
     const seqno = await opened.getSeqno();
 
-    const messages = [
+    const messages = transfers.map((t) =>
       internal({
-        to: Address.parse(to),
-        value: amountNano,
+        to: Address.parse(t.to),
+        value: t.value,
         bounce: false,
-      }),
-    ];
+      })
+    );
 
     const sendMode = SendMode.PAY_GAS_SEPARATELY + SendMode.IGNORE_ERRORS;
 
@@ -990,5 +938,4 @@ export class TransferRelayService {
 
     return { items, total, page, pageSize };
   }
-              }
-        
+}
