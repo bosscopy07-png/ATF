@@ -260,6 +260,7 @@ export function relayMenuKeyboard(hasAddresses: boolean): TelegramBot.InlineKeyb
   const rows: TelegramBot.InlineKeyboardButton[][] = [];
   if (hasAddresses) rows.push(row(b('📋 My Relay Addresses', 'relay_addresses')));
   rows.push(row(b('🧾 Relay History', 'relay_history')));
+  rows.push(row(b('♻️ Reclaim TON', 'relay_reclaim')));
   rows.push(mainRow());
   return { inline_keyboard: rows };
 }
@@ -269,5 +270,4 @@ export function relayConfirmKeyboard(): TelegramBot.InlineKeyboardMarkup {
     row(b('✅ Confirm Transfer', 'relay_confirm')),
     row(b('❌ Cancel', 'transfer_relay')),
   ] };
-      }
-          
+}
