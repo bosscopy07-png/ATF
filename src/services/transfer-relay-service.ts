@@ -44,9 +44,10 @@ export interface RelayQuote {
  *  3. execute       — user supplied destination → ONE relay transaction
  *                     (platform fee → admin wallet, requested → destination)
  *                     verified at destination → COMPLETED + 10-day cooldown
- *  4. reclaimFunds  — error/abandoned flows: returns the relay's ACTUAL
- *                     balance to the user, keeps the platform fee, frees
- *                     the address
+ *  4. reclaimFunds  — errored/abandoned flows only: returns the relay's
+ *                     ACTUAL balance to the user, keeps the platform fee,
+ *                     frees the address. Completed-transfer leftovers are
+ *                     platform residuals and are NOT user-reclaimable.
  *
  * Guarantees:
  *  - No admin treasury involvement; fees flow to the admin FEE wallet.
@@ -371,8 +372,8 @@ export class TransferRelayService {
         }
       });
     });
-                                                                }
-                                         /* ══════════════ STEP 3: EXECUTE THE OUTGOING TRANSFER ══════════════ */
+      }
+    /* ══════════════ STEP 3: EXECUTE THE OUTGOING TRANSFER ══════════════ */
 
   async execute(userId: number, quote: RelayQuote, destination: string): Promise<string> {
     this.assertEnabled();
@@ -727,9 +728,11 @@ export class TransferRelayService {
   /* ══════════════ RECLAIM (user-initiated error/abandon recovery) ══════════════ */
 
   /**
-   * Find the user's newest relay with reclaimable funds. FUNDED counts
-   * as reclaimable (the user abandoned the flow before entering a
-   * destination). FUNDING/SENDING still in-flight are excluded.
+   * Find the user's newest relay with reclaimable funds. Only errored or
+   * abandoned funding qualifies (EXPIRED / FAILED / RECOVERY_REQUIRED /
+   * abandoned FUNDED), plus foreign funds with no operation at all.
+   * Completed-transfer leftovers are platform residuals — NOT reclaimable.
+   * FUNDING/SENDING (still in-flight) are excluded.
    */
   async getReclaimable(
     userId: number
@@ -749,6 +752,13 @@ export class TransferRelayService {
 
       const balance = await this.getTonBalance(relay.address);
       const lastOp = await TransferOperation.findOne({ relayAddressId: relay._id }).sort({ createdAt: -1 });
+
+      // Completed transfers: leftover is a platform residual — NOT user-reclaimable.
+      const reclaimAllowed =
+        !lastOp ||
+        ['EXPIRED', 'FAILED', 'RECOVERY_REQUIRED', 'FUNDED'].includes(lastOp.state);
+      if (!reclaimAllowed) continue;
+
       const feeNano = lastOp ? BigInt(lastOp.platformFeeNano || '0') : 0n;
       const reclaimNano = balance - feeNano - config.relay.forwardFeeEstimateNano;
 
@@ -795,6 +805,12 @@ export class TransferRelayService {
 
       const balance = await this.getTonBalance(relay.address);
       const lastOp = await TransferOperation.findOne({ relayAddressId: relay._id }).sort({ createdAt: -1 });
+
+      // Completed transfers: leftover is a platform residual, never reclaimable.
+      if (lastOp && lastOp.state === 'COMPLETED') {
+        throw new Error('This relay is settled — leftover after a completed transfer is a platform residual.');
+      }
+
       const feeNano = lastOp ? BigInt(lastOp.platformFeeNano || '0') : 0n;
       const reclaimNano = balance - feeNano - config.relay.forwardFeeEstimateNano;
 
@@ -845,7 +861,7 @@ export class TransferRelayService {
         txHash,
       };
     });
-  }
+                    }
     /* ══════════════ TREASURY CONSOLIDATION (admin-gated) ══════════════ */
 
   async sweepResidualToTreasury(
@@ -1064,7 +1080,7 @@ export class TransferRelayService {
     | { ok: false; reason: string }
   > {
     const attempts = opts.quick ? 3 : 30;
-    const intervalMs = 5_000;
+    const intervalMs = 4_000;
 
     const canonicalSender = (() => {
       try { return Address.parse(senderAddress).toString(); } catch { return senderAddress; }
@@ -1208,4 +1224,4 @@ export class TransferRelayService {
 
     return { items, total, page, pageSize };
   }
-        }
+}
