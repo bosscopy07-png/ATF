@@ -1,4 +1,3 @@
-
 /**
  * ATF NEXUS — Telegram update router.
  * All screen logic lives in ./screens/*; this file only routes updates
@@ -89,17 +88,22 @@ export async function handleCallback(query: TelegramBot.CallbackQuery): Promise<
     await relayScreens.startRelayAmount(userId, chatId, user, data.replace('relay_sel_', ''));
     return;
   }
-  if (data === 'relay_fundgo') {
-    if (user.state !== 'relay_fundconfirm') { await showMainMenu(userId, chatId); return; }
-    await relayScreens.fundRelayFromWallet(userId, chatId, user);
-    return;
-  }
   if (data === 'relay_confirm') {
     if (user.state !== 'relay_confirm') { await showMainMenu(userId, chatId); return; }
     await relayScreens.executeRelayTransfer(userId, chatId, user);
     return;
   }
   if (data === 'relay_history') { await relayScreens.showRelayHistory(userId, chatId, user); return; }
+  if (data === 'relay_reclaim') { await relayScreens.showRelayReclaim(userId, chatId, user); return; }
+  if (data.startsWith('relay_reclaimgo_')) {
+    await relayScreens.executeRelayReclaim(userId, chatId, user, data.replace('relay_reclaimgo_', ''));
+    return;
+  }
+  if (data === 'relay_fundgo') {
+    if (user.state !== 'relay_fundconfirm') { await showMainMenu(userId, chatId); return; }
+    await relayScreens.fundRelayFromWallet(userId, chatId, user);
+    return;
+  }
 
   /* ── Deposit ── */
   if (data === 'deposit') { await transferScreens.showDepositMenu(userId, chatId); return; }
@@ -287,5 +291,5 @@ export async function delUserMsg(msg: TelegramBot.Message): Promise<void> {
   try {
     await getBot().deleteMessage(msg.chat.id, msg.message_id);
   } catch { /* ignore */ }
-                                                                    }
-    
+      }
+       
