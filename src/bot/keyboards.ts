@@ -194,12 +194,14 @@ export function userListKeyboard(users: any[], page: number, hasMore: boolean): 
   nav.push(b('Back', 'admin_panel'));
   if (hasMore) nav.push(b('›', `admin_users_page_${page + 1}`));
   rows.push(nav);
+  rows.unshift([b('🔍 Search by ID or Address', 'admin_search')]);
   return { inline_keyboard: rows };
 }
 
 export function userActionKeyboard(telegramId: number, isFrozen: boolean): TelegramBot.InlineKeyboardMarkup {
   return { inline_keyboard: [
     row(b(isFrozen ? '🔓 Unfreeze' : '🔒 Freeze', `admin_freeze_${telegramId}_${isFrozen ? 'unfreeze' : 'freeze'}`)),
+    row(b('✉️ Message User', `admin_msg_${telegramId}`)),
     row(b('◉ View Balance', `admin_balance_${telegramId}`)),
     row(b('▣ View Transactions', `admin_tx_${telegramId}`)),
     row(b('‹ Users', 'admin_users')),
@@ -268,4 +270,4 @@ export function relayConfirmKeyboard(): TelegramBot.InlineKeyboardMarkup {
     row(b('❌ Cancel', 'transfer_relay')),
   ] };
       }
-  
+          
