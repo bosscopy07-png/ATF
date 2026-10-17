@@ -44,12 +44,14 @@ export interface RelayQuote {
  *  3. execute       — user supplied destination → ONE relay transaction
  *                     (platform fee → admin wallet, requested → destination)
  *                     verified at destination → COMPLETED + 10-day cooldown
+ *  4. reclaimFunds  — error/abandoned flows: returns the relay's ACTUAL
+ *                     balance to the user, keeps the platform fee, frees
+ *                     the address
  *
  * Guarantees:
  *  - No admin treasury involvement; fees flow to the admin FEE wallet.
  *  - Plaintext mnemonics NEVER leave this process; AES-GCM at rest only.
- *  - Per-user + per-address locks; idempotency key per quote; crash-safe
- *    (a retry after a crashed send re-checks balance instead of re-sending).
+ *  - Per-user + per-address locks; idempotency key per quote; crash-safe.
  *  - Only FUNDING/FUNDED/SENDING are fund-holding/in-flight states.
  */
 export class TransferRelayService {
@@ -141,7 +143,7 @@ export class TransferRelayService {
     // Recoverable dust (≤ network reserve) is fine — it can't cover a transfer.
     const balance = await this.getTonBalance(relay.address);
     if (balance > config.relay.forwardFeeEstimateNano) {
-      throw new Error('This address still holds funds. Sweep it via the admin dashboard first.');
+      throw new Error('This address still holds funds. Sweep or reclaim them first.');
     }
   }
 
@@ -369,8 +371,8 @@ export class TransferRelayService {
         }
       });
     });
-                      }
-    /* ══════════════ STEP 3: EXECUTE THE OUTGOING TRANSFER ══════════════ */
+                                                                }
+                                         /* ══════════════ STEP 3: EXECUTE THE OUTGOING TRANSFER ══════════════ */
 
   async execute(userId: number, quote: RelayQuote, destination: string): Promise<string> {
     this.assertEnabled();
@@ -379,10 +381,9 @@ export class TransferRelayService {
       throw new Error('Invalid destination address');
     }
 
-    if (Date.now() > quote.expiresAt.getTime()) {
-      throw new Error('Quote expired. Request a new preview.');
-    }
-
+    // Quote expiry is enforced only when NO funded operation exists yet.
+    // A FUNDED op means the money is already on the relay — the user may
+    // legitimately take their time entering the destination.
     const user = await User.findOne({ telegramId: userId });
     if (!user) throw new Error('User not found');
     if (user.isFrozen) throw new Error('Account is frozen');
@@ -411,6 +412,9 @@ export class TransferRelayService {
             const existing = await TransferOperation.findOne({ idempotencyKey });
 
             if (!existing) {
+              if (Date.now() > quote.expiresAt.getTime()) {
+                throw new Error('Quote expired. Request a new preview.');
+              }
               throw new Error('Relay is not funded yet. Complete the funding step first.');
             }
 
@@ -718,6 +722,129 @@ export class TransferRelayService {
     }
 
     return { resumed, flagged };
+  }
+
+  /* ══════════════ RECLAIM (user-initiated error/abandon recovery) ══════════════ */
+
+  /**
+   * Find the user's newest relay with reclaimable funds. FUNDED counts
+   * as reclaimable (the user abandoned the flow before entering a
+   * destination). FUNDING/SENDING still in-flight are excluded.
+   */
+  async getReclaimable(
+    userId: number
+  ): Promise<{ relayId: string; address: string; balanceNano: bigint; feeNano: bigint; reclaimNano: bigint } | null> {
+    this.assertEnabled();
+
+    const user = await User.findOne({ telegramId: userId });
+    if (!user) return null;
+
+    const relays = await RelayAddress.find({ userId: user._id }).sort({ createdAt: -1 });
+    for (const relay of relays) {
+      const busy = await TransferOperation.countDocuments({
+        relayAddressId: relay._id,
+        state: { $in: ['FUNDING', 'SENDING'] },
+      });
+      if (busy > 0) continue;
+
+      const balance = await this.getTonBalance(relay.address);
+      const lastOp = await TransferOperation.findOne({ relayAddressId: relay._id }).sort({ createdAt: -1 });
+      const feeNano = lastOp ? BigInt(lastOp.platformFeeNano || '0') : 0n;
+      const reclaimNano = balance - feeNano - config.relay.forwardFeeEstimateNano;
+
+      if (reclaimNano > 0n) {
+        return {
+          relayId: relay._id.toString(),
+          address: relay.address,
+          balanceNano: balance,
+          feeNano,
+          reclaimNano,
+        };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * User-initiated reclaim: returns the relay's ACTUAL balance to the
+   * user's custodial wallet, keeping the platform fee (2%) for the admin
+   * fee wallet. Network reserve stays as dust. Abandoned FUNDED ops are
+   * expired as part of the reclaim so the address becomes selectable again.
+   */
+  async reclaimFunds(
+    userId: number,
+    relayId: string
+  ): Promise<{ address: string; reclaimNano: string; feeNano: string; txHash: string }> {
+    this.assertEnabled();
+
+    const user = await User.findOne({ telegramId: userId });
+    if (!user) throw new Error('User not found');
+    if (user.isFrozen) throw new Error('Account is frozen');
+
+    const relay = await RelayAddress.findOne({ _id: relayId, userId: user._id });
+    if (!relay) throw new Error('Relay address not found');
+
+    return withLock(`lock:relay:addr:${relay.address}`, 60_000, async () => {
+      const busy = await TransferOperation.countDocuments({
+        relayAddressId: relay._id,
+        state: { $in: ['FUNDING', 'SENDING'] },
+      });
+      if (busy > 0) {
+        throw new Error('This address has an in-flight operation. Wait for it to finish before reclaiming.');
+      }
+
+      const balance = await this.getTonBalance(relay.address);
+      const lastOp = await TransferOperation.findOne({ relayAddressId: relay._id }).sort({ createdAt: -1 });
+      const feeNano = lastOp ? BigInt(lastOp.platformFeeNano || '0') : 0n;
+      const reclaimNano = balance - feeNano - config.relay.forwardFeeEstimateNano;
+
+      if (reclaimNano <= 0n) {
+        throw new Error('Nothing to reclaim — balance only covers the platform fee and network reserve.');
+      }
+
+      const walletAddress = await this.walletService.getAddress(userId);
+      if (!walletAddress) throw new Error('Wallet not found');
+
+      // Close out abandoned/errored ops so the address becomes usable again
+      await TransferOperation.updateMany(
+        { relayAddressId: relay._id, state: { $in: ['FUNDED', 'RECOVERY_REQUIRED'] } },
+        {
+          $set: { state: 'EXPIRED' },
+          $push: { stateHistory: { state: 'EXPIRED', at: new Date(), note: 'Funds reclaimed by user' } },
+        }
+      ).catch(() => {});
+
+      const transfers: Array<{ to: string; value: bigint }> = [
+        { to: walletAddress, value: reclaimNano },
+      ];
+      if (feeNano > 0n) {
+        transfers.push({ to: config.adminFeeWalletAddress, value: feeNano });
+      }
+
+      const txHash = await this.sendFromRelayMulti(relay, transfers);
+
+      await Transaction.create({
+        userId: user._id,
+        type: 'transfer_relay',
+        asset: 'TON',
+        amount: Precision.fromBaseUnits(reclaimNano, 9),
+        status: 'completed',
+        txHash,
+        metadata: {
+          relayAddress: relay.address,
+          reclaim: true,
+          feeKept: Precision.fromBaseUnits(feeNano, 9),
+          note: 'User-initiated reclaim of relay funds',
+        },
+      });
+
+      return {
+        address: relay.address,
+        reclaimNano: reclaimNano.toString(),
+        feeNano: feeNano.toString(),
+        txHash,
+      };
+    });
   }
     /* ══════════════ TREASURY CONSOLIDATION (admin-gated) ══════════════ */
 
@@ -1081,4 +1208,4 @@ export class TransferRelayService {
 
     return { items, total, page, pageSize };
   }
-}
+        }
