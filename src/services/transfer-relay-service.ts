@@ -35,7 +35,7 @@ export interface RelayQuote {
 
 /**
  * Platform-controlled transfer relay — AUTO-FUNDED from the user's
- * custodial wallet.
+ * custodial wallet, with reuse-first address batches.
  *
  * Flow (one operation row per quote, idempotent end-to-end):
  *  1. prepareQuote  — amount → total to debit (requested + 2% fee + reserve)
@@ -43,17 +43,19 @@ export interface RelayQuote {
  *                     fresh relay address; verified on-chain → FUNDED
  *  3. execute       — user supplied destination → ONE relay transaction
  *                     (platform fee → admin wallet, requested → destination)
- *                     verified at destination → COMPLETED + 10-day cooldown
+ *                     verified at destination → COMPLETED + cooldown
  *  4. reclaimFunds  — errored/abandoned flows only: returns the relay's
  *                     ACTUAL balance to the user, keeps the platform fee,
- *                     frees the address. Completed-transfer leftovers are
- *                     platform residuals and are NOT user-reclaimable.
+ *                     frees the address. Completed leftovers are platform
+ *                     residuals — NOT user-reclaimable.
+ *  5. Batch policy  — addresses reuse after reuseCooldownDays; a fresh
+ *                     batch unlocks only when EVERY current address has
+ *                     minTransfersPerAddress COMPLETED transfers.
  *
  * Guarantees:
  *  - No admin treasury involvement; fees flow to the admin FEE wallet.
  *  - Plaintext mnemonics NEVER leave this process; AES-GCM at rest only.
  *  - Per-user + per-address locks; idempotency key per quote; crash-safe.
- *  - Only FUNDING/FUNDED/SENDING are fund-holding/in-flight states.
  */
 export class TransferRelayService {
   private tonClient: TonClient;
@@ -372,8 +374,8 @@ export class TransferRelayService {
         }
       });
     });
-      }
-    /* ══════════════ STEP 3: EXECUTE THE OUTGOING TRANSFER ══════════════ */
+  }
+      /* ══════════════ STEP 3: EXECUTE THE OUTGOING TRANSFER ══════════════ */
 
   async execute(userId: number, quote: RelayQuote, destination: string): Promise<string> {
     this.assertEnabled();
@@ -861,367 +863,43 @@ export class TransferRelayService {
         txHash,
       };
     });
-                    }
-    /* ══════════════ TREASURY CONSOLIDATION (admin-gated) ══════════════ */
-
-  async sweepResidualToTreasury(
-    adminTelegramId: number,
-    reason: string
-  ): Promise<Array<{ address: string; amountNano: string; txHash?: string; error?: string }>> {
-    if (!config.features.treasurySweep) throw new Error('Treasury sweep is not enabled');
-    if (!config.relay.treasuryAddress || !isValidTonAddress(config.relay.treasuryAddress)) {
-      throw new Error('Treasury address not configured');
-    }
-    if (!reason || reason.trim().length < 5) throw new Error('A reason is required for the audit log');
-
-    const results: Array<{ address: string; amountNano: string; txHash?: string; error?: string }> = [];
-
-    const candidates = await RelayAddress.aggregate([
-      {
-        $lookup: {
-          from: 'transferoperations',
-          let: { rid: '$_id' },
-          pipeline: [
-            {
-              $match: {
-                $expr: {
-                  $and: [
-                    { $eq: ['$relayAddressId', '$$rid'] },
-                    {
-                      $in: ['$state', [
-                        'CREATED', 'VALIDATED', 'AWAITING_CONFIRMATION',
-                        'FUNDING', 'FUNDED', 'SENDING', 'RECOVERY_REQUIRED',
-                      ]],
-                    },
-                  ],
-                },
-              },
-            },
-          ],
-          as: 'openOps',
-        },
-      },
-      {
-        $match: {
-          openOps: { $size: 0 },
-          status: { $in: ['active', 'recovery_required', 'retired'] },
-        },
-      },
-    ]);
-
-    for (const cand of candidates) {
-      const swept = await withLock(
-        `lock:relay:addr:${cand.address}`,
-        60_000,
-        async () => {
-          const balance = await this.getTonBalance(cand.address);
-
-          const minSweep =
-            config.relay.minRelayReserveNano +
-            config.relay.forwardFeeEstimateNano;
-
-          if (balance <= minSweep) return null;
-
-          const sweepable = balance - config.relay.forwardFeeEstimateNano;
-          if (sweepable <= 0n) return null;
-
-          try {
-            const relay = await RelayAddress.findById(cand._id);
-            if (!relay) return null;
-
-            const txHash = await this.sendFromRelay(
-              relay,
-              config.relay.treasuryAddress,
-              sweepable
-            );
-
-            return {
-              address: cand.address as string,
-              amountNano: sweepable.toString(),
-              txHash,
-            };
-          } catch (err: any) {
-            return {
-              address: cand.address as string,
-              amountNano: sweepable.toString(),
-              error: String(err.message).slice(0, 200),
-            };
-          }
-        }
-      ).catch(() => null);
-
-      if (swept) results.push(swept);
-    }
-
-    const adminUser = await User.findOne({ telegramId: adminTelegramId });
-    await Transaction.create({
-      userId: adminUser?._id,
-      type: 'treasury_sweep',
-      asset: 'TON',
-      amount: results
-        .filter((r) => !r.error)
-        .reduce((acc, r) => acc + BigInt(r.amountNano), 0n)
-        .toString(),
-      status: 'completed',
-      txHash: `sweep-${Date.now()}`,
-      metadata: {
-        adminTelegramId,
-        reason: reason.slice(0, 300),
-        addresses: results.map((r) => ({
-          address: r.address,
-          amountNano: r.amountNano,
-          txHash: r.txHash,
-          error: r.error,
-        })),
-        sweptCount: results.filter((r) => !r.error).length,
-        failedCount: results.filter((r) => r.error).length,
-      },
-    });
-
-    return results;
   }
 
+  /* ══════════════ ADDRESS BATCH (reuse-first, transfer-gated) ══════════════ */
+
   /**
-   * Admin recovery sweep: move the full spendable balance of ONE relay
-   * address to the admin fee wallet. Super-admin gated at the UI layer.
-   *
-   * Safety: refuses while any operation is fund-holding or broadcast-
-   * pending (FUNDING/FUNDED/SENDING). The caller holds the per-address
-   * lock, which fundRelay/execute also require for their entire bodies.
-   * Audit-logged via AdminAction.
+   * Batch status: which addresses are usable right now, per-address
+   * successful-transfer counts, and whether a fresh batch is unlocked.
+   * Only COMPLETED operations count (fee legs are Transaction records,
+   * reclaims/expiry are different states) — exactly the policy requested.
    */
-  async sweepAddressToAdmin(
-    relayId: string,
-    adminTelegramId: number
-  ): Promise<{ address: string; amountNano: string; txHash: string }> {
+  async getBatchStatus(userId: number): Promise<{
+    usable: any[];
+    entries: Array<{ label: string; completed: number; needed: number }>;
+    eligible: boolean;
+    perAddressNeeded: number;
+  }> {
     this.assertEnabled();
 
-    const relay = await RelayAddress.findById(relayId);
-    if (!relay) throw new Error('Relay address not found');
-
-    return withLock(`lock:relay:addr:${relay.address}`, 60_000, async () => {
-      const inFlight = await TransferOperation.countDocuments({
-        relayAddressId: relay._id,
-        state: { $in: ['FUNDING', 'FUNDED', 'SENDING'] },
-      });
-      if (inFlight > 0) {
-        throw new Error('This address has in-flight operations. Wait for them to finish before sweeping.');
-      }
-
-      const balance = await this.getTonBalance(relay.address);
-      const sweepable = balance - config.relay.forwardFeeEstimateNano; // reserve network fee
-      if (sweepable <= 0n) {
-        throw new Error('Nothing to sweep — balance is below the network-fee threshold.');
-      }
-
-      const txHash = await this.sendFromRelay(
-        relay,
-        config.adminFeeWalletAddress,
-        sweepable
-      );
-
-      await AdminAction.create({
-        adminId: adminTelegramId,
-        action: 'RELAY_ADDRESS_SWEEP',
-        target: relay.address,
-        result: 'success',
-        metadata: {
-          relayId: relay._id.toString(),
-          label: relay.label,
-          amountNano: sweepable.toString(),
-          txHash,
-          toAddress: config.adminFeeWalletAddress,
-          reason: 'admin_recovery_sweep',
-        },
-      });
-
-      return {
-        address: relay.address,
-        amountNano: sweepable.toString(),
-        txHash,
-      };
-    });
-  }
-
-  /** Public read for the admin dashboard (live on-chain balance). */
-  async getAddressBalance(address: string): Promise<bigint> {
-    return this.getTonBalance(address);
-  }
-
-  /* ══════════════ INTERNALS ══════════════ */
-
-  private async transition(op: ITransferOperation, to: RelayState, note?: string): Promise<void> {
-    await TransferOperation.updateOne(
-      { _id: op._id },
-      {
-        $set: { state: to },
-        $push: { stateHistory: { state: to, at: new Date(), note } },
-      }
-    );
-    op.state = to;
-  }
-
-  /**
-   * Verify an incoming transfer by SENDER ADDRESS + AMOUNT.
-   *
-   * Addresses are compared canonically (bounceable EQ form) because the
-   * same key can appear as EQ.../UQ... and raw string equality misses it.
-   * Hash references from wallet services ("address_seqno") are NOT tx
-   * hashes, so matching is sender+amount based, with an optional balance
-   * fallback where the receiving address is guaranteed fresh.
-   */
-  private async verifyIncomingTonFrom(
-    receivingAddress: string,
-    senderAddress: string,
-    expectedNano: bigint,
-    opts: { allowBalanceFallback: boolean; quick?: boolean }
-  ): Promise<
-    | { ok: true; receivedNano: bigint; feeNano: bigint; txHash: string }
-    | { ok: false; reason: string }
-  > {
-    const attempts = opts.quick ? 3 : 30;
-    const intervalMs = 4_000;
-
-    const canonicalSender = (() => {
-      try { return Address.parse(senderAddress).toString(); } catch { return senderAddress; }
-    })();
-
-    for (let attempt = 0; attempt < attempts; attempt++) {
-      try {
-        const txs = await this.tonClient.getTransactions(Address.parse(receivingAddress), { limit: 20 });
-
-        for (const tx of txs) {
-          const inMsg = tx.inMessage;
-          if (inMsg?.info.type === 'internal') {
-            const src = inMsg.info.src
-              ? (() => { try { return Address.parse(inMsg.info.src.toString()).toString(); } catch { return inMsg.info.src.toString(); } })()
-              : null;
-            if (src === canonicalSender) {
-              const value = BigInt(inMsg.info.value.coins.toString());
-              if (value >= expectedNano) {
-                return {
-                  ok: true,
-                  receivedNano: value,
-                  feeNano: BigInt(tx.totalFees.coins.toString()),
-                  txHash: tx.hash().toString('hex'),
-                };
-              }
-            }
-          }
-        }
-
-        // Balance fallback (fresh-address guarantee required)
-        if (opts.allowBalanceFallback) {
-          const balance = await this.getTonBalance(receivingAddress);
-          if (balance >= expectedNano) {
-            return {
-              ok: true,
-              receivedNano: balance,
-              feeNano: 0n,
-              txHash: '',
-            };
-          }
-        }
-      } catch {
-        // RPC hiccup — retry with backoff
-      }
-      await new Promise((r) => setTimeout(r, intervalMs));
-    }
-
-    return { ok: false, reason: 'incoming transfer not found on-chain after timeout' };
-  }
-
-  /**
-   * Sign and broadcast a single-message transfer FROM a relay wallet.
-   * Used by admin recovery sweeps. V4R2/V5R1 branched explicitly.
-   */
-  private async sendFromRelay(
-    relay: any,
-    to: string,
-    amountNano: bigint
-  ): Promise<string> {
-    return this.sendFromRelayMulti(relay, [{ to, value: amountNano }]);
-  }
-
-  /**
-   * Sign and broadcast a multi-message transfer FROM a relay wallet.
-   * All messages go out in ONE transaction (single seqno increment).
-   * Signing material decrypted in-memory only, never logged.
-   */
-  private async sendFromRelayMulti(
-    relay: any,
-    transfers: Array<{ to: string; value: bigint }>
-  ): Promise<string> {
-    const { decrypt } = require('../utils/encryption');
-
-    const mnemonicPhrase: string = decrypt(
-      relay.encryptedMnemonic,
-      relay.iv,
-      relay.tag
-    );
-    const mnemonic = mnemonicPhrase.split(' ');
-    const keyPair = await mnemonicToWalletKey(mnemonic);
-
-    const isV5 = relay.walletVersion === 'v5r1';
-    const contract = isV5
-      ? WalletContractV5R1.create({ publicKey: keyPair.publicKey, workchain: 0 })
-      : WalletContractV4.create({ publicKey: keyPair.publicKey, workchain: 0 });
-
-    const opened = this.tonClient.open(contract as any);
-
-    const seqno = await opened.getSeqno();
-
-    const messages = transfers.map((t) =>
-      internal({
-        to: Address.parse(t.to),
-        value: t.value,
-        bounce: false,
-      })
-    );
-
-    const sendMode = SendMode.PAY_GAS_SEPARATELY + SendMode.IGNORE_ERRORS;
-
-    let transfer: any;
-    if (isV5) {
-      const c = contract as WalletContractV5R1;
-      transfer = await c.createTransfer({
-        seqno,
-        secretKey: keyPair.secretKey,
-        sendMode,
-        messages,
-      });
-    } else {
-      const c = contract as WalletContractV4;
-      transfer = await c.createTransfer({
-        seqno,
-        secretKey: keyPair.secretKey,
-        sendMode,
-        messages,
-      });
-    }
-
-    await opened.send(transfer);
-    return transfer.hash().toString('hex');
-  }
-
-  /* ── User-facing history ── */
-
-  async history(userId: number, page = 1) {
     const user = await User.findOne({ telegramId: userId });
     if (!user) throw new Error('User not found');
 
-    const pageSize = 8;
-    const [items, total] = await Promise.all([
-      TransferOperation.find({ userId: user._id })
-        .sort({ createdAt: -1 })
-        .skip((page - 1) * pageSize)
-        .limit(pageSize)
-        .select(
-          'operationId relayAddress destinationAddress requestedAmountNano state fundingTxHash outgoingTxHash createdAt'
-        ),
-      TransferOperation.countDocuments({ userId: user._id }),
-    ]);
+    const needed = config.relay.minTransfersPerAddress;
+    const relays = await RelayAddress.find({ userId: user._id }).sort({ createdAt: 1 });
 
-    return { items, total, page, pageSize };
-  }
-}
+    const usable: any[] = [];
+    const entries: Array<{ label: string; completed: number; needed: number }> = [];
+    let eligible = relays.length > 0;
+
+    for (const r of relays) {
+      const completed = await TransferOperation.countDocuments({
+        relayAddressId: r._id,
+        state: 'COMPLETED',
+      });
+      entries.push({ label: r.label, completed, needed });
+      if (completed < needed) eligible = false;
+
+      const cooled = !r.nextEligibleAt || r.nextEligibleAt.getTime() <= Date.now();
+      const unresolved = await TransferOperation.countDocuments({
+        relayAddressId: r._id,
+        st
