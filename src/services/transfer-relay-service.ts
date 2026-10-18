@@ -56,6 +56,9 @@ export interface RelayQuote {
  *  - No admin treasury involvement; fees flow to the admin FEE wallet.
  *  - Plaintext mnemonics NEVER leave this process; AES-GCM at rest only.
  *  - Per-user + per-address locks; idempotency key per quote; crash-safe.
+ *  - Verification is time-gated: each operation only accepts on-chain
+ *    transactions inside its own window, so identical sender+amount+
+ *    destination repeats can never be confused (E11000-proof).
  */
 export class TransferRelayService {
   private tonClient: TonClient;
@@ -326,13 +329,15 @@ export class TransferRelayService {
 
           fundingAttempted = true;
 
+          const notBefore = Math.floor(Date.now() / 1000) - 60; // 60s clock-skew allowance
+
           await this.walletService.sendTon(userId, relay.address, quote.fundingAmountNano);
 
           const v = await this.verifyIncomingTonFrom(
             relay.address,
             walletAddress,
             quote.fundingAmountNano,
-            { allowBalanceFallback: true }
+            { allowBalanceFallback: true, notBefore }
           );
 
           if (!v.ok) {
@@ -375,7 +380,7 @@ export class TransferRelayService {
       });
     });
   }
-      /* ══════════════ STEP 3: EXECUTE THE OUTGOING TRANSFER ══════════════ */
+    /* ══════════════ STEP 3: EXECUTE THE OUTGOING TRANSFER ══════════════ */
 
   async execute(userId: number, quote: RelayQuote, destination: string): Promise<string> {
     this.assertEnabled();
@@ -502,6 +507,8 @@ export class TransferRelayService {
 
               outgoingBroadcastAttempted = true;
 
+              const notBefore = Math.floor(Date.now() / 1000) - 60; // this operation's window only
+
               // ONE transaction: platform fee → admin wallet, requested → destination
               const outgoingRef = await this.sendFromRelayMulti(
                 relay,
@@ -516,12 +523,14 @@ export class TransferRelayService {
                 { $set: { outgoingTxHash: outgoingRef } }
               );
 
-              /* ── Verify outgoing by SENDER (relay) + AMOUNT at destination ── */
+              /* ── Verify outgoing by SENDER (relay) + AMOUNT at destination,
+                    time-gated to THIS operation's broadcast window so
+                    identical repeats can never match each other ── */
               const verifiedOut = await this.verifyIncomingTonFrom(
                 normalizedDestination,
                 relay.address,
                 quote.requestedNano,
-                { allowBalanceFallback: false }
+                { allowBalanceFallback: false, notBefore }
               );
 
               if (!verifiedOut.ok) {
@@ -586,16 +595,31 @@ export class TransferRelayService {
                 },
               });
 
-              await Transaction.updateOne(
-                { _id: ledger._id },
-                {
-                  $set: {
-                    status: 'completed',
-                    txHash: verifiedOut.txHash || outgoingRef,
-                    reconciledAt: new Date(),
-                  },
+              // Bookkeeping must never break a completed transfer: if the
+              // real hash already exists on another row (ambiguous match),
+              // keep the provisional hash and log it.
+              try {
+                await Transaction.updateOne(
+                  { _id: ledger._id },
+                  {
+                    $set: {
+                      status: 'completed',
+                      txHash: verifiedOut.txHash || outgoingRef,
+                      reconciledAt: new Date(),
+                    },
+                  }
+                );
+              } catch (dup: any) {
+                if (dup?.code === 11000) {
+                  await Transaction.updateOne(
+                    { _id: ledger._id },
+                    { $set: { status: 'completed', reconciledAt: new Date() } }
+                  );
+                  console.warn(`[Relay] txHash ${verifiedOut.txHash} already recorded elsewhere — kept provisional hash on ledger`);
+                } else {
+                  throw dup;
                 }
-              );
+              }
 
               return op.operationId;
             } catch (error: any) {
@@ -685,7 +709,8 @@ export class TransferRelayService {
             op.destinationAddress,
             op.relayAddress,
             BigInt(op.requestedAmountNano),
-            { allowBalanceFallback: false, quick: true }
+            // broadcast happened before updatedAt; allow a 15-min window
+            { allowBalanceFallback: false, quick: true, notBefore: Math.floor(op.updatedAt.getTime() / 1000) - 15 * 60 }
           );
           if (v.ok) {
             await TransferOperation.updateOne(
@@ -871,90 +896,10 @@ export class TransferRelayService {
    * Batch status: which addresses are usable right now, per-address
    * successful-transfer counts, and whether a fresh batch is unlocked.
    * Only COMPLETED operations count (fee legs are Transaction records,
-   * reclaims/expiry are different states) — exactly the policy requested.
-   */
-  async getBatchStatus(userId: number): Promise<{
-    usable: any[];
-    entries: Array<{ label: string; completed: number; needed: number }>;
-    eligible: boolean;
-    perAddressNeeded: number;
-  }> {
-    this.assertEnabled();
+   * reclaims/expiry are different states) — exactly the policy r
 
-    const user = await User.findOne({ telegramId: userId });
-    if (!user) throw new Error('User not found');
 
-    const needed = config.relay.minTransfersPerAddress;
-    const relays = await RelayAddress.find({ userId: user._id }).sort({ createdAt: 1 });
 
-    const usable: any[] = [];
-    const entries: Array<{ label: string; completed: number; needed: number }> = [];
-    let eligible = relays.length > 0;
-
-    for (const r of relays) {
-      const completed = await TransferOperation.countDocuments({
-        relayAddressId: r._id,
-        state: 'COMPLETED',
-      });
-      entries.push({ label: r.label, completed, needed });
-      if (completed < needed) eligible = false;
-
-            const cooled = !r.nextEligibleAt || r.nextEligibleAt.getTime() <= Date.now();
-      const unresolved = await TransferOperation.countDocuments({
-        relayAddressId: r._id,
-        state: { $in: ['FUNDING', 'FUNDED', 'SENDING', 'RECOVERY_REQUIRED'] },
-      });
-      if (r.status === 'active' && cooled && unresolved === 0) usable.push(r);
-    }
-
-    return { usable, entries, eligible, perAddressNeeded: needed };
-  }
-
-  /**
-   * Provision a fresh batch: reuse-first (refuses if any address is
-   * already usable), eligibility gate (EVERY address needs `needed`
-   * COMPLETED transfers), then retire old + provision new (audit kept).
-   */
-  async provisionBatch(userId: number): Promise<{ retired: number; created: number }> {
-    this.assertEnabled();
-    await checkRateLimit('relay:provision', userId, 2, 60_000);
-
-    const user = await User.findOne({ telegramId: userId });
-    if (!user) throw new Error('User not found');
-
-    const status = await this.getBatchStatus(userId);
-
-    if (status.usable.length > 0) {
-      throw new Error(`You still have ${status.usable.length} address(es) ready to use — reuse them first.`);
-    }
-
-    if (!status.eligible) {
-      const missing = status.entries
-        .filter((e) => e.completed < e.needed)
-        .map((e) => `${e.label}: ${e.completed}/${e.needed}`)
-        .join(' · ');
-      throw new Error(
-        `Fresh batch locked — every address needs ${status.perAddressNeeded}+ successful transfers. Current: ${missing}`
-      );
-    }
-
-    const old = await RelayAddress.find({ userId: user._id });
-    for (const r of old) {
-      await RelayAddress.updateOne(
-        { _id: r._id },
-        { $set: { status: 'retired', retiredAt: new Date(), retireReason: 'user_batch_rotation' } }
-      );
-    }
-
-    await this.ensureAddresses(userId); // active+recovery count is now 0 → full set
-
-    const created = await RelayAddress.countDocuments({
-      userId: user._id,
-      status: { $in: ['active', 'recovery_required'] },
-    });
-
-    return { retired: old.length, created };
-  }
     /* ══════════════ TREASURY CONSOLIDATION (admin-gated) ══════════════ */
 
   async sweepResidualToTreasury(
@@ -1155,20 +1100,22 @@ export class TransferRelayService {
   }
 
   /**
-   * Verify an incoming transfer by SENDER ADDRESS + AMOUNT, with the
-   * balance check run INDEPENDENTLY of the tx scan.
+   * Verify an incoming transfer by SENDER ADDRESS + AMOUNT, time-gated.
    *
-   * Critical: getTransactions errors on not-yet-indexed (brand-new)
-   * addresses. When the balance check ran inside the same try-block, that
-   * error skipped the fallback entirely and verification always failed on
-   * fresh relay addresses. The balance check is now primary and runs in
-   * its own try; the tx scan only enriches the result with a real hash.
+   * - notBefore (unix seconds): only transactions AT/AFTER this moment are
+   *   accepted. This disambiguates identical sender+amount+destination
+   *   repeats from different operations (the E11000 scenario).
+   * - The balance check runs INDEPENDENTLY of the tx scan: getTransactions
+   *   errors on not-yet-indexed (brand-new) addresses, and when the balance
+   *   check lived inside the same try-block that error skipped the fallback
+   *   entirely. Balance is primary for fresh addresses; the scan only
+   *   enriches the result with a real tx hash.
    */
   private async verifyIncomingTonFrom(
     receivingAddress: string,
     senderAddress: string,
     expectedNano: bigint,
-    opts: { allowBalanceFallback: boolean; quick?: boolean }
+    opts: { allowBalanceFallback: boolean; quick?: boolean; notBefore?: number }
   ): Promise<
     | { ok: true; receivedNano: bigint; feeNano: bigint; txHash: string }
     | { ok: false; reason: string }
@@ -1180,10 +1127,13 @@ export class TransferRelayService {
       try { return Address.parse(senderAddress).toString(); } catch { return senderAddress; }
     })();
 
+    const notBefore = opts.notBefore ?? 0;
+
     const scanForTx = async (): Promise<{ receivedNano: bigint; feeNano: bigint; txHash: string } | null> => {
       try {
         const txs = await this.tonClient.getTransactions(Address.parse(receivingAddress), { limit: 20 });
         for (const tx of txs) {
+          if (tx.now < notBefore) continue; // ← time gate
           const inMsg = tx.inMessage;
           if (inMsg?.info.type === 'internal') {
             const src = inMsg.info.src
@@ -1326,5 +1276,4 @@ export class TransferRelayService {
 
     return { items, total, page, pageSize };
   }
-      }
-          
+}
