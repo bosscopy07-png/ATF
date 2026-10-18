@@ -99,6 +99,8 @@ export async function handleCallback(query: TelegramBot.CallbackQuery): Promise<
     await relayScreens.executeRelayReclaim(userId, chatId, user, data.replace('relay_reclaimgo_', ''));
     return;
   }
+  if (data === 'relay_batch') { await relayScreens.showRelayBatch(userId, chatId, user); return; }
+  if (data === 'relay_batch_go') { await relayScreens.executeRelayBatch(userId, chatId, user); return; }
   if (data === 'relay_fundgo') {
     if (user.state !== 'relay_fundconfirm') { await showMainMenu(userId, chatId); return; }
     await relayScreens.fundRelayFromWallet(userId, chatId, user);
@@ -291,5 +293,5 @@ export async function delUserMsg(msg: TelegramBot.Message): Promise<void> {
   try {
     await getBot().deleteMessage(msg.chat.id, msg.message_id);
   } catch { /* ignore */ }
-      }
-       
+     }
+                                
