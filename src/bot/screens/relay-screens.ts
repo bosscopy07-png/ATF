@@ -282,7 +282,7 @@ export async function showRelayHistory(userId: number, chatId: number, user: any
 
   await toast(userId, chatId,
     `${terminalHeader('RELAY HISTORY')}\n${lines.join('\n\n')}`,
-    keyboards.relayMenuKeyboard(true));
+    keyboards.backKeyboard('transfer_relay'));
 }
 
 /* ── ♻️ Reclaim (error/abandoned funding recovery) ── */
@@ -290,13 +290,18 @@ export async function showRelayHistory(userId: number, chatId: number, user: any
 export async function showRelayReclaim(userId: number, chatId: number, user: any): Promise<void> {
   if (!config.features.transferRelay) { await showMainMenu(userId, chatId); return; }
 
+  // Instant feedback — auto-edits to the result so the tap never feels dead
+  await render(userId, chatId,
+    `♻️ <b>CHECKING RECLAIMABLE FUNDS…</b>\n\nThis message updates automatically.`,
+    { inline_keyboard: [[{ text: '🏠 Main Menu', callback_data: 'back_main' }]] }, { withImage: true });
+
   try {
     const r = await relayService.getReclaimable(userId);
 
     if (!r) {
-      await toast(userId, chatId,
+      await render(userId, chatId,
         `${terminalHeader('RECLAIM')}\nNo reclaimable funds right now — this appears when a relay holds funds outside an active transfer (error, expiry, or leftover).`,
-        keyboards.relayMenuKeyboard(true));
+        keyboards.backKeyboard('transfer_relay'), { withImage: true });
       return;
     }
 
@@ -343,7 +348,7 @@ export async function executeRelayReclaim(userId: number, chatId: number, user: 
         `🧾 Platform fee → admin wallet: <code>${Precision.fromBaseUnits(BigInt(result.feeNano), 9)} TON</code>`,
         link ? `🔗 <a href="${link}">View on Tonscan</a>` : `🔗 Tx: <code>${result.txHash.slice(0, 20)}…</code>`,
       ].filter(Boolean).join('\n'),
-      keyboards.relayMenuKeyboard(true));
+      keyboards.backKeyboard('transfer_relay'));
   } catch (err: any) {
     console.error('[Relay] reclaim failed:', err);
     await render(userId, chatId,
@@ -469,108 +474,4 @@ export async function showAdminRelayAddressDetail(userId: number, chatId: number
         state: { $in: ['CREATED', 'VALIDATED', 'AWAITING_CONFIRMATION', 'FUNDING', 'FUNDED', 'SENDING'] },
       }),
       TransferOperation.countDocuments({
-        relayAddressId: relay._id,
-        state: { $in: ['RECOVERY_REQUIRED'] },
-      }),
-    ]);
-
-        const balanceTon = Precision.fromBaseUnits(balanceNano, 9);
-    const sweepable = balanceNano - config.relay.forwardFeeEstimateNano;
-    const canSweep = sweepable > 0n && inFlight === 0;
-
-    const caption = [
-      stepHeader('RELAY ADDRESS', relay.label),
-      '',
-      `<code>${relay.address}</code>`,
-      `${relay.walletVersion.toUpperCase()} · ${relay.status}`,
-      '',
-      `▸ <b>BALANCE</b>`,
-      `💎 on address  <code>${balanceTon} TON</code>`,
-      `├ reserve kept  <code>${Precision.fromBaseUnits(config.relay.forwardFeeEstimateNano, 9)} TON</code>`,
-      `└ sweepable     <code>${sweepable > 0n ? Precision.fromBaseUnits(sweepable, 9) : '0'} TON</code>`,
-      '',
-      `⏳ in-flight ops  <b>${inFlight}</b>`,
-      `🛠 recovery-required ops  <b>${unresolved}</b>`,
-      relay.nextEligibleAt ? `⏸ cooldown until  ${relay.nextEligibleAt.toLocaleDateString()}` : '',
-    ].filter(Boolean).join('\n');
-
-    const rows: TelegramBot.InlineKeyboardButton[][] = [];
-    if (canSweep) {
-      rows.push([{ text: `🧹 Sweep ${Precision.fromBaseUnits(sweepable, 9)} TON to Admin`, callback_data: `radm_sweep_${relayId}` }]);
-    } else if (inFlight > 0) {
-      rows.push([{ text: '⏳ In-flight operations — sweep locked', callback_data: `radm_addr_${relayId}` }]);
-    }
-    rows.push([{ text: '⟳ Refresh', callback_data: `radm_addr_${relayId}` }]);
-    rows.push([{ text: '‹ Addresses', callback_data: 'admin_relay_addrs' }]);
-
-    await render(userId, chatId, caption, { inline_keyboard: rows }, { withImage: true });
-  } catch {
-    await showAdminRelay(userId, chatId);
-  }
-}
-
-/** Sweep confirmation screen (explicit second step — no accidental sweeps). */
-export async function confirmRelayAddressSweep(userId: number, chatId: number, relayId: string): Promise<void> {
-  try {
-    await requireSuperAdmin(userId);   // sweeping moves funds — super admin only
-    const { RelayAddress } = await import('../../models/RelayAddress');
-
-    const relay = await RelayAddress.findById(relayId);
-    if (!relay) {
-      await toast(userId, chatId, '❌ Relay address not found.', { inline_keyboard: [[{ text: '‹ Addresses', callback_data: 'admin_relay_addrs' }]] });
-      return;
-    }
-
-    const balanceNano = await relayService.getAddressBalance(relay.address).catch(() => 0n);
-    const sweepable = balanceNano - config.relay.forwardFeeEstimateNano;
-    if (sweepable <= 0n) {
-      await toast(userId, chatId, 'Nothing to sweep — balance below network-fee threshold.', { inline_keyboard: [[{ text: '‹ Back', callback_data: `radm_addr_${relayId}` }]] });
-      return;
-    }
-
-    await render(userId, chatId, [
-      stepHeader('CONFIRM RECOVERY SWEEP', relay.label),
-      '',
-      `├ from  <code>${formatAddressShort(relay.address)}</code>`,
-      `├ amount  <code>${Precision.fromBaseUnits(sweepable, 9)} TON</code>`,
-      `└ to admin fee wallet  <code>${formatAddressShort(config.adminFeeWalletAddress)}</code>`,
-      '',
-      `The network reserve (${Precision.fromBaseUnits(config.relay.forwardFeeEstimateNano, 9)} TON) stays on the address.`,
-    ].join('\n'), {
-      inline_keyboard: [
-        [{ text: '✅ Confirm Sweep', callback_data: `radm_sweepyes_${relayId}` }],
-        [{ text: '❌ Cancel', callback_data: `radm_addr_${relayId}` }],
-      ],
-    }, { withImage: true });
-  } catch {
-    await showAdminRelay(userId, chatId);
-  }
-}
-
-/** Execute the sweep. */
-export async function executeRelayAddressSweep(userId: number, chatId: number, relayId: string): Promise<void> {
-  try {
-    await requireSuperAdmin(userId);
-    const result = await relayService.sweepAddressToAdmin(relayId, userId);
-
-    await render(userId, chatId, [
-      `✅ <b>SWEEP COMPLETED</b>`,
-      '',
-      `├ address  <code>${formatAddressShort(result.address)}</code>`,
-      `├ swept  <code>${Precision.fromBaseUnits(BigInt(result.amountNano), 9)} TON</code>`,
-      `└ tx  <code>${result.txHash}</code>`,
-      '',
-      `Funds recovered to admin fee wallet.`,
-    ].join('\n'), {
-      inline_keyboard: [
-        [{ text: '‹ Address Detail', callback_data: `radm_addr_${relayId}` }],
-        [{ text: '‹ Addresses', callback_data: 'admin_relay_addrs' }],
-      ],
-    }, { withImage: true });
-  } catch (err: any) {
-    console.error('[Relay] admin sweep failed:', err);
-    await toast(userId, chatId,
-      `❌ <b>Sweep failed</b>\n\n${String(err.message).slice(0, 300)}`,
-      { inline_keyboard: [[{ text: '‹ Back', callback_data: `radm_addr_${relayId}` }]] });
-  }
-          }
+        relayAddressId: relay._
