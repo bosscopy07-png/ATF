@@ -212,9 +212,13 @@ export const config = {
       requireEnvNumber('RELAY_FORWARD_FEE_NANO', 15_000_000)
     ),
 
-    reuseCooldownDays: requireEnvNumber('RELAY_REUSE_COOLDOWN_DAYS', 10),
+    /** Per-address reuse cooldown after a completed transfer (days). */
+    reuseCooldownDays: requireEnvNumber('RELAY_REUSE_COOLDOWN_DAYS', 3),
 
-    quoteTtlMs: requireEnvNumber('RELAY_QUOTE_TTL_MS', 60_000),
+    /** Successful transfers each address needs before a fresh batch unlocks. */
+    minTransfersPerAddress: requireEnvNumber('RELAY_MIN_TRANSFERS_PER_ADDRESS', 5),
+
+    quoteTtlMs: requireEnvNumber('RELAY_QUOTE_TTL_MS', 900_000),
 
     lockTtlMs: requireEnvNumber('RELAY_LOCK_TTL_MS', 120_000),
 
