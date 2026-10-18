@@ -897,7 +897,92 @@ export class TransferRelayService {
    * successful-transfer counts, and whether a fresh batch is unlocked.
    * Only COMPLETED operations count (fee legs are Transaction records,
    * reclaims/expiry are different states) — exactly the policy r
+      * Only COMPLETED operations count (fee legs are Transaction records,
+   * reclaims/expiry are different states) — exactly the policy requested.
+   */
+  async getBatchStatus(userId: number): Promise<{
+    usable: any[];
+    entries: Array<{ label: string; completed: number; needed: number }>;
+    eligible: boolean;
+    perAddressNeeded: number;
+  }> {
+    this.assertEnabled();
 
+    const user = await User.findOne({ telegramId: userId });
+    if (!user) throw new Error('User not found');
+
+    const needed = config.relay.minTransfersPerAddress;
+    const relays = await RelayAddress.find({ userId: user._id }).sort({ createdAt: 1 });
+
+    const usable: any[] = [];
+    const entries: Array<{ label: string; completed: number; needed: number }> = [];
+    let eligible = relays.length > 0;
+
+    for (const r of relays) {
+      const completed = await TransferOperation.countDocuments({
+        relayAddressId: r._id,
+        state: 'COMPLETED',
+      });
+      entries.push({ label: r.label, completed, needed });
+      if (completed < needed) eligible = false;
+
+      const cooled = !r.nextEligibleAt || r.nextEligibleAt.getTime() <= Date.now();
+      const unresolved = await TransferOperation.countDocuments({
+        relayAddressId: r._id,
+        state: { $in: ['FUNDING', 'FUNDED', 'SENDING', 'RECOVERY_REQUIRED'] },
+      });
+      if (r.status === 'active' && cooled && unresolved === 0) usable.push(r);
+    }
+
+    return { usable, entries, eligible, perAddressNeeded: needed };
+  }
+
+  /**
+   * Provision a fresh batch: reuse-first (refuses if any address is
+   * already usable), eligibility gate (EVERY address needs `needed`
+   * COMPLETED transfers), then retire old + provision new (audit kept).
+   */
+  async provisionBatch(userId: number): Promise<{ retired: number; created: number }> {
+    this.assertEnabled();
+    await checkRateLimit('relay:provision', userId, 2, 60_000);
+
+    const user = await User.findOne({ telegramId: userId });
+    if (!user) throw new Error('User not found');
+
+    const status = await this.getBatchStatus(userId);
+
+    if (status.usable.length > 0) {
+      throw new Error(`You still have ${status.usable.length} address(es) ready to use — reuse them first.`);
+    }
+
+    if (!status.eligible) {
+      const missing = status.entries
+        .filter((e) => e.completed < e.needed)
+        .map((e) => `${e.label}: ${e.completed}/${e.needed}`)
+        .join(' · ');
+      throw new Error(
+        `Fresh batch locked — every address needs ${status.perAddressNeeded}+ successful transfers. Current: ${missing}`
+      );
+    }
+
+    const old = await RelayAddress.find({ userId: user._id });
+    for (const r of old) {
+      await RelayAddress.updateOne(
+        { _id: r._id },
+        { $set: { status: 'retired', retiredAt: new Date(), retireReason: 'user_batch_rotation' } }
+      );
+    }
+
+    await this.ensureAddresses(userId); // active+recovery count is now 0 → full set
+
+    const created = await RelayAddress.countDocuments({
+      userId: user._id,
+      status: { $in: ['active', 'recovery_required'] },
+    });
+
+    return { retired: old.length, created };
+  }
+  
 
 
     /* ══════════════ TREASURY CONSOLIDATION (admin-gated) ══════════════ */
