@@ -34,8 +34,8 @@ export async function showSwapPair(userId: number, chatId: number): Promise<void
   await render(userId, chatId, [
     terminalHeader('SWAP', 'instant conversion · quote locked while confirming'),
     '',
-    tonPrice ? `💎 TON <code>$${tonPrice.price.toFixed(2)}</code> · ${marketMovement(tonPrice)}` : `💎 TON <i>⏳ price unavailable</i>`,
-    atfPrice ? `🔷 ATF <code>$${atfPrice.price.toFixed(6)}</code> · ${marketMovement(atfPrice)}` : `🔷 ATF <i>⏳ price unavailable</i>`,
+    tonPrice ? `💎 TON <code>$${tonPrice.price.toFixed(2)}</code> · ${marketMovement(tonPrice)}` : `💎 TON ⏳ price unavailable`,
+    atfPrice ? `🔷 ATF <code>$${atfPrice.price.toFixed(6)}</code> · ${marketMovement(atfPrice)}` : `🔷 ATF ⏳ price unavailable`,
     '',
     `Pick a pair below.`,
   ].join('\n'), keyboards.swapPairKeyboard(), { withImage: true });
@@ -60,10 +60,10 @@ export async function startSwapInput(userId: number, chatId: number, direction: 
   const caption = [
     stepHeader(`SWAP ${isTonToAtf ? 'TON → ATF' : 'ATF → TON'}`, 'free quote · no commitment'),
     '',
-    `💳 you have  <code>${Precision.formatDisplay(balance)} ${sym}</code>`,
-    isTonToAtf ? `📌 minimum   <code>${config.minSwapTon} TON</code>` : '',
+    `Enter the amount to swap.`,
     '',
-    `Type the amount to swap:`,
+    isTonToAtf ? `📌 Min: <code>${config.minSwapTon} TON</code>` : '',
+    `💳 Balance: <code>${Precision.formatDisplay(balance)} ${sym}</code>`,
   ].filter(Boolean).join('\n');
 
   user.state = `swap_input_${direction}`;
@@ -120,7 +120,7 @@ export async function handleSwapInput(userId: number, chatId: number, text: stri
       `└ swaps with    <code>${Precision.formatDisplay(confirmation.netSwapAmount)} ${inSym}</code>`,
       '',
       `▸ <b>YOU RECEIVE</b>`,
-      `<code>${Precision.formatDisplay(confirmation.expectedOutput)} ${outSym}</code>${receiveUsd ? `  <i>≈ $${fmtMoney(receiveUsd)}</i>` : ''}`,
+      `<code>${Precision.formatDisplay(confirmation.expectedOutput)} ${outSym}</code>${receiveUsd ? `  ≈ $${fmtMoney(receiveUsd)}` : ''}`,
       `└ minimum       <code>${Precision.formatDisplay(confirmation.minOutput)} ${outSym}</code>`,
       isTonToAtf ? `⛽ network  <code>${Precision.formatDisplay(confirmation.dexCosts)} TON</code>` : '',
       '',
@@ -154,11 +154,15 @@ export async function executeSwap(userId: number, chatId: number): Promise<void>
     return;
   }
 
-  await render(userId, chatId, `🔄 <b>Swapping…</b>\n\n<i>broadcasting to TON ⛓️</i>`, { inline_keyboard: [] }, { withImage: true });
+  await render(userId, chatId, `🔄 <b>Executing swap…</b>\n\nbroadcasting to TON ⛓️`, { inline_keyboard: [[{ text: '🏠 Main Menu', callback_data: 'back_main' }]] }, { withImage: true });
 
   try {
+    // FIX E: the swap is NOT completed here — it has only been BROADCAST.
+    // The reconciler is the sole authority on completion (it observes the
+    // on-chain DEX outcome and may still mark this swap failed). Marking it
+    // completed here made the bot report success for swaps that later
+    // failed on-chain.
     const txId = await swapService.executeSwap(userId, confirmation, direction);
-    await Transaction.findByIdAndUpdate(txId, { status: 'completed' });
     const txRecord = await Transaction.findById(txId);
     const txHash = txRecord?.txHash || '';
     const isTonToAtf = direction === 'ton_to_atf';
@@ -166,13 +170,11 @@ export async function executeSwap(userId: number, chatId: number): Promise<void>
     const outSym = isTonToAtf ? 'ATF' : 'TON';
 
     const caption = [
-      `✅ <b>SWAP EXECUTED</b>`,
+      `✅ <b>SWAP SUBMITTED</b>`,
       '',
       `<code>${Precision.formatDisplay(confirmation.inputAmount)} ${inSym}</code> → <code>${Precision.formatDisplay(confirmation.expectedOutput)} ${outSym}</code>`,
-      `└ settled in ~3–6s`,
+      `└ broadcasting — track final status in ◷ Activity`,
       explorerRow(txHash),
-      '',
-      `<i>funds are in your wallet ✅</i>`,
     ].filter(Boolean).join('\n');
 
     await clearState(userId);
@@ -190,7 +192,7 @@ const PAGE_SIZE_TOKENS = 8;
 
 export async function showTokenList(userId: number, chatId: number, direction: string, page: number): Promise<void> {
   if (!config.features.multiTokenSwap) {
-    await toast(userId, chatId, '⏳ <i>coming soon</i>', keyboards.tokenSearchKeyboard());
+    await toast(userId, chatId, '⏳ coming soon', keyboards.tokenSearchKeyboard());
     return;
   }
 
@@ -199,10 +201,9 @@ export async function showTokenList(userId: number, chatId: number, direction: s
 
     await toast(userId, chatId,
       [
-        terminalHeader('SELECT TOKEN'),
-        `page ${page} · ${total} token(s)`,
+        terminalHeader('SELECT TOKEN', `page ${page} · ${total} token(s)`),
         '',
-        `<i>verified &amp; community tokens with executable routes only.</i>`,
+        `Only verified &amp; community tokens with executable routes are listed.`,
       ].join('\n'),
       keyboards.tokenListKeyboard(
         items.map((t) => ({ masterAddress: t.masterAddress, symbol: t.symbol })),
@@ -212,7 +213,7 @@ export async function showTokenList(userId: number, chatId: number, direction: s
       ));
   } catch (err: any) {
     await toast(userId, chatId,
-      `❌ <i>token list unavailable: ${String(err.message).slice(0, 200)}</i>`,
+      `❌ token list unavailable: ${String(err.message).slice(0, 200)}`,
       keyboards.tokenSearchKeyboard());
   }
 }
@@ -220,7 +221,7 @@ export async function showTokenList(userId: number, chatId: number, direction: s
 /** Callback entry for the 'token_search' button (routes through feature gate). */
 export async function onTokenSearch(userId: number, chatId: number, user: any): Promise<void> {
   if (!config.features.multiTokenSwap) {
-    await toast(userId, chatId, '⏳ <i>coming soon</i>', keyboards.swapPairKeyboard());
+    await toast(userId, chatId, '⏳ coming soon', keyboards.swapPairKeyboard());
     return;
   }
 
@@ -237,7 +238,7 @@ export async function handleTokenSearchInput(userId: number, chatId: number, use
   const direction = user.stateData?.direction ?? 'ton_to_token';
 
   if (!config.features.multiTokenSwap) {
-    await toast(userId, chatId, '⏳ <i>coming soon</i>', keyboards.tokenSearchKeyboard());
+    await toast(userId, chatId, '⏳ coming soon', keyboards.tokenSearchKeyboard());
     return;
   }
 
@@ -254,7 +255,7 @@ export async function handleTokenSearchInput(userId: number, chatId: number, use
 
     if (!total) {
       await toast(userId, chatId,
-        `${terminalHeader('TOKEN SEARCH')}\n❌ nothing supported found for <b>${query.slice(0, 40)}</b>.\n\n<i>search by name, symbol, or exact contract address.</i>`,
+        `${terminalHeader('TOKEN SEARCH')}\n❌ nothing supported found for <b>${query.slice(0, 40)}</b>.\n\nsearch by name, symbol, or exact contract address.`,
         keyboards.tokenSearchKeyboard());
       return;
     }
@@ -269,21 +270,21 @@ export async function handleTokenSearchInput(userId: number, chatId: number, use
       ));
   } catch (err: any) {
     await toast(userId, chatId,
-      `❌ <i>search failed: ${String(err.message).slice(0, 200)}</i>`,
+      `❌ search failed: ${String(err.message).slice(0, 200)}`,
       keyboards.tokenSearchKeyboard());
   }
 }
 
 export async function startTokenSwapInput(userId: number, chatId: number, direction: string, master: string): Promise<void> {
   if (!config.features.multiTokenSwap) {
-    await toast(userId, chatId, '⏳ <i>coming soon</i>', keyboards.tokenSearchKeyboard());
+    await toast(userId, chatId, '⏳ coming soon', keyboards.tokenSearchKeyboard());
     return;
   }
 
   const token = await TokenRegistry.resolve(master);
   if (!token) {
     await toast(userId, chatId,
-      `${terminalHeader('SWAP')}\n❌ <i>token unavailable, unverified, or route unsupported.</i>`,
+      `${terminalHeader('SWAP')}\n❌ token unavailable, unverified, or route unsupported.`,
       keyboards.tokenSearchKeyboard());
     return;
   }
@@ -306,7 +307,7 @@ export async function startTokenSwapInput(userId: number, chatId: number, direct
     [
       stepHeader('SWAP', `${direction === 'ton_to_token' ? 'TON → ' + token.symbol : token.symbol + ' → TON'}`),
       '',
-      `Type the amount of <b>${inputName}</b> to swap:`,
+      `Enter the amount of <b>${inputName}</b> to swap:`,
     ].join('\n'),
     keyboards.cancelKeyboard('swap'));
 }
@@ -318,7 +319,7 @@ export async function handleTokenSwapAmount(userId: number, chatId: number, user
   const amount = text.trim();
   if (!isValidAmount(amount) || Number(amount) <= 0) {
     await toast(userId, chatId,
-      `${terminalHeader('SWAP')}\n❌ <i>invalid amount — enter a positive number.</i>`,
+      `${terminalHeader('SWAP')}\n❌ invalid amount — enter a positive number.`,
       keyboards.cancelKeyboard('swap'));
     return;
   }
@@ -330,7 +331,7 @@ export async function handleTokenSwapAmount(userId: number, chatId: number, user
     );
   } catch (err: any) {
     await toast(userId, chatId,
-      `${terminalHeader('SWAP')}\n❌ <i>${String(err.message).slice(0, 300)}</i>`,
+      `${terminalHeader('SWAP')}\n❌ ${String(err.message).slice(0, 300)}`,
       keyboards.tokenSearchKeyboard());
     return;
   }
@@ -346,11 +347,11 @@ export async function handleTokenSwapAmount(userId: number, chatId: number, user
   const feeLines: string[] = [];
   if (fp.platformFeeInputBase && fp.platformFeeInputBase !== '0') {
     feeLines.push(
-      `├ platform fee (${fp.platformPercent}%)  <code>${confirmation.platformFee}</code> ${inputSymbol} <i>from input</i>`
+      `├ platform fee (${fp.platformPercent}%)  <code>${confirmation.platformFee}</code> ${inputSymbol} — from input`
     );
   } else {
     feeLines.push(
-      `├ platform fee (${fp.platformPercent}%)  <code>${Precision.fromBaseUnits(BigInt(fp.platformFeeOutputBase), tokenDecimals)}</code> ${outputSymbol} <i>from output</i>`
+      `├ platform fee (${fp.platformPercent}%)  <code>${Precision.fromBaseUnits(BigInt(fp.platformFeeOutputBase), tokenDecimals)}</code> ${outputSymbol} — from output`
     );
   }
   if (fp.tonOutputFeeBase && fp.tonOutputFeeBase !== '0') {
@@ -369,7 +370,7 @@ export async function handleTokenSwapAmount(userId: number, chatId: number, user
       `   minimum    <code>${confirmation.minOutput}</code> ${outputSymbol}`,
       `⛽ DEX costs   <code>${confirmation.dexCosts}</code> TON`,
       '',
-      `<i>quote valid until ${new Date(confirmation.expiresAt).toLocaleTimeString()} — revalidated before execution.</i>`,
+      `Quote valid until ${new Date(confirmation.expiresAt).toLocaleTimeString()} — revalidated before execution.`,
     ].join('\n'),
     { inline_keyboard: [
       [{ text: '✅ Confirm Swap', callback_data: 'confirm_token_swap' }],
@@ -391,8 +392,8 @@ export async function executeTokenSwap(userId: number, chatId: number, user: any
   await user.save();
 
   await render(userId, chatId,
-    `🔄 <b>Swapping…</b>\n\n<i>broadcasting to TON ⛓️</i>`,
-    { inline_keyboard: [] }, { withImage: true });
+    `🔄 <b>Executing swap…</b>\n\nbroadcasting to TON ⛓️`,
+    { inline_keyboard: [[{ text: '🏠 Main Menu', callback_data: 'back_main' }]] }, { withImage: true });
 
   try {
     const txId = await swapService.executeTokenSwap(userId, confirmation, tokenDecimals);
@@ -405,15 +406,14 @@ export async function executeTokenSwap(userId: number, chatId: number, user: any
         '',
         `<code>${confirmation.inputAmount}</code> sent`,
         `└ expect ~<code>${confirmation.expectedOutput}</code> back`,
+        `└ track final status in ◷ Activity`,
         explorerRow(txHash),
-        '',
-        `<i>track final status in ◷ Activity.</i>`,
       ].filter(Boolean).join('\n'),
       keyboards.backKeyboard('back_main'), { withImage: true });
   } catch (err: any) {
     await toast(userId, chatId,
-      `❌ <b>Swap failed</b>\n\n<i>${String(err.message).slice(0, 300)}</i>`,
+      `❌ <b>Swap failed</b>\n\n${String(err.message).slice(0, 300)}`,
       keyboards.tokenSearchKeyboard());
   }
-}
+                                                                                             }
   
