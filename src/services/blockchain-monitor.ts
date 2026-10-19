@@ -24,9 +24,11 @@ function sleep(ms: number): Promise<void> {
  *   a double-credit. That's expected and benign, not a failure.
  */
 function logMonitorError(context: string, address: string, error: any): void {
+  
   if (error?.code === 11000) {
-    console.log(`${context} for ${address}: deposit already recorded by another check (safe, no double-credit).`);
-    return;
+  // Duplicate deposit record prevented by the unique index.
+  // Expected concurrency; no need to log every occurrence.
+  return;
   }
   const status = error?.response?.status;
   if (status === 429) {
