@@ -745,8 +745,9 @@ class ReconciliationService {
           { new: true }
         );
         if (!claimed) {
-          console.log(`ATF deposit check for ${deposit.fromAddress || ''}: deposit already recorded by another check (safe, no double-credit).`);
-          continue;
+  // Another worker already claimed or processed this deposit.
+  // Expected concurrency; skip silently to avoid log spam.
+  continue;
         }
 
         const user = await User.findById(deposit.userId);
