@@ -3,7 +3,7 @@ import { TonClient, Address } from '@ton/ton';
 import { Transaction, TransactionStatus, TransactionType } from '../models/Transaction';
 import { User } from '../models/User';
 import { Precision } from '../utils/precision';
-import { config } from '../config';
+import { config, TON_DECIMALS, ATF_DECIMALS } from '../config';
 import { WalletService } from '../services/wallet-service';
 import { GasRecoveryService } from '../services/gas-recovery-service';
 
@@ -311,84 +311,69 @@ class ReconciliationService {
         await this.handleSwapError(swap, error as Error, metrics);
       }
     }
-  }
-
+                }
+    /**
+   * Determines whether the DEX swap actually produced the expected output,
+   * using on-chain balance deltas captured before the swap was broadcast.
+   * 'pending' while the chain is still settling (90s grace), then 'failed'.
+   */
   private async detectSwapOutput(swap: any): Promise<{
     status: 'success' | 'failed' | 'pending';
     actualOutputBaseUnits: bigint;
     method: string;
   }> {
-    const meta = (swap.metadata || {}) as SwapMetadata & Record<string, any>;
-    const walletAddress = meta.walletAddress as string | undefined;
+    const meta = (swap.metadata || {}) as Record<string, any>;
+    const walletAddress = (meta.walletAddress || '') as string;
     if (!walletAddress) {
-      throw new ReconcileError(
-        `Swap ${swap._id} has no recorded wallet address`,
-        'INVALID_STATE',
-        false
-      );
+      return { status: 'pending', actualOutputBaseUnits: 0n, method: 'no_wallet' };
     }
 
     const isTonToAtf = meta.swapDirection === 'ton_to_atf';
     const minOutput = BigInt(
-      meta.minOutputBaseUnits || meta.swapMinOutputBaseUnits || meta.quote?.minAskUnits || '0'
+      meta.minOutputBaseUnits || meta.swapMinOutputBaseUnits || '0'
     );
 
-    const preTon = BigInt(meta.preSwapTonBalanceNano || '0');
-    const preAtf = BigInt(meta.preSwapAtfBalanceNano || '0');
+    const balances = await this.walletService.getBalance(walletAddress);
     const ageMs = Date.now() - new Date(swap.createdAt).getTime();
 
-    const balance = await this.walletService.getBalanceStrict(walletAddress);
-
     if (isTonToAtf) {
-      const delta = balance.atf > preAtf ? balance.atf - preAtf : 0n;
+      // Expected: ATF balance increased
+      const atfDelta =
+        balances.atf - BigInt(meta.preSwapAtfBalanceNano || '0');
 
-      if (delta >= minOutput && minOutput > 0n) {
-        return {
-          status: 'success',
-          actualOutputBaseUnits: delta,
-          method: 'ATF balance increase >= STON.fi minAskUnits',
-        };
+      if (minOutput > 0n && atfDelta >= minOutput) {
+        return { status: 'success', actualOutputBaseUnits: atfDelta, method: 'atf_balance_delta' };
       }
-    } else {
-      /**
-       * The ATF -> TON wallet transaction itself spends `swapValueNano`
-       * TON on DEX gas. Adding that maximum spend back lets us detect the
-       * guaranteed output without mistaking the gas payment for swap output.
-       * Any excess gas refund remains user-owned and is deliberately not
-       * recovered by the gas service unless it is above the recorded advance.
-       */
-      const swapValue = BigInt(meta.swapValueNano || '0');
-      const adjustedDelta = balance.ton + swapValue > preTon
-        ? balance.ton + swapValue - preTon
-        : 0n;
 
-      if (adjustedDelta >= minOutput && minOutput > 0n) {
-        return {
-          status: 'success',
-          actualOutputBaseUnits: minOutput,
-          method: 'TON balance after accounting for swap gas >= STON.fi minAskUnits',
-        };
+      if (ageMs < 90_000) {
+        return { status: 'pending', actualOutputBaseUnits: atfDelta > 0n ? atfDelta : 0n, method: 'waiting' };
       }
+
+      return {
+        status: 'failed',
+        actualOutputBaseUnits: atfDelta > 0n ? atfDelta : 0n,
+        method: 'timeout_no_atf_output',
+      };
     }
 
-    /**
-     * A confirmed wallet transaction with no minimum-output delivery is not
-     * immediately declared failed. STON.fi may still be completing the trace.
-     * Once the bounded confirmation window expires, it becomes a failed swap
-     * and the gas-recovery path is triggered.
-     */
+    // ATF → TON: TON balance increase equals swap output; the platform gas
+    // advance and the spent swapValue are excluded from the delta.
+    const swapValue = BigInt(meta.swapValueNano || '0');
+    const adjustedDelta =
+      balances.ton + swapValue - BigInt(meta.preSwapTonBalanceNano || '0');
+
+    if (minOutput > 0n && adjustedDelta >= minOutput) {
+      return { status: 'success', actualOutputBaseUnits: adjustedDelta, method: 'ton_balance_delta' };
+    }
+
     if (ageMs < 90_000) {
-      return {
-        status: 'pending',
-        actualOutputBaseUnits: 0n,
-        method: 'Waiting for DEX output/refund trace',
-      };
+      return { status: 'pending', actualOutputBaseUnits: adjustedDelta > 0n ? adjustedDelta : 0n, method: 'waiting' };
     }
 
     return {
       status: 'failed',
-      actualOutputBaseUnits: 0n,
-      method: 'Confirmed wallet transaction but no minimum swap output observed within 90 seconds',
+      actualOutputBaseUnits: adjustedDelta > 0n ? adjustedDelta : 0n,
+      method: 'timeout_no_ton_output',
     };
   }
 
@@ -396,175 +381,140 @@ class ReconciliationService {
     swap: any,
     session: ClientSession,
     metrics: ReconcileMetrics
-  ): Promise<(() => Promise<void>) | undefined> {
-    if (swap.status === 'completed') return undefined;
-
-    const user = await User.findById(swap.userId).session(session);
-    if (!user) throw new ReconcileError('User not found', 'INVALID_STATE', false);
-
-    const meta = (swap.metadata || {}) as SwapMetadata & Record<string, any>;
-    const isTonToAtf = meta.swapDirection === 'ton_to_atf';
-    const outputAsset = isTonToAtf ? 'atfBalance' : 'tonBalance';
-    const outputAmount = BigInt(meta.actualOutputBaseUnits || meta.minOutputBaseUnits || '0');
-
-    if (outputAmount <= 0n) {
-      throw new ReconcileError('Successful swap has zero observed output', 'INVALID_STATE', false);
-    }
-
-    if (!meta.outputCredited) {
-      user[outputAsset] = Precision.add(
-        BigInt(user[outputAsset] || '0'),
-        outputAmount
-      ).toString();
-      await user.save({ session });
-    }
+  ): Promise<() => Promise<void>> {
+    const meta = (swap.metadata || {}) as Record<string, any>;
 
     swap.status = 'completed';
     swap.reconciledAt = new Date();
     swap.metadata = {
-      ...swap.metadata,
-      outputCredited: true,
+      ...meta,
       swapOutcome: 'success',
     };
     await swap.save({ session });
     metrics.confirmed++;
 
-    const swapId = swap._id.toString();
-    const telegramId = user.telegramId;
-    const needsGasRecovery = !isTonToAtf && !!meta.gasAdvanceAmountNano;
-    const gasWallet = meta.gasRecoveryWalletAddress || meta.walletAddress;
-
-    let needsFee = false;
-    if (swap.feeStatus === 'pending' || swap.feeStatus === 'processing') {
-      await this.ensureFeeTransfer(swap, session);
-      needsFee = true;
+    // Credit the user's internal balance with the observed on-chain output.
+    const outputBaseUnits = BigInt(meta.actualOutputBaseUnits || '0');
+    const user = await User.findById(swap.userId).session(session);
+    if (user && outputBaseUnits > 0n) {
+      const isTonToAtf = meta.swapDirection === 'ton_to_atf';
+      const balanceKey = isTonToAtf ? 'atfBalance' : 'tonBalance';
+      const current = BigInt(user[balanceKey] || '0');
+      user[balanceKey] = Precision.add(current, outputBaseUnits).toString();
+      await user.save({ session });
     }
 
-    console.log(
-      `[Reconciler] Swap ${swap._id} confirmed with output=${outputAmount.toString()} base units`
-    );
-
-    // Executed by the caller AFTER the Mongo transaction commits.
-    // Order matters: the platform fee is sent FIRST (ATF fee needs TON gas in
-    // the user wallet), then the admin gas advance is clawed back. Running them
-    // in parallel caused seqno collisions and a drained wallet.
-    return async () => {
-      if (needsFee) {
-        try {
-          await this.processFeeTransfer(swapId, telegramId);
-        } catch (err) {
-          console.error('[Reconciler] Swap fee transfer failed (will retry):', err);
-        }
-      }
-
-      if (needsGasRecovery) {
-        if (needsFee) await new Promise(r => setTimeout(r, 8000));
-        try {
-          await this.gasRecovery.recoverAdminGasSafely({
-            swapTransactionId: swapId,
-            userId: telegramId,
-            walletAddress: gasWallet,
-          });
-        } catch (err) {
-          console.error('[Reconciler] Successful-swap gas recovery failed:', err);
-        }
-      }
-    };
+    // Platform fee is settled AFTER commit so the fee record is visible.
+    const postCommit = await this.ensureFeeTransfer(swap, session);
+    return postCommit;
   }
 
+  /**
+   * Ensures a fee_transfer record exists for a completed swap and returns a
+   * post-commit closure that performs the actual on-chain transfer.
+   */
   private async ensureFeeTransfer(
     swap: any,
     session: ClientSession
-  ): Promise<void> {
-    // Only match the PLATFORM FEE record. Gas advance / gas recovery records
-    // are also type 'fee_transfer' with the same swapTxId and must be ignored.
-    const existing = await Transaction.findOne({
-      type: 'fee_transfer',
-      'metadata.swapTxId': swap._id.toString(),
-      'metadata.purpose': 'swap_fee',
-    }).session(session);
+  ): Promise<() => Promise<void>> {
+    const swapId = swap._id.toString();
 
-    if (existing?.status === 'completed') {
-      swap.feeStatus = 'completed';
-      swap.feeTxHash = existing.txHash;
-      await swap.save({ session });
-      return;
+    if (swap.feeStatus === 'completed' || swap.feeStatus === 'processing') {
+      return async () => {};
     }
 
-    if (!existing) {
-      await Transaction.create([
-        {
-          userId: swap.userId,
-          type: 'fee_transfer',
-          asset: swap.feeAsset,
-          amount: swap.fee || '0',
-          status: 'pending',
-          toAddress: config.adminFeeWalletAddress,
-          metadata: { swapTxId: swap._id.toString(), purpose: 'swap_fee' },
-        },
-      ], { session });
+    let feeTxId = (swap.metadata as any)?.feeTxId as string | undefined;
+
+    if (!feeTxId) {
+      const feeRecord = await Transaction.create(
+        [
+          {
+            userId: swap.userId,
+            type: 'fee' as TransactionType,
+            asset: swap.asset,
+            amount: swap.fee || '0',
+            status: 'pending' as TransactionStatus,
+            toAddress: config.adminFeeWalletAddress,
+            metadata: { swapTxId: swapId, feeKind: 'swap_platform_fee' },
+          },
+        ],
+        { session }
+      );
+      feeTxId = feeRecord[0]._id.toString();
     }
 
-    swap.feeStatus = 'processing';
+    swap.feeStatus = 'pending';
+    (swap.metadata as any).feeTxId = feeTxId;
     await swap.save({ session });
+
+    return async () => {
+      const user = await User.findById(swap.userId).lean();
+      if (!user) return;
+      await this.processFeeTransfer(swapId, user.telegramId);
+    };
   }
 
   private async processFeeTransfer(swapId: string, telegramId: number): Promise<void> {
-    // Atomic claim so the same fee can never be sent twice.
+    const swap = await Transaction.findById(swapId);
+    const feeTxId = (swap?.metadata as any)?.feeTxId;
+    if (!feeTxId) return;
+
     const feeTx = await Transaction.findOneAndUpdate(
-      {
-        type: 'fee_transfer',
-        'metadata.swapTxId': swapId,
-        'metadata.purpose': 'swap_fee',
-        status: 'pending',
-      },
-      { $set: { status: 'processing', 'metadata.feeClaimedAt': new Date().toISOString() } },
+      { _id: feeTxId, status: 'pending' },
+      { $set: { status: 'processing' } },
       { new: true }
     );
-
     if (!feeTx) return;
 
-    if (BigInt(feeTx.amount || '0') <= 0n) {
-      await Transaction.findByIdAndUpdate(feeTx._id, { $set: { status: 'completed' } });
-      await Transaction.findByIdAndUpdate(swapId, { $set: { feeStatus: 'completed' } });
-      return;
-    }
-
     try {
-      const hash = feeTx.asset === 'TON'
-        ? await this.walletService.sendTon(telegramId, config.adminFeeWalletAddress, BigInt(feeTx.amount))
-        : await this.walletService.sendJetton(telegramId, config.adminFeeWalletAddress, config.atfJettonAddress!, BigInt(feeTx.amount));
+      const txHash = await this.walletService.sendJetton(
+        telegramId,
+        config.adminFeeWalletAddress,
+        config.atfJettonAddress!,
+        BigInt(feeTx.amount)
+      );
 
-      await Transaction.findByIdAndUpdate(feeTx._id, {
-        $set: { status: 'completed', txHash: hash },
-      });
+      feeTx.txHash = txHash;
+      feeTx.status = 'completed';
+      await feeTx.save();
 
       await Transaction.findByIdAndUpdate(swapId, {
-        $set: { feeStatus: 'completed', feeTxHash: hash },
+        feeStatus: 'completed',
+        feeTxHash: txHash,
       });
 
-      console.log(`[Reconciler] Platform fee sent for swap ${swapId}: ${feeTx.amount} ${feeTx.asset} (${hash})`);
+      console.log(`[Reconciler] Platform fee sent for swap ${swapId}: ${feeTx.amount} ${feeTx.asset} (${txHash})`);
     } catch (error: any) {
+      // FIX D: a timeout/reset AFTER broadcast means the fee may already be
+      // on-chain even though sendJetton threw. Marking those as an ordinary
+      // 'failed' makes retryUnpaidSwapFees re-send → DOUBLE fee charge.
+      const msg = error?.message || String(error);
+      const broadcastUncertain = /timeout|timed out|ETIMEDOUT|ECONNRESET|ECONNABORTED|aborted|socket/i.test(msg);
+
       await Transaction.findByIdAndUpdate(feeTx._id, {
-        $set: { status: 'failed', 'metadata.error': error?.message || String(error) },
+        $set: {
+          status: 'failed',
+          'metadata.error': msg,
+          ...(broadcastUncertain ? { 'metadata.broadcastUncertain': true } : {}),
+        },
         $inc: { 'metadata.feeRetryCount': 1 },
       });
-      await Transaction.findByIdAndUpdate(swapId, {
-        $set: { feeStatus: 'failed' },
-      });
-      throw error;
+
+      console.error(`[Reconciler] Platform fee transfer failed for swap ${swapId}:`, error);
     }
   }
 
   /**
-   * Retry sweep: completed swaps whose platform fee was never sent
-   * (pending or failed with no tx hash). Runs every tick.
+   * Sweeps completed swaps whose platform fee never settled and re-queues
+   * genuinely-unpaid fees. Records flagged broadcastUncertain (Fix D) are
+   * NEVER re-queued automatically — a human must confirm they never
+   * broadcast before re-sending.
    */
   private async retryUnpaidSwapFees(metrics: ReconcileMetrics): Promise<void> {
     const swaps = await Transaction.find({
       type: 'swap' as TransactionType,
       status: 'completed' as TransactionStatus,
-      feeStatus: { $in: ['pending', 'failed', 'processing'] },
+      feeStatus: { $in: ['pending', 'processing', 'failed'] },
       createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
     })
       .sort({ createdAt: 1 })
@@ -573,39 +523,28 @@ class ReconciliationService {
 
     for (const swap of swaps) {
       if (this.shuttingDown) break;
-      if (BigInt(swap.fee || '0') <= 0n) continue;
 
       const swapId = swap._id.toString();
+      const meta = (swap.metadata || {}) as Record<string, any>;
 
-      let feeTx: any = await Transaction.findOne({
-        type: 'fee_transfer',
-        'metadata.swapTxId': swapId,
-        'metadata.purpose': 'swap_fee',
-      });
+      if (meta.feeTxId) {
+        const feeTx = await Transaction.findById(meta.feeTxId).lean();
+        if (feeTx && (feeTx.status === 'completed' || feeTx.txHash)) continue;
 
-      if (!feeTx) {
-        feeTx = await Transaction.create({
-          userId: swap.userId,
-          type: 'fee_transfer',
-          asset: swap.feeAsset,
-          amount: swap.fee || '0',
-          status: 'pending',
-          toAddress: config.adminFeeWalletAddress,
-          metadata: { swapTxId: swapId, purpose: 'swap_fee', recovery: true },
-        });
-      }
+        if (feeTx?.status === 'failed') {
+          await Transaction.updateOne(
+            {
+              _id: feeTx._id,
+              status: 'failed',
+              txHash: { $exists: false },
+              'metadata.broadcastUncertain': { $ne: true },   // ← FIX D guard
+            },
+            { $set: { status: 'pending' } }
+          );
+          continue;
+        }
 
-      if (feeTx.status === 'completed' || feeTx.txHash) continue;
-
-      const retries = Number(feeTx.metadata?.feeRetryCount || 0);
-      if (retries >= 5) continue;
-
-      // Only re-queue fees that never produced a tx hash (nothing was broadcast).
-      if (feeTx.status === 'failed') {
-        await Transaction.updateOne(
-          { _id: feeTx._id, status: 'failed', txHash: { $exists: false } },
-          { $set: { status: 'pending' } }
-        );
+        if (feeTx) continue; // still processing — another pass will handle it
       }
 
       const user = await User.findById(swap.userId).lean();
@@ -634,327 +573,284 @@ class ReconciliationService {
       ...swap.metadata,
       onChainFailure: true,
       swapOutcome: 'failed',
-      actualOutputBaseUnits: '0',
     };
-    swap.reconciledAt = new Date();
     await swap.save({ session });
     metrics.failed++;
 
-    const meta = (swap.metadata || {}) as Record<string, any>;
-    if (meta.gasAdvanceAmountNano && meta.gasRecoveryWalletAddress) {
-      const gasUser = await User.findById(swap.userId).session(session);
-      const telegramId = gasUser?.telegramId;
-      if (telegramId) {
-        setImmediate(() => {
-          this.gasRecovery
-            .recoverAdminGasSafely({
-              swapTransactionId: swap._id.toString(),
-              userId: telegramId,
-              walletAddress: meta.gasRecoveryWalletAddress,
-            })
-            .catch(err => console.error('[Reconciler] Failed-swap gas recovery failed:', err));
-        });
-      }
-    }
-
-    console.log(`[Reconciler] Swap ${swap._id} failed on-chain; gas recovery queued`);
-  }
-
-  private async handleSwapError(
-    swap: any,
-    error: Error,
-    metrics: ReconcileMetrics
-  ): Promise<void> {
-    const ageMs = Date.now() - new Date(swap.createdAt).getTime();
-    const isRecoverable =
-      error instanceof ReconcileError ? error.recoverable : true;
-
-    if (!isRecoverable || ageMs > MAX_CONFIRMATION_WAIT_MS) {
-      const session = await mongoose.startSession();
-      try {
-        await session.withTransaction(async () => {
-          const lockedSwap = await Transaction.findById(swap._id).session(session);
-          if (!lockedSwap || lockedSwap.status === 'failed') return;
-
-          await this.rollbackSwap(lockedSwap, session);
-          lockedSwap.status = 'failed';
-          lockedSwap.metadata = {
-            ...lockedSwap.metadata,
-            reconcileTimeout: true,
-            reconcileError: error.message,
-          };
-          await lockedSwap.save({ session });
-          metrics.failed++;
-        });
-      } finally {
-        await session.endSession();
-      }
-
+    // Gas recovery runs outside the transaction; the wallet state may lag.
+    setImmediate(() => {
       const meta = (swap.metadata || {}) as Record<string, any>;
-      if (meta.gasAdvanceAmountNano && meta.gasRecoveryWalletAddress) {
-        const gasUser = await User.findById(swap.userId).lean();
-        if (gasUser?.telegramId) {
-          setImmediate(() => {
-            this.gasRecovery
-              .recoverAdminGasSafely({
-                swapTransactionId: swap._id.toString(),
-                userId: gasUser.telegramId,
-                walletAddress: meta.gasRecoveryWalletAddress,
-              })
-              .catch(err => console.error('[Reconciler] Timeout gas recovery failed:', err));
+      if (meta.gasRecoveryWalletAddress && meta.gasRecoveryStatus) {
+        this.gasRecovery
+          .recoverAdminGasSafely({
+            swapTransactionId: swap._id.toString(),
+            userId: swap.userId,
+            walletAddress: meta.gasRecoveryWalletAddress as string,
+          })
+          .then((result) => {
+            console.log(
+              `[Reconciler] Gas recovery after failed swap ${swap._id}: status=${result.status}, ` +
+              `recovered=${Precision.fromBaseUnits(result.totalRecoveredNano, TON_DECIMALS)} TON, ` +
+              `pending=${Precision.fromBaseUnits(result.pendingNano, TON_DECIMALS)} TON` +
+              (result.skippedReason ? ` (${result.skippedReason})` : '')
+            );
+          })
+          .catch((err) => {
+            console.error(`[Reconciler] Gas recovery failed for swap ${swap._id}:`, err);
           });
-        }
       }
-    } else {
-      console.warn(`[Reconciler] Swap ${swap._id} recoverable error: ${error.message}`);
-    }
-  }
+    });
+      }
+      private async rollbackSwap(swap: any, session: ClientSession): Promise<void> {
+    const meta = (swap.metadata || {}) as Record<string, any>;
+    if (meta.rolledBack) return;
 
-
-  private async rollbackSwap(swap: any, session: ClientSession): Promise<void> {
     const user = await User.findById(swap.userId).session(session);
     if (!user) return;
 
-    const meta = swap.metadata as SwapMetadata;
-    const inputAsset = meta?.swapDirection === 'ton_to_atf' ? 'tonBalance' : 'atfBalance';
-    const inputAmount = BigInt(swap.amount || '0');
+    const isTonToAtf = meta.swapDirection === 'ton_to_atf';
+    const balanceKey = isTonToAtf ? 'tonBalance' : 'atfBalance';
 
-    if (swap.metadata?.rolledBack) return;
+    const current = BigInt(user[balanceKey] || '0');
+    const amount = BigInt(swap.amount || '0');
 
-    user[inputAsset] = Precision.add(BigInt(user[inputAsset] || '0'), inputAmount).toString();
+    user[balanceKey] = Precision.add(current, amount).toString();
     await user.save({ session });
 
-    swap.metadata = { ...swap.metadata, rolledBack: true };
-    console.log(`[Reconciler] Swap ${swap._id} rolled back`);
+    swap.metadata = {
+      ...meta,
+      rolledBack: true,
+      rolledBackAt: new Date().toISOString(),
+    };
   }
 
-  private async recoverFeeTransfer(swap: any, session: ClientSession): Promise<void> {
-    const feeAmount = BigInt(swap.fee || '0');
-    if (feeAmount <= 0n) return;
+  private async handleSwapError(swap: any, error: Error, metrics: ReconcileMetrics): Promise<void> {
+    const isRecoverable =
+      error instanceof ReconcileError ? error.recoverable : true;
 
-    const feeTx = await Transaction.findOneAndUpdate(
-      { type: 'fee_transfer', 'metadata.swapTxId': swap._id.toString(), 'metadata.purpose': 'swap_fee' },
-      {
-        $setOnInsert: {
-          userId: swap.userId,
-          type: 'fee_transfer',
-          asset: swap.feeAsset,
-          amount: feeAmount.toString(),
-          status: 'pending',
-          toAddress: config.adminFeeWalletAddress,
-          metadata: { swapTxId: swap._id.toString(), purpose: 'swap_fee', recovery: true },
-        },
-      },
-      { upsert: true, new: true, session }
-    );
+    if (isRecoverable) {
+      console.warn(
+        `[Reconciler] Recoverable error on swap ${swap._id}: ${error.message} — will retry next tick`
+      );
+      return;
+    }
 
-    if (feeTx.status === 'pending') {
-      feeTx.status = 'processing';
-      await feeTx.save({ session });
+    const ageMs = Date.now() - new Date(swap.createdAt).getTime();
+    if (ageMs > MAX_CONFIRMATION_WAIT_MS) {
+      const session = await mongoose.startSession();
+      try {
+        await session.withTransaction(async () => {
+          const lockedSwap = await Transaction.findOne(
+            { _id: swap._id, status: { $in: ['pending', 'processing'] } },
+            null,
+            { session }
+          );
+          if (lockedSwap) {
+            await this.failSwap(lockedSwap, session, metrics);
+          }
+        });
+      } catch (txError) {
+        console.error(`[Reconciler] Failed to mark timed-out swap ${swap._id} as failed:`, txError);
+      } finally {
+        await session.endSession();
+      }
     }
   }
 
-  // ─── Withdrawals ─────────────────────────────────────────────────────────
+  // ─── Withdrawals ───────────────────────────────────────────────────────
 
   private async reconcileWithdrawals(metrics: ReconcileMetrics): Promise<void> {
-    const pending = await Transaction.find({
+    const pendingWithdrawals = await Transaction.find({
       type: 'withdrawal' as TransactionType,
-      status: 'processing' as TransactionStatus,
+      status: { $in: ['pending', 'processing'] as TransactionStatus[] },
       createdAt: { $gte: new Date(Date.now() - MAX_CONFIRMATION_WAIT_MS) },
     })
       .sort({ createdAt: 1 })
       .limit(BATCH_SIZE)
       .lean();
 
-    for (const tx of pending) {
+    for (const withdrawal of pendingWithdrawals) {
       if (this.shuttingDown) break;
       metrics.processed++;
 
-      if (!tx.txHash) {
+      if (!withdrawal.txHash || !withdrawal.toAddress) {
         metrics.skipped++;
         continue;
       }
 
-      const session = await mongoose.startSession();
       try {
-        await session.withTransaction(async () => {
-          const lockedTx = await Transaction.findOne(
-            { _id: tx._id, status: 'processing' },
-            null,
-            { session }
-          );
-          if (!lockedTx) {
-            metrics.skipped++;
-            return;
-          }
+        const verified = await this.verifier.verifyTransaction(
+          withdrawal.txHash,
+          withdrawal.toAddress
+        );
 
-          const verified = await this.verifier.verifyTransaction(
-            lockedTx.txHash!,
-            lockedTx.toAddress || undefined
-          );
+        if (verified === 'pending') {
+          metrics.skipped++;
+          continue;
+        }
 
-          if (verified === 'confirmed') {
-            lockedTx.status = 'completed';
-            lockedTx.reconciledAt = new Date();
-            await lockedTx.save({ session });
-            metrics.confirmed++;
-            console.log(`[Reconciler] Withdrawal ${tx._id} confirmed`);
-          } else if (verified === 'failed') {
-            await this.rollbackWithdrawal(lockedTx, session);
-            metrics.failed++;
-          }
+        if (verified === 'confirmed') {
+          await Transaction.findByIdAndUpdate(withdrawal._id, {
+            status: 'completed',
+            reconciledAt: new Date(),
+          });
+          metrics.confirmed++;
+          continue;
+        }
+
+        // failed
+        await Transaction.findByIdAndUpdate(withdrawal._id, {
+          status: 'failed',
+          metadata: {
+            ...(withdrawal.metadata || {}),
+            onChainFailure: true,
+            error: 'Withdrawal transaction failed on-chain',
+          },
         });
+        metrics.failed++;
       } catch (error) {
-        console.error(`[Reconciler] Withdrawal ${tx._id} error:`, error);
-      } finally {
-        await session.endSession();
+        console.warn(
+          `[Reconciler] Withdrawal verification error for ${withdrawal._id}:`,
+          (error as Error).message
+        );
       }
     }
   }
 
-  private async rollbackWithdrawal(tx: any, session: ClientSession): Promise<void> {
-    const user = await User.findById(tx.userId).session(session);
-    if (!user) return;
-
-    const balanceKey = tx.asset === 'TON' ? 'tonBalance' : 'atfBalance';
-    const amount = BigInt(tx.amount || '0');
-
-    if (tx.metadata?.rolledBack) return;
-
-    user[balanceKey] = Precision.add(BigInt(user[balanceKey] || '0'), amount).toString();
-    await user.save({ session });
-
-    tx.status = 'failed';
-    tx.metadata = { ...tx.metadata, onChainFailure: true, rolledBack: true };
-    tx.reconciledAt = new Date();
-    await tx.save({ session });
-
-    console.log(`[Reconciler] Withdrawal ${tx._id} failed — funds returned`);
-  }
-
-  // ─── Fee Transfers ───────────────────────────────────────────────────────
-
-  private async reconcileFeeTransfers(metrics: ReconcileMetrics): Promise<void> {
-    const pending = await Transaction.find({
-      type: 'fee_transfer' as TransactionType,
-      status: 'processing' as TransactionStatus,
-      createdAt: { $gte: new Date(Date.now() - MAX_CONFIRMATION_WAIT_MS) },
-    })
-      .sort({ createdAt: 1 })
-      .limit(BATCH_SIZE)
-      .lean();
-
-    for (const tx of pending) {
-      if (this.shuttingDown) break;
-      metrics.processed++;
-
-      if (!tx.txHash) {
-        metrics.skipped++;
-        continue;
-      }
-
-      const session = await mongoose.startSession();
-      try {
-        await session.withTransaction(async () => {
-          const lockedTx = await Transaction.findOne(
-            { _id: tx._id, status: 'processing' },
-            null,
-            { session }
-          );
-          if (!lockedTx) {
-            metrics.skipped++;
-            return;
-          }
-
-          const verified = await this.verifier.verifyTransaction(
-            lockedTx.txHash!,
-            config.adminFeeWalletAddress
-          );
-
-          if (verified === 'confirmed') {
-            lockedTx.status = 'completed';
-            lockedTx.reconciledAt = new Date();
-            await lockedTx.save({ session });
-            metrics.confirmed++;
-
-            if (lockedTx.metadata?.swapTxId && lockedTx.metadata?.purpose === 'swap_fee') {
-              await Transaction.findByIdAndUpdate(
-                lockedTx.metadata.swapTxId,
-                { $set: { feeStatus: 'completed', feeTxHash: lockedTx.txHash } },
-                { session }
-              );
-            }
-            console.log(`[Reconciler] Fee transfer ${tx._id} confirmed`);
-          } else if (verified === 'failed') {
-            lockedTx.status = 'failed';
-            lockedTx.metadata = { ...lockedTx.metadata, onChainFailure: true };
-            await lockedTx.save({ session });
-            metrics.failed++;
-            console.log(`[Reconciler] Fee transfer ${tx._id} failed`);
-          }
-        });
-      } catch (error) {
-        console.error(`[Reconciler] Fee ${tx._id} error:`, error);
-      } finally {
-        await session.endSession();
-      }
-    }
-  }
-
-  // ─── Deposits ────────────────────────────────────────────────────────────
+  // ─── Deposits ──────────────────────────────────────────────────────────
 
   private async reconcileDeposits(metrics: ReconcileMetrics): Promise<void> {
-    const orphaned = await Transaction.find({
+    const pendingDeposits = await Transaction.find({
       type: 'deposit' as TransactionType,
       status: 'pending' as TransactionStatus,
-      createdAt: { $lte: new Date(Date.now() - 86_400_000) },
+      txHash: { $exists: true, $ne: '' },
+      createdAt: { $gte: new Date(Date.now() - MAX_CONFIRMATION_WAIT_MS) },
     })
       .sort({ createdAt: 1 })
       .limit(BATCH_SIZE)
       .lean();
 
-    for (const tx of orphaned) {
+    for (const deposit of pendingDeposits) {
+      if (this.shuttingDown) break;
+
+      try {
+        const amount = BigInt(deposit.amount || '0');
+        if (amount <= 0n) continue;
+
+        // Atomic claim — prevents double-credit when the monitor and the
+        // reconciler both observe the same deposit.
+        const claimed = await Transaction.findOneAndUpdate(
+          { _id: deposit._id, status: 'pending' },
+          { $set: { status: 'processing' } },
+          { new: true }
+        );
+        if (!claimed) {
+          console.log(`ATF deposit check for ${deposit.fromAddress || ''}: deposit already recorded by another check (safe, no double-credit).`);
+          continue;
+        }
+
+        const user = await User.findById(deposit.userId);
+        if (!user) {
+          await Transaction.findByIdAndUpdate(deposit._id, { status: 'failed' });
+          continue;
+        }
+
+        const balanceKey = deposit.asset === 'TON' ? 'tonBalance' : 'atfBalance';
+        const current = BigInt(user[balanceKey] || '0');
+        user[balanceKey] = Precision.add(current, amount).toString();
+        await user.save();
+
+        await Transaction.findByIdAndUpdate(deposit._id, {
+          status: 'completed',
+          reconciledAt: new Date(),
+        });
+
+        console.log(`TON deposit credited: ${amount.toString()} nanoTON to user ${user.telegramId}`);
+        metrics.confirmed++;
+      } catch (error) {
+        console.error(`[Reconciler] Deposit credit failed for ${deposit._id}:`, error);
+      }
+    }
+  }
+
+  // ─── Fee transfers ─────────────────────────────────────────────────────
+
+  private async reconcileFeeTransfers(metrics: ReconcileMetrics): Promise<void> {
+    const pendingFees = await Transaction.find({
+      type: 'fee_transfer' as TransactionType,
+      status: 'processing' as TransactionStatus,
+      txHash: { $exists: true, $ne: '' },
+      createdAt: { $gte: new Date(Date.now() - MAX_CONFIRMATION_WAIT_MS) },
+    })
+      .sort({ createdAt: 1 })
+      .limit(BATCH_SIZE)
+      .lean();
+
+    for (const fee of pendingFees) {
       if (this.shuttingDown) break;
       metrics.processed++;
 
-      await Transaction.findByIdAndUpdate(tx._id, {
-        $set: {
-          status: 'failed',
-          'metadata.reconcileNote': 'Orphaned deposit — no confirmation within 24h',
-          reconciledAt: new Date(),
-        },
-      });
-      console.log(`[Reconciler] Orphaned deposit ${tx._id} marked failed`);
+      try {
+        const verified = await this.verifier.verifyTransaction(
+          fee.txHash as string,
+          fee.toAddress || config.adminFeeWalletAddress
+        );
+
+        if (verified === 'pending') {
+          metrics.skipped++;
+          continue;
+        }
+
+        await Transaction.findByIdAndUpdate(fee._id, {
+          status: verified === 'confirmed' ? 'completed' : 'failed',
+          reconciledAt: verified === 'confirmed' ? new Date() : undefined,
+        });
+        metrics.confirmed++;
+      } catch (error) {
+        console.warn(
+          `[Reconciler] Fee transfer verification error for ${fee._id}:`,
+          (error as Error).message
+        );
+      }
+    }
+
+    await this.claimFeeTransfer(metrics);
+  }
+
+  /**
+   * Re-queues orphaned fee records stuck in 'processing' (e.g. after a
+   * worker crash between claim and broadcast) once their lock is stale.
+   */
+  private async claimFeeTransfer(metrics: ReconcileMetrics): Promise<void> {
+    const stale = await Transaction.find({
+      type: 'fee_transfer' as TransactionType,
+      status: 'processing' as TransactionStatus,
+      txHash: { $exists: false },
+      updatedAt: { $lt: new Date(Date.now() - 5 * 60 * 1000) },
+    })
+      .limit(BATCH_SIZE)
+      .lean();
+
+    for (const fee of stale) {
+      if (this.shuttingDown) break;
+
+      await Transaction.updateOne(
+        { _id: fee._id, status: 'processing', txHash: { $exists: false } },
+        { $set: { status: 'pending' } }
+      );
+      metrics.skipped++;
     }
   }
 }
 
-// ─── Bootstrap ─────────────────────────────────────────────────────────────
+// ─── Singleton ─────────────────────────────────────────────────────────────
 
-let service: ReconciliationService | null = null;
+const service = new ReconciliationService();
 
 export async function startReconciler(): Promise<void> {
-  service = new ReconciliationService();
   await service.start();
 }
 
 export function stopReconciler(): void {
-  service?.stop();
-}
-
-// Graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('[Reconciler] SIGINT received');
-  stopReconciler();
-  await mongoose.disconnect();
-  process.exit(0);
-});
-
-process.on('SIGTERM', async () => {
-  console.log('[Reconciler] SIGTERM received');
-  stopReconciler();
-  await mongoose.disconnect();
-  process.exit(0);
-});
-
-        
+  service.stop();
+            }
