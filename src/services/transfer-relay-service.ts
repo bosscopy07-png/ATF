@@ -18,6 +18,15 @@ import { isValidTonAddress } from '../utils/validation';
 import { Precision } from '../utils/precision';
 import { WalletService } from './wallet-service';
 
+/**
+ * walletService.sendTon deducts the network forward fee FROM the carried
+ * amount (receiver gets amount − fee, observed ≈ 66,667 nano). We over-send
+ * by this carry so the relay still receives ≥ the required funding.
+ * 100,000 nano gives comfortable headroom; the excess stays on the relay
+ * (reserve / platform residual).
+ */
+const FUNDING_FEE_CARRY_NANO = 100_000n;
+
 export interface RelayQuote {
   quoteId: string;
   relayAddressId: string;
@@ -39,9 +48,9 @@ export interface RelayQuote {
  *
  * Flow (one operation row per quote, idempotent end-to-end):
  *  1. prepareQuote  — amount → total to debit (requested + 2% fee + reserve)
- *  2. fundRelay     — bot sends the total from the user's wallet to the
- *                     fresh relay address; verified on-chain → FUNDED
- *                     (relay balance → tx scan → sender-debit cross-check)
+ *  2. fundRelay     — bot sends total+carry from the user's wallet to the
+ *                     fresh relay address; confirmed via relay balance →
+ *                     tx scan → sender-debit cross-check → FUNDED
  *  3. execute       — user supplied destination → ONE relay transaction
  *                     (platform fee → admin wallet, requested → destination)
  *                     verified at destination → COMPLETED
@@ -198,9 +207,10 @@ export class TransferRelayService {
     if (!walletAddress) throw new Error('Wallet not found');
     const userTon = await this.getTonBalance(walletAddress);
     const gasBuffer = 20_000_000n; // ~0.02 TON for the funding send itself
-    if (userTon < fundingAmountNano + gasBuffer) {
+    const required = fundingAmountNano + FUNDING_FEE_CARRY_NANO + gasBuffer;
+    if (userTon < required) {
       throw new Error(
-        `Insufficient TON — you need ~${Precision.fromBaseUnits(fundingAmountNano + gasBuffer, 9)} TON ` +
+        `Insufficient TON — you need ~${Precision.fromBaseUnits(required, 9)} TON ` +
         `(amount + ${config.feePolicy.relayTransferPercent}% fee + network reserve + gas).`
       );
     }
@@ -236,8 +246,8 @@ export class TransferRelayService {
     const balanceNano = await this.getTonBalance(relay.address);
 
     return { ok: balanceNano >= requiredNano, balanceNano, requiredNano };
-}
-              /* ══════════════ STEP 2: FUND THE RELAY FROM THE USER'S WALLET ══════════════ */
+  }
+    /* ══════════════ STEP 2: FUND THE RELAY FROM THE USER'S WALLET ══════════════ */
 
   /**
    * Debit the user's custodial wallet and fund the relay. Creates the
@@ -252,6 +262,9 @@ export class TransferRelayService {
    *  3. Sender-debit cross-check: the sender wallet's balance dropped by
    *     ≥ the sent amount (sendTon either broadcasts the exact amount or
    *     throws, so a debit proves the funding left the wallet).
+   *
+   * Note: sendTon deducts the forward fee FROM the carried amount, so we
+   * over-send by FUNDING_FEE_CARRY_NANO to net the required funding.
    */
   async fundRelay(userId: number, quote: RelayQuote): Promise<{ operationId: string }> {
     this.assertEnabled();
@@ -341,7 +354,13 @@ export class TransferRelayService {
           // Sender-side baseline for the cross-check fallback
           const senderBefore = await this.getTonBalance(walletAddress);
 
-          await this.walletService.sendTon(userId, relay.address, quote.fundingAmountNano);
+          // sendTon deducts the forward fee from the carried amount — over-send
+          // by the carry so the relay still receives the full required funding.
+          await this.walletService.sendTon(
+            userId,
+            relay.address,
+            quote.fundingAmountNano + FUNDING_FEE_CARRY_NANO
+          );
 
           let v = await this.verifyIncomingTonFrom(
             relay.address,
@@ -689,8 +708,8 @@ export class TransferRelayService {
         );
       }
     );
-        }
-                                                         /* ══════════════ RECONCILIATION (worker-owned) ══════════════ */
+                  }
+                  /* ══════════════ RECONCILIATION (worker-owned) ══════════════ */
 
   async reconcileStale(): Promise<{ resumed: number; flagged: number }> {
     let resumed = 0;
@@ -1009,8 +1028,8 @@ export class TransferRelayService {
     });
 
     return { retired: old.length, created };
-            }
-                         /* ══════════════ TREASURY CONSOLIDATION (admin-gated) ══════════════ */
+  }
+      /* ══════════════ TREASURY CONSOLIDATION (admin-gated) ══════════════ */
 
   async sweepResidualToTreasury(
     adminTelegramId: number,
@@ -1220,8 +1239,11 @@ export class TransferRelayService {
    *   when the balance check lived inside the same try-block that error
    *   skipped the fallback entirely. Balance is primary for fresh
    *   addresses; the scan only enriches the result with a real tx hash.
-   * - label: when provided, logs every attempt (balance read / failure) so
-   *   provider quirks are visible in the logs.
+   * - label: when provided, logs every attempt so provider quirks are
+   *   visible in the logs.
+   * - Short windows by design: a correct funding shows within the first
+   *   attempts; a stable shortfall never catches up, so long polling only
+   *   delays the sender-debit cross-check.
    */
   private async verifyIncomingTonFrom(
     receivingAddress: string,
@@ -1232,8 +1254,8 @@ export class TransferRelayService {
     | { ok: true; receivedNano: bigint; feeNano: bigint; txHash: string }
     | { ok: false; reason: string }
   > {
-    const attempts = opts.quick ? 3 : 30;
-    const intervalMs = 4_000;
+    const attempts = opts.quick ? 3 : 12;
+    const intervalMs = 3_000;
     const label = opts.label ?? 'verify';
 
     const canonicalSender = (() => {
@@ -1311,8 +1333,8 @@ export class TransferRelayService {
     balanceBeforeNano: bigint,
     expectedNano: bigint
   ): Promise<{ ok: true; receivedNano: bigint; feeNano: bigint; txHash: string } | { ok: false; reason: string }> {
-    const attempts = 15;
-    const intervalMs = 4_000;
+    const attempts = 10;
+    const intervalMs = 3_000;
     const tolerance = 5_000_000n; // forward-fee tolerance on the debit
 
     for (let attempt = 0; attempt < attempts; attempt++) {
@@ -1421,5 +1443,5 @@ export class TransferRelayService {
 
     return { items, total, page, pageSize };
   }
-        }
-  
+      }
+    
