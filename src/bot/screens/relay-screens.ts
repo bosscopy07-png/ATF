@@ -54,11 +54,11 @@ export async function showRelayHome(userId: number, chatId: number, user: any): 
       `📋 <b>${addresses.length}</b> relay address${addresses.length !== 1 ? 'es' : ''} ready`,
       '',
       `▸ <b>HOW IT WORKS</b>`,
-      `1️⃣ pick an address &amp; amount`,
+      `1️⃣ pick an address & amount`,
       `2️⃣ we move the TON to the relay (from your wallet)`,
       `3️⃣ enter the destination — we relay it`,
       '',
-      `├ used addresses rest <code>${config.relay.reuseCooldownDays}</code> days before reuse`,
+      `├ ⏳ cooldown  <code>${config.relay.reuseCooldownDays}</code> days after each use`,
       `└ platform-managed — reliable, but <b>not</b> anonymous`,
       '',
       `Select an address below to start.`,
@@ -268,7 +268,7 @@ export async function showRelayHistory(userId: number, chatId: number, user: any
   if (!items.length) {
     await toast(userId, chatId,
       `${terminalHeader('RELAY HISTORY')}\nNo relay transfers yet.`,
-      keyboards.relayMenuKeyboard(false));
+      keyboards.backKeyboard('transfer_relay'));
     return;
   }
 
@@ -305,7 +305,7 @@ export async function showRelayReclaim(userId: number, chatId: number, user: any
       return;
     }
 
-    await toast(userId, chatId,
+    await render(userId, chatId,
       [
         stepHeader('RECLAIM TON', formatAddressShort(r.address)),
         '',
@@ -320,11 +320,11 @@ export async function showRelayReclaim(userId: number, chatId: number, user: any
       { inline_keyboard: [
         [{ text: `♻️ Reclaim ${Precision.fromBaseUnits(r.reclaimNano, 9)} TON`, callback_data: `relay_reclaimgo_${r.relayId}` }],
         [{ text: '❌ Cancel', callback_data: 'transfer_relay' }],
-      ] });
+      ] }, { withImage: true });
   } catch (err: any) {
-    await toast(userId, chatId,
+    await render(userId, chatId,
       `❌ ${String(err.message).slice(0, 300)}`,
-      keyboards.backKeyboard('transfer_relay'));
+      keyboards.backKeyboard('transfer_relay'), { withImage: true });
   }
 }
 
@@ -431,7 +431,7 @@ export async function executeRelayBatch(userId: number, chatId: number, user: an
         `├ retired  <b>${r.retired}</b> old address(es) — history kept`,
         `└ created  <b>${r.created}</b> fresh relay address(es)`,
         '',
-        `Each new address rests ${config.relay.reuseCooldownDays} days per use and needs ${config.relay.minTransfersPerAddress}+ successful transfers before the next batch.`,
+        `⏳ cooldown  ${config.relay.reuseCooldownDays} days per use · each address needs ${config.relay.minTransfersPerAddress}+ successful transfers before the next batch.`,
       ].join('\n'),
       keyboards.backKeyboard('transfer_relay'), { withImage: true });
   } catch (err: any) {
@@ -439,9 +439,8 @@ export async function executeRelayBatch(userId: number, chatId: number, user: an
       `❌ <b>Batch not generated</b>\n\n${String(err.message).slice(0, 400)}`,
       keyboards.backKeyboard('transfer_relay'), { withImage: true });
   }
-}
-
-/* ═══════════════════════════════════════════════════════════
+  }
+  /* ═══════════════════════════════════════════════════════════
    PHASE 5 — ADMIN: TRANSFER RELAY DASHBOARD (interactive)
    ═══════════════════════════════════════════════════════════ */
 
@@ -472,7 +471,7 @@ export async function showAdminRelay(userId: number, chatId: number): Promise<vo
       `⏳ in-flight operations  <b>${inFlight}</b>`,
       '',
       `Signing material is never displayed here.`,
-        ].join('\n'), {
+    ].join('\n'), {
       inline_keyboard: [
         [{ text: '📋 Addresses & Balances', callback_data: 'admin_relay_addrs' }],
         [{ text: '⟳ Refresh', callback_data: 'admin_relay' }],
@@ -662,4 +661,4 @@ export async function executeRelayAddressSweep(userId: number, chatId: number, r
       `❌ <b>Sweep failed</b>\n\n${String(err.message).slice(0, 300)}`,
       { inline_keyboard: [[{ text: '‹ Back', callback_data: `radm_addr_${relayId}` }]] });
   }
-          }
+}
