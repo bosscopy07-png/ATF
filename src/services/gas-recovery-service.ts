@@ -2,25 +2,25 @@ import {
   Transaction,
   ITransaction,
 } from '../models/Transaction';
- 
+
 import { WalletService } from './wallet-service';
 import { Precision } from '../utils/precision';
 import { config, TON_DECIMALS } from '../config';
 import { acquireLock } from '../utils/distributed-lock';
- 
+
 export type GasRecoveryStatus =
   | 'pending'
   | 'processing'
   | 'partial'
   | 'completed'
   | 'failed';
- 
+
 export interface GasAdvanceRecord {
   swapTransactionId: string;
   userId: number;
   walletAddress: string;
 }
- 
+
 export interface RecoveryResult {
   status: GasRecoveryStatus;
   recoveredThisAttemptNano: bigint;
@@ -29,7 +29,7 @@ export interface RecoveryResult {
   txHash?: string;
   skippedReason?: string;
 }
- 
+
 /**
  * Owns the platform TON advance lifecycle for ATF -> TON swaps.
  *
@@ -39,11 +39,11 @@ export interface RecoveryResult {
  */
 export class GasRecoveryService {
   private walletService: WalletService;
- 
+
   constructor(walletService?: WalletService) {
     this.walletService = walletService || new WalletService();
   }
- 
+
   async recordAdvance(params: {
     swapTransactionId: string;
     walletAddress: string;
@@ -72,18 +72,18 @@ export class GasRecoveryService {
       },
       { new: true }
     );
- 
+
     if (!updated) {
       throw new Error(`Swap transaction ${params.swapTransactionId} not found while recording gas advance`);
     }
   }
- 
+
   async recoverAdminGasSafely(record: GasAdvanceRecord): Promise<RecoveryResult> {
     const lock = await acquireLock(
       `lock:ton-gas:${record.walletAddress}`,
       config.gasRecoveryLockTtlMs
     );
- 
+
     if (!lock) {
       return {
         status: 'pending',
@@ -93,37 +93,48 @@ export class GasRecoveryService {
         skippedReason: 'Wallet gas-recovery lock is busy; retry will run again.',
       };
     }
- 
+
     try {
       return await this.recoverAdminGasSafelyUnlocked(record);
     } finally {
       await lock.release().catch(() => undefined);
     }
   }
- 
+
   private async recoverAdminGasSafelyUnlocked(
     record: GasAdvanceRecord
   ): Promise<RecoveryResult> {
+    // FIX B: pipeline update — $toInt normalizes legacy BOOLEAN values
+    // written by older swap-service code (true → 1) so the attempt counter
+    // can never crash the retry job with:
+    //   "Cannot apply $inc to a value of non-numeric type ... bool"
     const claimed = await Transaction.findOneAndUpdate(
       {
         _id: record.swapTransactionId,
         'metadata.gasRecoveryStatus': { $in: ['pending', 'partial', 'failed'] },
       },
-      {
-        $set: {
-          'metadata.gasRecoveryStatus': 'processing' as GasRecoveryStatus,
-          'metadata.gasRecoveryProcessingAt': new Date().toISOString(),
+      [
+        {
+          $set: {
+            'metadata.gasRecoveryStatus': 'processing' as GasRecoveryStatus,
+            'metadata.gasRecoveryProcessingAt': new Date().toISOString(),
+            'metadata.gasRecoveryAttempted': {
+              $add: [
+                { $toInt: { $ifNull: ['$metadata.gasRecoveryAttempted', 0] } },
+                1,
+              ],
+            },
+          },
         },
-        $inc: { 'metadata.gasRecoveryAttempted': 1 },
-      },
+      ],
       { new: true }
     );
- 
+
     if (!claimed) {
       const existing = await Transaction.findById(record.swapTransactionId).lean();
       const meta = (existing?.metadata || {}) as Record<string, any>;
       const status = (meta.gasRecoveryStatus || 'completed') as GasRecoveryStatus;
- 
+
       return {
         status,
         recoveredThisAttemptNano: 0n,
@@ -137,18 +148,18 @@ export class GasRecoveryService {
               : 'Nothing to recover.',
       };
     }
- 
+
     try {
       const meta = (claimed.metadata || {}) as Record<string, any>;
       const advanced = BigInt(meta.gasAdvanceAmountNano || '0');
       const preAdvance = BigInt(meta.tonBalanceBeforeGasAdvance || '0');
       const recovered = BigInt(meta.gasRecoveredAmountNano || '0');
       const writtenOff = BigInt(meta.gasRecoveryWrittenOffNano || '0');
- 
+
       const stillOwed = advanced > recovered + writtenOff
         ? advanced - recovered - writtenOff
         : 0n;
- 
+
       if (advanced <= 0n || stillOwed <= 0n) {
         return this.settle(
           claimed,
@@ -159,17 +170,17 @@ export class GasRecoveryService {
           'No outstanding platform gas obligation.'
         );
       }
- 
+
       // This is deliberately strict. A provider/RPC failure must never look
       // like a zero balance and cause a false recovery decision.
       const currentBalance = await this.walletService.getTonBalanceStrict(
         record.walletAddress
       );
- 
+
       const balanceIncrease = currentBalance > preAdvance
         ? currentBalance - preAdvance
         : 0n;
- 
+
       /**
        * For a failed swap there is no user swap output to protect.
        * For a successful swap, `actualOutputBaseUnits` is written by the
@@ -181,13 +192,13 @@ export class GasRecoveryService {
       const actualUserOutput = swapSucceeded
         ? BigInt(meta.actualOutputBaseUnits || '0')
         : 0n;
- 
+
       const platformIncrease = balanceIncrease > actualUserOutput
         ? balanceIncrease - actualUserOutput
         : 0n;
- 
+
       const recoverable = min2(stillOwed, platformIncrease);
- 
+
       if (recoverable <= 0n) {
         return this.settle(
           claimed,
@@ -200,18 +211,18 @@ export class GasRecoveryService {
             : 'No platform TON is currently recoverable; retry remains active.'
         );
       }
- 
+
       const reserve =
         config.tonTransferFeeReserveNano +
         config.gasRecoveryBufferNano +
         config.gasRecoveryMinBalanceNano;
- 
+
       const maxSendable = currentBalance > reserve
         ? currentBalance - reserve
         : 0n;
- 
+
       const safeRecoverable = min2(recoverable, maxSendable);
- 
+
       if (safeRecoverable <= 0n) {
         return this.settle(
           claimed,
@@ -222,22 +233,22 @@ export class GasRecoveryService {
           'Wallet balance is below the safe recovery-send threshold.'
         );
       }
- 
+
       /**
-       * CRITICAL FIX: send from the exact wallet that received the advance.
+       * CRITICAL: send from the exact wallet that received the advance.
        */
       const txHash = await this.walletService.sendTonFromWalletAddress(
         record.walletAddress,
         config.adminFeeWalletAddress,
         safeRecoverable
       );
- 
+
       const newRecovered = recovered + safeRecoverable;
       const pending = advanced > newRecovered + writtenOff
         ? advanced - newRecovered - writtenOff
         : 0n;
       const status: GasRecoveryStatus = pending > 0n ? 'partial' : 'completed';
- 
+
       await Transaction.create({
         userId: claimed.userId,
         type: 'fee_transfer',
@@ -256,7 +267,7 @@ export class GasRecoveryService {
           swapOutcome: meta.swapOutcome || 'unknown',
         },
       });
- 
+
       return this.settle(
         claimed,
         status,
@@ -274,7 +285,7 @@ export class GasRecoveryService {
       const pending = advanced > recovered + writtenOff
         ? advanced - recovered - writtenOff
         : 0n;
- 
+
       await Transaction.findByIdAndUpdate(record.swapTransactionId, {
         $set: {
           'metadata.gasRecoveryStatus': recovered > 0n ? 'partial' : 'pending',
@@ -283,12 +294,12 @@ export class GasRecoveryService {
           'metadata.gasRecoveryPendingAmountNano': pending.toString(),
         },
       });
- 
+
       console.error(
         `[GasRecoveryService] Recovery failed for swap ${record.swapTransactionId}:`,
         error
       );
- 
+
       return {
         status: recovered > 0n ? 'partial' : 'pending',
         recoveredThisAttemptNano: 0n,
@@ -297,9 +308,8 @@ export class GasRecoveryService {
         skippedReason: error?.message || String(error),
       };
     }
-  }
- 
-  private async settle(
+        }
+      private async settle(
     claimed: ITransaction,
     status: GasRecoveryStatus,
     recoveredThisAttemptNano: bigint,
@@ -317,7 +327,7 @@ export class GasRecoveryService {
         ...(txHash ? { 'metadata.gasRecoveryTxHash': txHash } : {}),
       },
     });
- 
+
     return {
       status,
       recoveredThisAttemptNano,
@@ -328,12 +338,11 @@ export class GasRecoveryService {
     };
   }
 }
- 
+
 function min2(a: bigint, b: bigint): bigint {
   return a < b ? a : b;
 }
- 
+
 export function gasTonToNano(gasTon: string): bigint {
   return Precision.toBaseUnits(gasTon, TON_DECIMALS);
-        }
-      
+}
