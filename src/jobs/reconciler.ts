@@ -74,6 +74,16 @@ class OnChainVerifier {
 
   async verifyTransaction(txHash: string, toAddress?: string): Promise<VerificationResult> {
     if (!toAddress) return 'pending';
+
+    // Wallet-service tracking references (waitForTransaction):
+    //   "addr_seqno"    → minted ONLY after the wallet's seqno increased,
+    //                     i.e. the external message WAS consumed on-chain.
+    //   "addr_seqno_ts" → minted after the seqno never moved (timeout) —
+    //                     genuinely unknown, keep pending.
+    if (txHash.includes('_')) {
+      return txHash.split('_').length === 2 ? 'confirmed' : 'pending';
+    }
+
     if (this.circuitOpen) {
       throw new ReconcileError('Circuit breaker open', 'RPC_ERROR', true);
     }
@@ -244,9 +254,18 @@ class ReconciliationService {
       }
 
       try {
+        const swapMeta = (swap.metadata || {}) as Record<string, any>;
+
+        // CRITICAL: txHash is the WALLET-side transaction hash
+        // (WalletService.waitForTransaction returns txs[0].hash() of the
+        // SENDER wallet). It can never be found at the DEX router, whose
+        // processing of our message is a DIFFERENT transaction with a
+        // different hash. Verify at the wallet address.
+        const verifyAddress = (swapMeta.walletAddress || swap.toAddress) as string;
+
         const verified = await this.verifier.verifyTransaction(
           swap.txHash,
-          swap.toAddress
+          verifyAddress
         );
 
         if (verified === 'pending') {
@@ -470,10 +489,10 @@ class ReconciliationService {
   }
 
   /**
-   * Delegates to FeeCollectionService (kept as the reconciler's sweep entry
+   * Delegates to FeeCollectionService (kept as the reconciler's entry
    * point so older call sites keep working). All fee logic — record
-   * creation, claims, sending, broadcast-uncertain handling — lives in the
-   * fee service now.
+   * creation, claims, sending, broadcast-uncertain handling — lives in
+   * the fee service now.
    */
   private async processFeeTransfer(swapId: string, _telegramId: number): Promise<void> {
     const { FeeCollectionService } = await import('../services/fee-collection-service');
@@ -548,7 +567,7 @@ class ReconciliationService {
           });
       }
     });
-                                  }
+        }
     private async rollbackSwap(swap: any, session: ClientSession): Promise<void> {
     const meta = (swap.metadata || {}) as Record<string, any>;
     if (meta.rolledBack) return;
@@ -627,9 +646,22 @@ class ReconciliationService {
       }
 
       try {
+        // txHash is wallet-side (waitForTransaction); verify at the
+        // sender wallet, not the destination. Underscore seqno refs are
+        // handled inside the verifier. Fall back to toAddress if the
+        // wallet cannot be resolved.
+        let verifyAddress = withdrawal.toAddress as string;
+        try {
+          const wUser = await User.findById(withdrawal.userId).lean();
+          if (wUser) {
+            const wAddr = await this.walletService.getAddress(wUser.telegramId);
+            if (wAddr) verifyAddress = wAddr;
+          }
+        } catch { /* fall back to toAddress */ }
+
         const verified = await this.verifier.verifyTransaction(
           withdrawal.txHash,
-          withdrawal.toAddress
+          verifyAddress
         );
 
         if (verified === 'pending') {
@@ -693,11 +725,9 @@ class ReconciliationService {
           { new: true }
         );
         if (!claimed) {
-  // Another worker already claimed or processed this deposit.
-  // Expected concurrency; skip silently to avoid log spam.
-  continue;
+          console.log(`ATF deposit check for ${deposit.fromAddress || ''}: deposit already recorded by another check (safe, no double-credit).`);
+          continue;
         }
-        
 
         const user = await User.findById(deposit.userId);
         if (!user) {
@@ -805,4 +835,5 @@ export async function startReconciler(): Promise<void> {
 
 export function stopReconciler(): void {
   service.stop();
-}
+                 }
+      
