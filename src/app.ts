@@ -8,6 +8,8 @@ import { startReconciler, stopReconciler } from './jobs/reconciler';
 import { GasRecoveryRetryJob } from './jobs/gas-recovery-retry';
 // ── PHASE 4 addition: relay operation reconciler (runs in BOTH modes) ──
 import { RelayReconcilerJob } from './jobs/relay-reconciler';
+// ── Fee collector: dedicated platform-fee sweeper (runs in BOTH modes) ──
+import { FeeCollectorJob } from './services/fee-collection-service';
 
 // ─── Service Registry & Lifecycle ─────────────────────────────────────────
 
@@ -118,6 +120,16 @@ async function startServer(): Promise<void> {
     health: async () => ({ status: 'healthy' }),
   });
 
+  // ── Fee collector: sweeps platform fees for completed swaps even if
+  //    the reconciler's finalize path never fires. ──
+  const feeCollector = new FeeCollectorJob();
+  manager.register({
+    name: 'fee_collector',
+    start: async () => feeCollector.start(),
+    stop: async () => feeCollector.stop(),
+    health: async () => ({ status: 'healthy' }),
+  });
+
   // HTTP service
   const app = express();
   const adminApp = createAdminApp();
@@ -217,6 +229,15 @@ async function startWorker(): Promise<void> {
     name: 'relay_reconciler',
     start: async () => relayReconciler.start(),
     stop: async () => relayReconciler.stop(),
+    health: async () => ({ status: 'healthy' }),
+  });
+
+  // ── Fee collector (worker mode) ──
+  const feeCollector = new FeeCollectorJob();
+  manager.register({
+    name: 'fee_collector',
+    start: async () => feeCollector.start(),
+    stop: async () => feeCollector.stop(),
     health: async () => ({ status: 'healthy' }),
   });
 
@@ -337,3 +358,4 @@ bootstrap().catch((error) => {
   console.error('[Bootstrap] Unhandled bootstrap error:', error);
   process.exit(1);
 });
+      
