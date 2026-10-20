@@ -320,8 +320,8 @@ class ReconciliationService {
         await this.handleSwapError(swap, error as Error, metrics);
       }
     }
-      }
-              /**
+  }
+    /**
    * Determines whether the DEX swap actually produced the expected output,
    * using on-chain balance deltas captured before the swap was broadcast.
    * 'pending' while the chain is still settling (90s grace), then 'failed'.
@@ -413,14 +413,16 @@ class ReconciliationService {
       await user.save({ session });
     }
 
-    // Platform fee is settled AFTER commit so the fee record is visible.
+    // Platform fee is settled AFTER commit via the dedicated fee service
+    // (single source of truth — see fee-collection-service.ts).
     const postCommit = await this.ensureFeeTransfer(swap, session);
     return postCommit;
   }
 
   /**
-   * Ensures a fee_transfer record exists for a completed swap and returns a
-   * post-commit closure that performs the actual on-chain transfer.
+   * Ensures a fee record exists for a completed swap (created inside the
+   * finalize transaction so it's atomic with completion) and returns a
+   * post-commit closure that hands off to the FeeCollectionService.
    */
   private async ensureFeeTransfer(
     swap: any,
@@ -442,8 +444,11 @@ class ReconciliationService {
             type: 'fee' as TransactionType,
             asset: swap.asset,
             amount: swap.fee || '0',
+            feePercentage: swap.feePercentage,
+            feeWallet: config.adminFeeWalletAddress,
             status: 'pending' as TransactionStatus,
             toAddress: config.adminFeeWalletAddress,
+            txHash: `fee-pending-${swapId}`,
             metadata: { swapTxId: swapId, feeKind: 'swap_platform_fee' },
           },
         ],
@@ -457,67 +462,28 @@ class ReconciliationService {
     await swap.save({ session });
 
     return async () => {
-      const user = await User.findById(swap.userId).lean();
-      if (!user) return;
-      await this.processFeeTransfer(swapId, user.telegramId);
+      // Delegated to the dedicated fee service: single source of truth,
+      // broadcast-safe, idempotent. telegramId is resolved inside.
+      const { FeeCollectionService } = await import('../services/fee-collection-service');
+      await new FeeCollectionService().collectSwapFee(swapId);
     };
   }
 
-  private async processFeeTransfer(swapId: string, telegramId: number): Promise<void> {
-    const swap = await Transaction.findById(swapId);
-    const feeTxId = (swap?.metadata as any)?.feeTxId;
-    if (!feeTxId) return;
-
-    const feeTx = await Transaction.findOneAndUpdate(
-      { _id: feeTxId, status: 'pending' },
-      { $set: { status: 'processing' } },
-      { new: true }
-    );
-    if (!feeTx) return;
-
-    try {
-      const txHash = await this.walletService.sendJetton(
-        telegramId,
-        config.adminFeeWalletAddress,
-        config.atfJettonAddress!,
-        BigInt(feeTx.amount)
-      );
-
-      feeTx.txHash = txHash;
-      feeTx.status = 'completed';
-      await feeTx.save();
-
-      await Transaction.findByIdAndUpdate(swapId, {
-        feeStatus: 'completed',
-        feeTxHash: txHash,
-      });
-
-      console.log(`[Reconciler] Platform fee sent for swap ${swapId}: ${feeTx.amount} ${feeTx.asset} (${txHash})`);
-    } catch (error: any) {
-      // FIX D: a timeout/reset AFTER broadcast means the fee may already be
-      // on-chain even though sendJetton threw. Marking those as an ordinary
-      // 'failed' makes retryUnpaidSwapFees re-send → DOUBLE fee charge.
-      const msg = error?.message || String(error);
-      const broadcastUncertain = /timeout|timed out|ETIMEDOUT|ECONNRESET|ECONNABORTED|aborted|socket/i.test(msg);
-
-      await Transaction.findByIdAndUpdate(feeTx._id, {
-        $set: {
-          status: 'failed',
-          'metadata.error': msg,
-          ...(broadcastUncertain ? { 'metadata.broadcastUncertain': true } : {}),
-        },
-        $inc: { 'metadata.feeRetryCount': 1 },
-      });
-
-      console.error(`[Reconciler] Platform fee transfer failed for swap ${swapId}:`, error);
-    }
+  /**
+   * Delegates to FeeCollectionService (kept as the reconciler's sweep entry
+   * point so older call sites keep working). All fee logic — record
+   * creation, claims, sending, broadcast-uncertain handling — lives in the
+   * fee service now.
+   */
+  private async processFeeTransfer(swapId: string, _telegramId: number): Promise<void> {
+    const { FeeCollectionService } = await import('../services/fee-collection-service');
+    await new FeeCollectionService().collectSwapFee(swapId);
   }
 
   /**
-   * Sweeps completed swaps whose platform fee never settled and re-queues
-   * genuinely-unpaid fees. Records flagged broadcastUncertain (Fix D) are
-   * NEVER re-queued automatically — a human must confirm they never
-   * broadcast before re-sending.
+   * Sweeps completed swaps whose platform fee never settled. Delegates to
+   * the FeeCollectionService — broadcast-uncertain records are never
+   * auto-requeued there (double-charge guard).
    */
   private async retryUnpaidSwapFees(metrics: ReconcileMetrics): Promise<void> {
     const swaps = await Transaction.find({
@@ -530,41 +496,14 @@ class ReconciliationService {
       .limit(BATCH_SIZE)
       .lean();
 
+    const { FeeCollectionService } = await import('../services/fee-collection-service');
+    const feeService = new FeeCollectionService();
+
     for (const swap of swaps) {
       if (this.shuttingDown) break;
 
-      const swapId = swap._id.toString();
-      const meta = (swap.metadata || {}) as Record<string, any>;
-
-      if (meta.feeTxId) {
-        const feeTx = await Transaction.findById(meta.feeTxId).lean();
-        if (feeTx && (feeTx.status === 'completed' || feeTx.txHash)) continue;
-
-        if (feeTx?.status === 'failed') {
-          await Transaction.updateOne(
-            {
-              _id: feeTx._id,
-              status: 'failed',
-              txHash: { $exists: false },
-              'metadata.broadcastUncertain': { $ne: true },   // ← FIX D guard
-            },
-            { $set: { status: 'pending' } }
-          );
-          continue;
-        }
-
-        if (feeTx) continue; // still processing — another pass will handle it
-      }
-
-      const user = await User.findById(swap.userId).lean();
-      if (!user) continue;
-
-      try {
-        await this.processFeeTransfer(swapId, user.telegramId);
-        metrics.feesRecovered++;
-      } catch (err) {
-        console.error(`[Reconciler] Fee retry failed for swap ${swapId}:`, err);
-      }
+      const result = await feeService.collectSwapFee(swap._id.toString());
+      if (result === 'collected') metrics.feesRecovered++;
     }
   }
 
@@ -609,7 +548,7 @@ class ReconciliationService {
           });
       }
     });
-  }
+                                  }
     private async rollbackSwap(swap: any, session: ClientSession): Promise<void> {
     const meta = (swap.metadata || {}) as Record<string, any>;
     if (meta.rolledBack) return;
@@ -758,6 +697,7 @@ class ReconciliationService {
   // Expected concurrency; skip silently to avoid log spam.
   continue;
         }
+        
 
         const user = await User.findById(deposit.userId);
         if (!user) {
@@ -828,8 +768,10 @@ class ReconciliationService {
   }
 
   /**
-   * Re-queues orphaned fee records stuck in 'processing' (e.g. after a
-   * worker crash between claim and broadcast) once their lock is stale.
+   * Re-queues orphaned fee_transfer records stuck in 'processing' (e.g.
+   * after a worker crash between claim and broadcast) once their lock is
+   * stale. Platform-fee records (type 'fee') are NOT touched here — they
+   * belong to the FeeCollectionService.
    */
   private async claimFeeTransfer(metrics: ReconcileMetrics): Promise<void> {
     const stale = await Transaction.find({
@@ -863,5 +805,4 @@ export async function startReconciler(): Promise<void> {
 
 export function stopReconciler(): void {
   service.stop();
-            }
-    
+}
