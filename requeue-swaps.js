@@ -3,7 +3,7 @@
   const mongoose = require('mongoose');
 
   if (!process.env.MONGODB_URI) {
-    throw new Error('MONGODB_URI environment variable is missing');
+    throw new Error('MONGODB_URI is missing');
   }
 
   await mongoose.connect(process.env.MONGODB_URI);
@@ -29,32 +29,22 @@
         'status=' + s.status,
         'fee=' + s.fee,
         'feeStatus=' + s.feeStatus,
-        'created=' + (s.createdAt?.toISOString?.() || 'UNKNOWN')
+        'created=' + s.createdAt?.toISOString()
       );
     }
 
-    if (stuck.length === 0) {
-      console.log('No stranded swaps found. Nothing changed.');
-      return;
-    }
-
-    console.log(
-      '\nWARNING: This will change the status of these swaps to pending.'
-    );
-    console.log(
-      'Only proceed if the swap reconciliation logic safely verifies existing on-chain execution and fee state.'
-    );
-
-    const res = await Transaction.updateMany(
+    const result = await Transaction.updateMany(
       filter,
       { $set: { status: 'pending' } }
     );
 
-    console.log('Requeued to pending:', res.modifiedCount);
+    console.log('Requeued to pending:', result.modifiedCount);
+    console.log('Sweep completed.');
   } finally {
     await mongoose.disconnect();
   }
 })().catch(error => {
-  console.error('Requeue script failed:', error);
+  console.error('Sweep failed:', error);
   process.exitCode = 1;
 });
+  
