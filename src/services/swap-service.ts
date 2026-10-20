@@ -371,10 +371,9 @@ export class SwapService {
       throw new Error('Insufficient balance');
     }
 
-    const feeBase = Precision.calculateFee(
-      amountBase,
-      config.platformSwapFeePercent
-    );
+    // Fee rate from the centralized policy (2% default per FEE_* env vars)
+    const feePercent = this.legacySwapPercent(request.direction);
+    const feeBase = Precision.calculateFee(amountBase, feePercent);
     const netSwapBase = Precision.subtract(amountBase, feeBase);
 
     if (isTonToAtf) {
@@ -472,11 +471,21 @@ export class SwapService {
       txParams,
       gasTon,
     };
-      }
-          /* ═══════════════════════════════════════════════════════════
-     PHASE 2 — GENERIC TOKEN SWAP (additive)
-     TON↔ATF methods above are UNCHANGED.
+  }
+    /* ═══════════════════════════════════════════════════════════
+     PHASE 2 — GENERIC TOKEN SWAP (ton→token, token→ton, token→token)
+     The TON↔ATF methods above are UNCHANGED.
      ═══════════════════════════════════════════════════════════ */
+
+  /**
+   * Centralized fee % for the legacy TON↔ATF directions.
+   * Reads from feePolicy so the FEE_* env vars are the single source.
+   */
+  private legacySwapPercent(direction: 'ton_to_atf' | 'atf_to_ton'): number {
+    return direction === 'ton_to_atf'
+      ? config.feePolicy.tonToTokenPercent
+      : config.feePolicy.tokenToTonInputPercent;
+  }
 
   /**
    * Resolve offer/ask pair for generic swap directions.
@@ -910,8 +919,7 @@ export class SwapService {
       }
     });
   }
-
-  /* ─────────────────────────────────────────────
+    /* ─────────────────────────────────────────────
      DIRECT EXECUTION
      ───────────────────────────────────────────── */
 
@@ -938,10 +946,8 @@ export class SwapService {
       confirmation.inputAmount,
       inputDecimals
     );
-    const feeBase = Precision.calculateFee(
-      amountBase,
-      config.platformSwapFeePercent
-    );
+    const feePercent = this.legacySwapPercent(direction);
+    const feeBase = Precision.calculateFee(amountBase, feePercent);
 
     const balanceKey = isTonToAtf ? 'tonBalance' : 'atfBalance';
 
@@ -988,7 +994,7 @@ export class SwapService {
         amount: amountBase.toString(),
         fee: feeBase.toString(),
         feeAsset: isTonToAtf ? 'TON' : 'ATF',
-        feePercentage: config.platformSwapFeePercent,
+        feePercentage: feePercent,
         feeWallet: config.adminFeeWalletAddress,
         feeStatus: 'pending',
         status: 'processing',
@@ -1084,7 +1090,7 @@ export class SwapService {
           gasAdvanceTxHash: gasTxHash,
         });
 
-                /**
+        /**
          * Give the gas transfer a moment to settle before
          * constructing/broadcasting the swap.
          */
@@ -1312,7 +1318,7 @@ export class SwapService {
               // FIX A: preserve the numeric counter written by
               // recordAdvance — gas-recovery-retry $inc's this field;
               // a boolean here crashes every future recovery attempt
-              // for this swap (TypeMismatch, E11000 stuck gas).
+              // for this swap (TypeMismatch, stuck gas forever).
               gasRecoveryAttempted:
                 typeof latest?.metadata?.gasRecoveryAttempted === 'number'
                   ? latest.metadata.gasRecoveryAttempted
@@ -1329,9 +1335,7 @@ export class SwapService {
 
       throw error;
     }
-  }
-  
-
+      }
           /* ─────────────────────────────────────────────
      FEE TRANSFER
      ───────────────────────────────────────────── */
@@ -1386,5 +1390,4 @@ export class SwapService {
       console.error('[SwapService] Fee transfer failed:', error);
     }
   }
-    }
-          
+}
