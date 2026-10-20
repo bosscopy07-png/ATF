@@ -8,7 +8,14 @@ import { WalletService } from '../services/wallet-service';
 import { GasRecoveryService } from '../services/gas-recovery-service';
 
 const RECONCILE_INTERVAL_MS = 30_000;
-const MAX_CONFIRMATION_WAIT_MS = 3_600_000;
+
+// Reconciliation must never abandon a swap by age while it is still
+// pending/processing — a stranded swap meant a stranded platform fee.
+// Age-based FAILURE decisions live in detectSwapOutput (90s output
+// timeout) and handleSwapError instead. This is only a query safety
+// bound for the auxiliary sweeps (withdrawals/deposits/fee transfers).
+const MAX_CONFIRMATION_WAIT_MS = 86_400_000; // 24h
+
 const BATCH_SIZE = 50;
 const RPC_RETRY_ATTEMPTS = 3;
 const RPC_RETRY_DELAY_MS = 1_000;
@@ -216,10 +223,12 @@ class ReconciliationService {
   // ─── Swaps ─────────────────────────────────────────────────────────────
 
   private async reconcileSwaps(metrics: ReconcileMetrics): Promise<void> {
+    // NO createdAt window: a swap stays reconcilable until it is finalized
+    // or explicitly failed by the outcome logic. (A 1-hour window here
+    // previously stranded swaps — and their platform fees — forever.)
     const pendingSwaps = await Transaction.find({
       type: 'swap' as TransactionType,
       status: { $in: ['pending', 'processing'] as TransactionStatus[] },
-      createdAt: { $gte: new Date(Date.now() - MAX_CONFIRMATION_WAIT_MS) },
     })
       .sort({ createdAt: 1 })
       .limit(BATCH_SIZE)
@@ -311,8 +320,8 @@ class ReconciliationService {
         await this.handleSwapError(swap, error as Error, metrics);
       }
     }
-                }
-    /**
+      }
+              /**
    * Determines whether the DEX swap actually produced the expected output,
    * using on-chain balance deltas captured before the swap was broadcast.
    * 'pending' while the chain is still settling (90s grace), then 'failed'.
@@ -515,7 +524,7 @@ class ReconciliationService {
       type: 'swap' as TransactionType,
       status: 'completed' as TransactionStatus,
       feeStatus: { $in: ['pending', 'processing', 'failed'] },
-      createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+      createdAt: { $gte: new Date(Date.now() - MAX_CONFIRMATION_WAIT_MS) },
     })
       .sort({ createdAt: 1 })
       .limit(BATCH_SIZE)
@@ -600,8 +609,8 @@ class ReconciliationService {
           });
       }
     });
-      }
-      private async rollbackSwap(swap: any, session: ClientSession): Promise<void> {
+  }
+    private async rollbackSwap(swap: any, session: ClientSession): Promise<void> {
     const meta = (swap.metadata || {}) as Record<string, any>;
     if (meta.rolledBack) return;
 
@@ -855,3 +864,4 @@ export async function startReconciler(): Promise<void> {
 export function stopReconciler(): void {
   service.stop();
             }
+    
