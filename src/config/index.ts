@@ -150,7 +150,13 @@ export const config = {
   swapExecuteRateWindowMs: requireEnvNumber('SWAP_EXECUTE_RATE_WINDOW_MS', 10_000),
 
   swapLockTtlMs: requireEnvNumber('SWAP_LOCK_TTL_MS', 30_000),
-
+   /**
+   * Extra TON reserve required ON TOP of STON.fi's swap value, to cover
+   * the wallet's own processing fee in the exact-balance edge case.
+   * Default 0 = trust STON.fi's computation (original behavior).
+   */
+  swapGasReserveNano: BigInt(requireEnvNumber('SWAP_GAS_RESERVE_NANO', 0)),
+  
   // ─────────────────────────────────────────────
   // ⛳ Feature flags — ALL new capabilities OFF by default
   // ─────────────────────────────────────────────
