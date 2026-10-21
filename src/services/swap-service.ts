@@ -31,6 +31,14 @@ import { FeeEngine } from '../config/fees';
 import { Address } from '@ton/core';
 import { TonClient, JettonMaster, JettonWallet } from '@ton/ton';
 
+/**
+ * The wallet's own transaction gas is paid ON TOP of the swap message
+ * value (PAY_GAS_SEPARATELY). A balance that exactly equals the swap value
+ * therefore still cannot execute — the tx fails on-chain. Every funding
+ * check must include this reserve.
+ */
+const WALLET_GAS_RESERVE_NANO = 50_000_000n; // 0.05 TON
+
 export interface SwapRequest {
   userId: number;
   direction: 'ton_to_atf' | 'atf_to_ton';
@@ -367,13 +375,34 @@ export class SwapService {
 
     const liveBalance = isTonToAtf ? onChainTon : onChainAtf;
 
-    if (Precision.isLessThan(liveBalance, amountBase)) {
-      throw new Error('Insufficient balance');
+    // ── Fee-on-top rule ──
+    // The platform fee is settled from the wallet AFTER the swap, so the
+    // user must hold amount + fee. Swapping the ENTIRE balance leaves
+    // nothing to pay the platform fee and the flow fails. Reject upfront
+    // with the concrete maximum the user CAN swap.
+    const feePercentEarly = this.legacySwapPercent(request.direction);
+    const feeBaseEarly = Precision.calculateFee(amountBase, feePercentEarly);
+    const totalRequiredEarly = Precision.add(amountBase, feeBaseEarly);
+
+    if (Precision.isLessThan(liveBalance, totalRequiredEarly)) {
+      const pScaled = BigInt(Math.round(feePercentEarly * 10_000)); // basis points
+      const maxAmount =
+        pScaled > 0n ? (liveBalance * 10_000n) / (10_000n + pScaled) : liveBalance;
+      const inputSymbol = isTonToAtf ? 'TON' : 'ATF';
+
+      throw new Error(
+        `You can't swap your full balance — the ${feePercentEarly}% platform fee must remain available.\n\n` +
+        `Balance: <b>${Precision.fromBaseUnits(liveBalance, inputDecimals)} ${inputSymbol}</b>\n` +
+        `Fee reserve: ~${Precision.fromBaseUnits(feeBaseEarly, inputDecimals)} ${inputSymbol}\n\n` +
+        (maxAmount > 0n
+          ? `Maximum you can swap: <b>${Precision.fromBaseUnits(maxAmount, inputDecimals)} ${inputSymbol}</b>`
+          : `Your balance is too low to swap — deposit more ${inputSymbol} first.`)
+      );
     }
 
     // Fee rate from the centralized policy (2% default per FEE_* env vars)
-    const feePercent = this.legacySwapPercent(request.direction);
-    const feeBase = Precision.calculateFee(amountBase, feePercent);
+    const feePercent = feePercentEarly;
+    const feeBase = feeBaseEarly;
     const netSwapBase = Precision.subtract(amountBase, feeBase);
 
     if (isTonToAtf) {
@@ -433,6 +462,27 @@ export class SwapService {
       );
     }
 
+    // ── Upfront affordability (TON→ATF): amount + fee + DEX value + wallet gas ──
+    if (isTonToAtf && txParams) {
+      const requiredTon =
+        BigInt(txParams.value.toString()) + WALLET_GAS_RESERVE_NANO;
+
+      if (onChainTon < requiredTon) {
+        const deficit = requiredTon - onChainTon;
+        const suggestedMax = amountBase > deficit ? amountBase - deficit : 0n;
+
+        throw new Error(
+          `Insufficient TON for this swap.\n\n` +
+          `Needed: ~${Precision.fromBaseUnits(requiredTon, TON_DECIMALS)} TON ` +
+          `(amount + ${Precision.fromBaseUnits(feeBase, TON_DECIMALS)} fee + network gas)\n` +
+          `Your balance: ${Precision.fromBaseUnits(onChainTon, TON_DECIMALS)} TON\n\n` +
+          (suggestedMax > 0n
+            ? `Try a smaller amount — roughly <b>${Precision.fromBaseUnits(suggestedMax, TON_DECIMALS)} TON</b> or less.`
+            : `Your balance is too low to swap TON right now — deposit more TON first.`)
+        );
+      }
+    }
+
     const inputDisplay = Precision.fromBaseUnits(amountBase, inputDecimals);
     const feeDisplay = Precision.fromBaseUnits(feeBase, inputDecimals);
     const netDisplay = Precision.fromBaseUnits(netSwapBase, inputDecimals);
@@ -471,8 +521,8 @@ export class SwapService {
       txParams,
       gasTon,
     };
-  }
-    /* ═══════════════════════════════════════════════════════════
+      }
+  /* ═══════════════════════════════════════════════════════════
      PHASE 2 — GENERIC TOKEN SWAP (ton→token, token→ton, token→token)
      The TON↔ATF methods above are UNCHANGED.
      ═══════════════════════════════════════════════════════════ */
@@ -538,8 +588,8 @@ export class SwapService {
 
   /**
    * Prepare a generic token swap quote.
-   * Mirrors prepareSwap: rate-limit → frozen check → balance check
-   * → centralized fee plan → STON.fi quote → txParams.
+   * Mirrors prepareSwap: rate-limit → frozen check → fee-on-top balance
+   * rule → centralized fee plan → STON.fi quote → txParams.
    */
   async prepareTokenSwap(
     userId: number,
@@ -597,8 +647,20 @@ export class SwapService {
       liveInput = await this.readJettonBalance(walletAddress, tokenMaster);
     }
 
-    if (Precision.isLessThan(liveInput, amountBase)) {
-      throw new Error('Insufficient balance');
+    // ── Fee-on-top rule (same as prepareSwap): amount + input-side fee ──
+    const feePctP = FeeEngine.platformPercentFor(pair.kind);
+    const feeBaseP = FeeEngine.percentOf(amountBase, feePctP);
+    const totalReqP = Precision.add(amountBase, feeBaseP);
+
+    if (Precision.isLessThan(liveInput, totalReqP)) {
+      const pScaled = BigInt(Math.round(feePctP * 10_000)); // basis points
+      const maxAmount =
+        pScaled > 0n ? (liveInput * 10_000n) / (10_000n + pScaled) : liveInput;
+
+      throw new Error(
+        `You can't swap your full balance — the ${feePctP}% platform fee must remain available.\n\n` +
+        `Maximum you can swap: <b>${Precision.fromBaseUnits(maxAmount, inputDecimals)}</b>`
+      );
     }
 
     /* ── Centralized fee plan (input XOR output — never both) ── */
@@ -856,18 +918,31 @@ export class SwapService {
         /* ── Pre-broadcast funding requirements ── */
         if (pair.kind === 'ton_to_token') {
           const { ton } = await this.walletService.getBalance(walletAddress);
-          if (ton < BigInt(swapParams.value.toString())) {
+          const requiredTon =
+            BigInt(swapParams.value.toString()) + WALLET_GAS_RESERVE_NANO;
+          if (ton < requiredTon) {
             throw new Error(
-              `Wallet needs ~${Precision.fromBaseUnits(BigInt(swapParams.value.toString()), TON_DECIMALS)} TON for this swap (includes gas). Excess is returned. Deposit more TON.`
+              `Insufficient TON for this swap (amount + network gas). ` +
+              `Needed ~${Precision.fromBaseUnits(requiredTon, TON_DECIMALS)} TON. ` +
+              `Reduce the amount or deposit more TON.`
             );
           }
         } else {
-          // Token input: re-verify jetton balance covers GROSS input
+          // Token input: re-verify jetton balance covers amount + fee (fee-on-top)
           const live = await this.readJettonBalance(
             walletAddress,
             confirmation.tokenMaster
           );
-          if (live < amountBase) throw new Error('Insufficient balance');
+          const feePctX = FeeEngine.platformPercentFor(pair.kind);
+          const requiredToken = Precision.add(
+            amountBase,
+            FeeEngine.percentOf(amountBase, feePctX)
+          );
+          if (Precision.isLessThan(live, requiredToken)) {
+            throw new Error(
+              `Insufficient balance — the ${feePctX}% platform fee must remain available after your swap. Reduce the amount.`
+            );
+          }
         }
 
         const txHash = await this.walletService.sendTon(
@@ -918,8 +993,8 @@ export class SwapService {
         throw error;
       }
     });
-  }
-    /* ─────────────────────────────────────────────
+      }
+          /* ─────────────────────────────────────────────
      DIRECT EXECUTION
      ───────────────────────────────────────────── */
 
@@ -959,8 +1034,12 @@ export class SwapService {
 
     const liveBalance = isTonToAtf ? onChainTon : onChainAtf;
 
-    if (Precision.isLessThan(liveBalance, amountBase)) {
-      throw new Error('Insufficient balance');
+    // ── Fee-on-top guard (execution time): balance may have dropped
+    //    between quote and confirm. The fee must remain coverable. ──
+    if (Precision.isLessThan(liveBalance, Precision.add(amountBase, feeBase))) {
+      throw new Error(
+        `Insufficient balance — the ${feePercent}% platform fee must remain available after your swap. Reduce the amount and try again.`
+      );
     }
 
     let tx: any;
@@ -1108,17 +1187,37 @@ export class SwapService {
       );
 
       /**
-       * TON → ATF needs enough TON to execute.
+       * TON → ATF needs enough TON to execute — including the wallet's own
+       * gas reserve (PAY_GAS_SEPARATELY) on top of the message value.
        */
       if (isTonToAtf) {
         const { ton: onChainTonCheck } = await this.walletService.getBalance(
           walletAddress
         );
-        const requiredTon = BigInt(swapParams.value.toString());
+        const requiredTon =
+          BigInt(swapParams.value.toString()) + WALLET_GAS_RESERVE_NANO;
 
         if (onChainTonCheck < requiredTon) {
           throw new Error(
-            `Wallet needs ~${Precision.fromBaseUnits(requiredTon, TON_DECIMALS)} TON for this swap (includes gas). Excess is returned. Deposit more TON.`
+            `Insufficient TON for this swap.\n\n` +
+            `Needed: ~${Precision.fromBaseUnits(requiredTon, TON_DECIMALS)} TON (amount + network gas + buffer)\n` +
+            `Your balance: ${Precision.fromBaseUnits(onChainTonCheck, TON_DECIMALS)} TON\n\n` +
+            `Reduce the amount or deposit more TON.`
+          );
+        }
+      } else {
+        // ATF → TON: the freshly gas-advanced wallet must cover the swap
+        // message value AND its own gas. Same reserve rule.
+        const { ton: tonNow } = await this.walletService.getBalance(walletAddress);
+        const requiredTon =
+          BigInt(swapParams.value.toString()) + WALLET_GAS_RESERVE_NANO;
+
+        if (tonNow < requiredTon) {
+          throw new Error(
+            `Insufficient TON for this swap.\n\n` +
+            `Needed: ~${Precision.fromBaseUnits(requiredTon, TON_DECIMALS)} TON (network gas)\n` +
+            `Available: ${Precision.fromBaseUnits(tonNow, TON_DECIMALS)} TON\n\n` +
+            `The swap was NOT sent — your ATF is untouched. Try a smaller amount or deposit more TON.`
           );
         }
       }
@@ -1335,8 +1434,8 @@ export class SwapService {
 
       throw error;
     }
-      }
-          /* ─────────────────────────────────────────────
+  }
+    /* ─────────────────────────────────────────────
      FEE TRANSFER
      ───────────────────────────────────────────── */
 
