@@ -385,13 +385,13 @@ export class SwapService {
     const totalRequiredEarly = Precision.add(amountBase, feeBaseEarly);
 
     if (Precision.isLessThan(liveBalance, totalRequiredEarly)) {
-      const pScaled = BigInt(Math.round(feePercentEarly * 10_000)); // basis points
+      const pScaled = BigInt(Math.round(feePercentEarly * 100)); // percent → basis points
       const maxAmount =
         pScaled > 0n ? (liveBalance * 10_000n) / (10_000n + pScaled) : liveBalance;
       const inputSymbol = isTonToAtf ? 'TON' : 'ATF';
 
       throw new Error(
-        `You can't swap your full balance — the ${feePercentEarly}% platform fee must remain available.\n\n` +
+        `You can't swap your full balance — the platform fee must remain available.\n\n` +
         `Balance: <b>${Precision.fromBaseUnits(liveBalance, inputDecimals)} ${inputSymbol}</b>\n` +
         `Fee reserve: ~${Precision.fromBaseUnits(feeBaseEarly, inputDecimals)} ${inputSymbol}\n\n` +
         (maxAmount > 0n
@@ -521,8 +521,8 @@ export class SwapService {
       txParams,
       gasTon,
     };
-      }
-  /* ═══════════════════════════════════════════════════════════
+  }
+      /* ═══════════════════════════════════════════════════════════
      PHASE 2 — GENERIC TOKEN SWAP (ton→token, token→ton, token→token)
      The TON↔ATF methods above are UNCHANGED.
      ═══════════════════════════════════════════════════════════ */
@@ -653,12 +653,12 @@ export class SwapService {
     const totalReqP = Precision.add(amountBase, feeBaseP);
 
     if (Precision.isLessThan(liveInput, totalReqP)) {
-      const pScaled = BigInt(Math.round(feePctP * 10_000)); // basis points
+      const pScaled = BigInt(Math.round(feePctP * 100)); // percent → basis points
       const maxAmount =
         pScaled > 0n ? (liveInput * 10_000n) / (10_000n + pScaled) : liveInput;
 
       throw new Error(
-        `You can't swap your full balance — the ${feePctP}% platform fee must remain available.\n\n` +
+        `You can't swap your full balance — the platform fee must remain available.\n\n` +
         `Maximum you can swap: <b>${Precision.fromBaseUnits(maxAmount, inputDecimals)}</b>`
       );
     }
@@ -940,7 +940,7 @@ export class SwapService {
           );
           if (Precision.isLessThan(live, requiredToken)) {
             throw new Error(
-              `Insufficient balance — the ${feePctX}% platform fee must remain available after your swap. Reduce the amount.`
+              `Insufficient balance — the platform fee must remain available after your swap. Reduce the amount.`
             );
           }
         }
@@ -993,8 +993,8 @@ export class SwapService {
         throw error;
       }
     });
-      }
-          /* ─────────────────────────────────────────────
+  }
+      /* ─────────────────────────────────────────────
      DIRECT EXECUTION
      ───────────────────────────────────────────── */
 
@@ -1038,7 +1038,7 @@ export class SwapService {
     //    between quote and confirm. The fee must remain coverable. ──
     if (Precision.isLessThan(liveBalance, Precision.add(amountBase, feeBase))) {
       throw new Error(
-        `Insufficient balance — the ${feePercent}% platform fee must remain available after your swap. Reduce the amount and try again.`
+        `Insufficient balance — the platform fee must remain available after your swap. Reduce the amount and try again.`
       );
     }
 
@@ -1434,8 +1434,8 @@ export class SwapService {
 
       throw error;
     }
-  }
-    /* ─────────────────────────────────────────────
+          }
+              /* ─────────────────────────────────────────────
      FEE TRANSFER
      ───────────────────────────────────────────── */
 
