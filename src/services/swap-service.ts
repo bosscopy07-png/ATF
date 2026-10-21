@@ -31,14 +31,6 @@ import { FeeEngine } from '../config/fees';
 import { Address } from '@ton/core';
 import { TonClient, JettonMaster, JettonWallet } from '@ton/ton';
 
-/**
- * The wallet's own transaction gas is paid ON TOP of the swap message
- * value (PAY_GAS_SEPARATELY). A balance that exactly equals the swap value
- * therefore still cannot execute — the tx fails on-chain. Every funding
- * check must include this reserve.
- */
-const WALLET_GAS_RESERVE_NANO = 50_000_000n; // 0.05 TON
-
 export interface SwapRequest {
   userId: number;
   direction: 'ton_to_atf' | 'atf_to_ton';
@@ -462,10 +454,12 @@ export class SwapService {
       );
     }
 
-    // ── Upfront affordability (TON→ATF): amount + fee + DEX value + wallet gas ──
+    // ── Upfront affordability (TON→ATF): STON.fi's tx value is the
+    //    authoritative requirement; the optional reserve (default 0)
+    //    covers the exact-balance edge. ──
     if (isTonToAtf && txParams) {
       const requiredTon =
-        BigInt(txParams.value.toString()) + WALLET_GAS_RESERVE_NANO;
+        BigInt(txParams.value.toString()) + config.swapGasReserveNano;
 
       if (onChainTon < requiredTon) {
         const deficit = requiredTon - onChainTon;
@@ -522,7 +516,7 @@ export class SwapService {
       gasTon,
     };
   }
-      /* ═══════════════════════════════════════════════════════════
+    /* ═══════════════════════════════════════════════════════════
      PHASE 2 — GENERIC TOKEN SWAP (ton→token, token→ton, token→token)
      The TON↔ATF methods above are UNCHANGED.
      ═══════════════════════════════════════════════════════════ */
@@ -918,8 +912,9 @@ export class SwapService {
         /* ── Pre-broadcast funding requirements ── */
         if (pair.kind === 'ton_to_token') {
           const { ton } = await this.walletService.getBalance(walletAddress);
+          // STON.fi's value is authoritative; optional reserve (default 0).
           const requiredTon =
-            BigInt(swapParams.value.toString()) + WALLET_GAS_RESERVE_NANO;
+            BigInt(swapParams.value.toString()) + config.swapGasReserveNano;
           if (ton < requiredTon) {
             throw new Error(
               `Insufficient TON for this swap (amount + network gas). ` +
@@ -993,8 +988,8 @@ export class SwapService {
         throw error;
       }
     });
-  }
-      /* ─────────────────────────────────────────────
+              }
+            /* ─────────────────────────────────────────────
      DIRECT EXECUTION
      ───────────────────────────────────────────── */
 
@@ -1187,30 +1182,32 @@ export class SwapService {
       );
 
       /**
-       * TON → ATF needs enough TON to execute — including the wallet's own
-       * gas reserve (PAY_GAS_SEPARATELY) on top of the message value.
+       * TON → ATF: STON.fi's tx value is the authoritative requirement
+       * (amount + DEX fees); the optional reserve (default 0) covers the
+       * exact-balance edge.
        */
       if (isTonToAtf) {
         const { ton: onChainTonCheck } = await this.walletService.getBalance(
           walletAddress
         );
         const requiredTon =
-          BigInt(swapParams.value.toString()) + WALLET_GAS_RESERVE_NANO;
+          BigInt(swapParams.value.toString()) + config.swapGasReserveNano;
 
         if (onChainTonCheck < requiredTon) {
           throw new Error(
             `Insufficient TON for this swap.\n\n` +
-            `Needed: ~${Precision.fromBaseUnits(requiredTon, TON_DECIMALS)} TON (amount + network gas + buffer)\n` +
+            `Needed: ~${Precision.fromBaseUnits(requiredTon, TON_DECIMALS)} TON (amount + network gas)\n` +
             `Your balance: ${Precision.fromBaseUnits(onChainTonCheck, TON_DECIMALS)} TON\n\n` +
             `Reduce the amount or deposit more TON.`
           );
         }
       } else {
         // ATF → TON: the freshly gas-advanced wallet must cover the swap
-        // message value AND its own gas. Same reserve rule.
+        // message value. STON.fi's gasTon/value are authoritative; the
+        // optional reserve defaults to 0 (original behavior).
         const { ton: tonNow } = await this.walletService.getBalance(walletAddress);
         const requiredTon =
-          BigInt(swapParams.value.toString()) + WALLET_GAS_RESERVE_NANO;
+          BigInt(swapParams.value.toString()) + config.swapGasReserveNano;
 
         if (tonNow < requiredTon) {
           throw new Error(
@@ -1434,8 +1431,8 @@ export class SwapService {
 
       throw error;
     }
-          }
-              /* ─────────────────────────────────────────────
+  }
+    /* ─────────────────────────────────────────────
      FEE TRANSFER
      ───────────────────────────────────────────── */
 
