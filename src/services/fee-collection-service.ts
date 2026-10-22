@@ -13,6 +13,10 @@
  *  - Broadcast-safe: timeout-class failures are flagged broadcastUncertain
  *    and NEVER auto-requeued (avoids charging the user twice).
  *  - Direction-aware: only collects when the swap actually completed.
+ *  - Asset-aware (FIX A): the fee is sent in the asset the swap actually
+ *    recorded (TON fees via sendTon, ATF via sendJetton, generic tokens
+ *    via their own master). Previously every fee was sent as ATF, so
+ *    TON→ATF platform fees (denominated in TON) could never be collected.
  */
 import { Transaction } from '../models/Transaction';
 import { User } from '../models/User';
@@ -38,7 +42,8 @@ export class FeeCollectionService {
         $setOnInsert: {
           userId: swap.userId,
           type: 'fee',
-          asset: swap.asset,
+          // FIX A: record the fee in the asset it is actually charged in.
+          asset: swap.feeAsset || swap.asset,
           amount: swap.fee || '0',
           feePercentage: swap.feePercentage,
           feeWallet: config.adminFeeWalletAddress,
@@ -67,6 +72,42 @@ export class FeeCollectionService {
   }
 
   /**
+   * Send `amount` of `asset` from the user's wallet to the admin fee
+   * wallet. FIX A: dispatches on the recorded fee asset instead of always
+   * sending ATF. Mirrors SwapService.transferFee's original dispatch.
+   */
+  private async sendFeeAsset(
+    telegramId: number,
+    asset: string,
+    amount: bigint,
+    jettonMaster?: string
+  ): Promise<string> {
+    if (asset === 'TON') {
+      return this.walletService.sendTon(
+        telegramId,
+        config.adminFeeWalletAddress,
+        amount
+      );
+    }
+    if (asset === 'ATF') {
+      return this.walletService.sendJetton(
+        telegramId,
+        config.adminFeeWalletAddress,
+        config.atfJettonAddress!,
+        amount
+      );
+    }
+    // Generic token fee: send the token itself from the swap's input master.
+    const master = jettonMaster || config.atfJettonAddress!;
+    return this.walletService.sendJetton(
+      telegramId,
+      config.adminFeeWalletAddress,
+      master,
+      amount
+    );
+  }
+
+  /**
    * Collect the platform fee for ONE completed swap.
    * Claim-protected; safe to call from multiple places concurrently.
    */
@@ -92,11 +133,11 @@ export class FeeCollectionService {
     if (!user) return 'skipped';
 
     try {
-      const txHash = await this.walletService.sendJetton(
+      const txHash = await this.sendFeeAsset(
         user.telegramId,
-        config.adminFeeWalletAddress,
-        config.atfJettonAddress!,
-        BigInt(feeTx.amount)
+        feeTx.asset || swap.feeAsset || swap.asset,
+        BigInt(feeTx.amount),
+        (swap.metadata as any)?.tokenMaster
       );
 
       await Transaction.updateOne(
@@ -111,6 +152,12 @@ export class FeeCollectionService {
       console.log(
         `[FeeCollector] Platform fee sent for swap ${swapId}: ${feeTx.amount} ${feeTx.asset} (${txHash})`
       );
+
+      // FIX A (secondary): token→TON swaps carry an additional disclosed
+      // output-side TON fee (tokenToTonOutputPercent) that lives only in
+      // metadata.feePlan. Collect it exactly once, guarded by a metadata flag.
+      await this.collectTonOutputFee(swap, user.telegramId);
+
       return 'collected';
     } catch (error: any) {
       const msg = error?.message || String(error);
@@ -131,6 +178,58 @@ export class FeeCollectionService {
 
       console.error(`[FeeCollector] Fee transfer failed for swap ${swapId}:`, msg);
       return broadcastUncertain ? 'uncertain' : 'pending';
+    }
+  }
+
+  /**
+   * Collect the disclosed token→TON extra output fee (1% default) once.
+   * No-op for other directions, missing plans, or already-collected fees.
+   */
+  private async collectTonOutputFee(swap: any, telegramId: number): Promise<void> {
+    const meta = (swap.metadata || {}) as any;
+    if (meta.swapDirection !== 'atf_to_ton' && meta.feePlan?.kind !== 'token_to_ton') {
+      return;
+    }
+    if (meta.tonOutputFeeCollected) return;
+
+    const tonFee = BigInt(meta.feePlan?.tonOutputFeeBase || '0');
+    if (tonFee <= 0n) return;
+
+    // Atomic claim — concurrent sweeps/reconciler can never double-send.
+    const claimed = await Transaction.findOneAndUpdate(
+      { _id: swap._id, 'metadata.tonOutputFeeCollected': { $ne: true } },
+      { $set: { 'metadata.tonOutputFeeCollected': true } }
+    );
+    if (!claimed) return;
+
+    try {
+      const txHash = await this.walletService.sendTon(
+        telegramId,
+        config.adminFeeWalletAddress,
+        tonFee
+      );
+      await Transaction.create({
+        userId: swap.userId,
+        type: 'fee',
+        asset: 'TON',
+        amount: tonFee.toString(),
+        feePercentage: config.feePolicy.tokenToTonOutputPercent,
+        feeWallet: config.adminFeeWalletAddress,
+        status: 'completed',
+        toAddress: config.adminFeeWalletAddress,
+        txHash,
+        metadata: {
+          swapTxId: swap._id.toString(),
+          feeKind: 'swap_ton_output_fee',
+        },
+      });
+    } catch (err: any) {
+      // Roll the claim back so a later sweep can retry (idempotent).
+      await Transaction.updateOne(
+        { _id: swap._id },
+        { $set: { 'metadata.tonOutputFeeCollected': false } }
+      );
+      throw err;
     }
   }
 
@@ -203,4 +302,5 @@ export class FeeCollectorJob {
       this.running = false;
     }
   }
-}
+        }
+        
