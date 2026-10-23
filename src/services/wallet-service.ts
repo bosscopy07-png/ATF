@@ -154,10 +154,33 @@ export class WalletService {
    */
   private readonly v5NetworkGlobalId: number;
 
-  constructor(signer?: ISigner) {
+  /**
+   * FIX E: rpcProfile selects which endpoint/API key this instance uses.
+   * 'swap'  — swap execution path
+   * 'fee'   — fee collection + gas recovery
+   * default — deposit monitor, withdraws, everything else (unchanged)
+   */
+  constructor(
+    signer?: ISigner,
+    rpcProfile: 'default' | 'swap' | 'fee' = 'default'
+  ) {
+    const endpoint =
+      rpcProfile === 'swap'
+        ? config.tonRpcUrlSwap
+        : rpcProfile === 'fee'
+          ? config.tonRpcUrlFee
+          : config.tonRpcUrl;
+
+    const apiKey =
+      rpcProfile === 'swap'
+        ? config.tonApiKeySwap
+        : rpcProfile === 'fee'
+          ? config.tonApiKeyFee
+          : config.tonApiKey;
+
     this.client = new TonClient({
-      endpoint: config.tonRpcUrl,
-      apiKey: config.tonApiKey,
+      endpoint,
+      apiKey,
     });
 
     this.signer = signer || new LocalSigner();
@@ -350,7 +373,7 @@ export class WalletService {
       };
     }
       }
-            /**
+    /**
    * Automatically determine which wallet version is actually being used.
    *
    * Rules:
@@ -948,7 +971,7 @@ export class WalletService {
       version,
       contract,
     };
-}
+  }
     // ===========================================================================
   // SEND TON
   // ===========================================================================
@@ -1009,7 +1032,23 @@ export class WalletService {
 
     const destination = Address.parse(toAddress);
     const opened = this.client.open(contract);
-    const seqno = await opened.getSeqno();
+
+    /**
+     * FIX D — undeployed-wallet support.
+     *
+     * A freshly created wallet has no on-chain state yet, and
+     * getSeqno() throws for a non-existent account. An undeployed
+     * wallet's seqno is definitionally 0, and sendExternalMessage
+     * auto-attaches the contract init on first send (self-deploy).
+     * Without this fallback the very first swap on a new wallet
+     * always errors out before broadcast.
+     */
+    let seqno: number;
+    try {
+      seqno = await opened.getSeqno();
+    } catch {
+      seqno = 0; // undeployed wallet — first transaction deploys it
+    }
 
     const message = internal({
       to: destination,
@@ -1117,9 +1156,7 @@ export class WalletService {
 
     return false;
   }
-  
-
-  // ===========================================
+      // ===========================================
   async sendJetton(
     userId: number,
     toAddress: string,
@@ -1152,11 +1189,24 @@ export class WalletService {
       .endCell();
 
     const opened = this.client.open(contract);
-    const seqno = await opened.getSeqno();
+
+    /**
+     * FIX D — undeployed-wallet support (see sendTonFromWalletAddress).
+     */
+    let seqno: number;
+    try {
+      seqno = await opened.getSeqno();
+    } catch {
+      seqno = 0; // undeployed wallet — first transaction deploys it
+    }
 
     const message = internal({
       to: userJettonWallet,
-      value: toNano('0.05'),
+      // FIX C: 0.05 → 0.1 — a fee transfer to a wallet whose jetton
+      // wallet isn't deployed yet needs this headroom; the standard
+      // jetton contract otherwise BOUNCES the transfer ("fee returned").
+      // Unused excess is refunded to the sender.
+      value: toNano('0.1'),
       bounce: true,
       body: transferBody,
     });
@@ -1398,5 +1448,4 @@ export class WalletService {
       ),
     };
   }
-  }
-  
+}
