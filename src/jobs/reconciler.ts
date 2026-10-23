@@ -7,6 +7,31 @@ import { config, TON_DECIMALS, ATF_DECIMALS } from '../config';
 import { WalletService } from '../services/wallet-service';
 import { GasRecoveryService } from '../services/gas-recovery-service';
 
+/**
+ * FIX A: platform-internal senders (admin treasury, admin fee wallet)
+ * are never deposit sources. Mirrors blockchain-monitor's guard so
+ * pre-fix deposit records are absorbed without crediting.
+ */
+function isInternalSender(address: string): boolean {
+  const internal = [
+    config.adminFeeWalletAddress,
+    (config as any).adminWalletAddress,
+  ]
+    .filter(Boolean)
+    .map((a) =>
+      Address.parse(a as string).toString({ bounceable: false })
+    );
+
+  try {
+    return internal.includes(
+      Address.parse(address).toString({ bounceable: false })
+    );
+  } catch {
+    return false;
+  }
+}
+
+
 const RECONCILE_INTERVAL_MS = 30_000;
 
 // Reconciliation must never abandon a swap by age while it is still
@@ -228,9 +253,8 @@ class ReconciliationService {
         );
       }
     }
-  }
-
-  // ─── Swaps ─────────────────────────────────────────────────────────────
+      }
+          // ─── Swaps ─────────────────────────────────────────────────────────────
 
   private async reconcileSwaps(metrics: ReconcileMetrics): Promise<void> {
     // NO createdAt window: a swap stays reconcilable until it is finalized
@@ -481,14 +505,35 @@ class ReconciliationService {
     await swap.save({ session });
 
     return async () => {
-      // Delegated to the dedicated fee service: single source of truth,
-      // broadcast-safe, idempotent. telegramId is resolved inside.
+      const meta = swap.metadata as any;
+
+      // ── Step 1: claw back the admin gas advance FIRST, while the
+      // wallet still holds it (recoverAdminGasSafely is idempotent and
+      // re-entrant — a no-op call is harmless).
+      if (meta.gasAdvanceTxId || meta.gasRecoveryWalletAddress) {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            await this.gasRecovery.recoverAdminGasSafely({
+              swapTransactionId: swapId,
+              userId: swap.userId,
+              walletAddress: meta.walletAddress,
+            });
+            break;
+          } catch (err) {
+            console.error(`[Reconciler] Gas recovery attempt ${attempt} failed:`, err);
+            if (attempt < 3) await new Promise((r) => setTimeout(r, 2000));
+            // after 3 failures leave it — the GasRecoveryRetry job resumes.
+          }
+        }
+      }
+
+      // ── Steps 2 + 3: input fee, then output fee — sequential and
+      // idempotent inside the dedicated fee service.
       const { FeeCollectionService } = await import('../services/fee-collection-service');
       await new FeeCollectionService().collectSwapFee(swapId);
     };
-  }
-
-  /**
+          }
+            /**
    * Delegates to FeeCollectionService (kept as the reconciler's entry
    * point so older call sites keep working). All fee logic — record
    * creation, claims, sending, broadcast-uncertain handling — lives in
@@ -729,6 +774,18 @@ class ReconciliationService {
           continue;
         }
 
+        /**
+         * FIX A: platform-internal inflows are never user deposits.
+         * Absorb any pre-fix records silently without crediting.
+         */
+        if (deposit.fromAddress && isInternalSender(deposit.fromAddress)) {
+          await Transaction.findByIdAndUpdate(deposit._id, {
+            status: 'completed',
+            reconciledAt: new Date(),
+          });
+          continue;
+        }
+
         const user = await User.findById(deposit.userId);
         if (!user) {
           await Transaction.findByIdAndUpdate(deposit._id, { status: 'failed' });
@@ -836,4 +893,5 @@ export async function startReconciler(): Promise<void> {
 export function stopReconciler(): void {
   service.stop();
                  }
-      
+
+          
