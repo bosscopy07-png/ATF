@@ -224,7 +224,8 @@ export class SwapService {
   private tonClient: TonClient;
 
   constructor() {
-    this.walletService = new WalletService();
+    // FIX E: swap execution uses the dedicated swap-profile RPC/API key
+    this.walletService = new WalletService(undefined, 'swap');
     this.adminWallet = new AdminWalletService();
     this.stonfi = new STONFiAdapter();
     this.priceService = PriceService.getInstance();
@@ -331,7 +332,7 @@ export class SwapService {
       }
     });
   }
-    /* ─────────────────────────────────────────────
+      /* ─────────────────────────────────────────────
      PREPARE QUOTE
      ───────────────────────────────────────────── */
 
@@ -751,8 +752,8 @@ export class SwapService {
       tokenOutDecimals,
       direction,
     };
-      }
-    /**
+  }
+      /**
    * Execute a generic token swap THROUGH the existing idempotency and
    * locking engine (same pattern as executeSwap). A retried callback,
    * double tap, or worker restart converges on the SAME idempotency row.
@@ -1518,5 +1519,5 @@ export class SwapService {
       console.error('[SwapService] Fee transfer failed:', error);
     }
   }
-  }
-            
+            }
+          
