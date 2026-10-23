@@ -14,6 +14,33 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * FIX A: platform-internal inflows are NEVER user deposits.
+ *
+ * The admin gas advance arrives as an incoming TON transfer from the
+ * platform treasury; the old code booked it (and anything else from
+ * platform wallets) into the user's internal balance — which let users
+ * withdraw money the platform had only LENT them.
+ */
+function isInternalSender(address: string): boolean {
+  const internal = [
+    config.adminFeeWalletAddress,
+    (config as any).adminWalletAddress,
+  ]
+    .filter(Boolean)
+    .map((a) =>
+      Address.parse(a as string).toString({ bounceable: false })
+    );
+
+  try {
+    return internal.includes(
+      Address.parse(address).toString({ bounceable: false })
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Concise, non-circular error logging for the deposit monitor.
  * - A 429 from toncenter is expected occasionally under load; log it as a
  *   short one-liner, not the raw Axios error (which has circular refs and
@@ -159,6 +186,16 @@ export class BlockchainMonitor {
           continue;
         }
 
+        /**
+         * FIX A: platform-internal inflows (admin gas advance, anything
+         * from the fee/treasury wallets) are NEVER user deposits.
+         */
+        const depositSender = getInternalMessageSource(tx);
+        if (depositSender && isInternalSender(depositSender)) {
+          PROCESSED_TXS.add(uniqueId);
+          continue;
+        }
+
         const user = await User.findById(walletDoc.userId);
         if (!user) continue;
 
@@ -186,8 +223,8 @@ export class BlockchainMonitor {
     } catch (error: any) {
       logMonitorError(`TON deposit check`, walletDoc.address, error);
     }
-  }
-
+    }
+  
   private async checkAtfDeposits(walletDoc: any): Promise<void> {
     const ownerAddress = Address.parse(walletDoc.address);
 
@@ -270,5 +307,4 @@ export class BlockchainMonitor {
       logMonitorError(`ATF deposit check`, walletDoc.address, error);
     }
   }
-      }
-            
+}
