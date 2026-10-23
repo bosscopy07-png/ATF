@@ -1,35 +1,39 @@
 /**
  * FeeCollectionService — the SINGLE place platform swap fees are collected.
  *
- * Why this exists: fee collection used to live inside the reconciler's
- * finalize path (post-commit closure). Any failure in that chain meant no
- * fee record, no fee — silently. This service owns the whole lifecycle and
- * also runs an independent sweeper, so fees are collected even if the
- * reconciler's fast path never fires.
- *
  * Guarantees:
  *  - Idempotent: upsert-on-swapTxId record creation + status claims mean
  *    the reconciler fast path AND this sweeper can never double-send.
- *  - Broadcast-safe: timeout-class failures are flagged broadcastUncertain
- *    and NEVER auto-requeued (avoids charging the user twice).
- *  - Direction-aware: only collects when the swap actually completed.
- *  - Asset-aware (FIX A): the fee is sent in the asset the swap actually
- *    recorded (TON fees via sendTon, ATF via sendJetton, generic tokens
- *    via their own master). Previously every fee was sent as ATF, so
- *    TON→ATF platform fees (denominated in TON) could never be collected.
+ *  - Asset-aware (FIX A): TON fees via sendTon, ATF via sendJetton,
+ *    generic tokens via their own master.
+ *  - Delivery-verified (FIX C): a jetton fee is only 'completed' after
+ *    on-chain proof the fee ARRIVED. Bounced transfers still consume the
+ *    wallet seqno, which made waitForTransaction report success while the
+ *    fee returned to the user. Three outcomes: delivered → completed;
+ *    clearly bounced → failed + retryable; ambiguous → deliveryUncertain,
+ *    NEVER auto-requeued (prevents double-charging).
+ *  - Output-side TON fee (FIX D): token→TON swaps carry an additional
+ *    disclosed 1% output fee — read from metadata.feePlan when present,
+ *    derived from expectedOutputBaseUnits for legacy swaps.
+ *  - FIX E: uses the fee-profile RPC endpoint/API key so rate limits on
+ *    swap/monitor paths can't stall fee transfers.
  */
 import { Transaction } from '../models/Transaction';
 import { User } from '../models/User';
 import { WalletService } from './wallet-service';
 import { config } from '../config';
+import { FeeEngine } from '../config/fees';
+
+const DELIVERY_POLL_ATTEMPTS = 20;
+const DELIVERY_POLL_INTERVAL_MS = 4000;
 
 export class FeeCollectionService {
-  private walletService = new WalletService();
+  private walletService = new WalletService(undefined, 'fee');
 
-  /**
-   * Idempotently ensure a fee record exists for a completed swap.
-   * Returns the fee record ID.
-   */
+  /* ─────────────────────────────────────────
+     FEE RECORD
+     ───────────────────────────────────────── */
+
   private async ensureFeeRecord(swap: any): Promise<string> {
     const swapId = swap._id.toString();
     const meta = (swap.metadata || {}) as any;
@@ -42,7 +46,6 @@ export class FeeCollectionService {
         $setOnInsert: {
           userId: swap.userId,
           type: 'fee',
-          // FIX A: record the fee in the asset it is actually charged in.
           asset: swap.feeAsset || swap.asset,
           amount: swap.fee || '0',
           feePercentage: swap.feePercentage,
@@ -71,11 +74,10 @@ export class FeeCollectionService {
     return feeRecord._id.toString();
   }
 
-  /**
-   * Send `amount` of `asset` from the user's wallet to the admin fee
-   * wallet. FIX A: dispatches on the recorded fee asset instead of always
-   * sending ATF. Mirrors SwapService.transferFee's original dispatch.
-   */
+  /* ─────────────────────────────────────────
+     ASSET DISPATCH (FIX A)
+     ───────────────────────────────────────── */
+
   private async sendFeeAsset(
     telegramId: number,
     asset: string,
@@ -97,7 +99,6 @@ export class FeeCollectionService {
         amount
       );
     }
-    // Generic token fee: send the token itself from the swap's input master.
     const master = jettonMaster || config.atfJettonAddress!;
     return this.walletService.sendJetton(
       telegramId,
@@ -107,10 +108,62 @@ export class FeeCollectionService {
     );
   }
 
+  /* ─────────────────────────────────────────
+     DELIVERY VERIFICATION (FIX C)
+     ───────────────────────────────────────── */
+
   /**
-   * Collect the platform fee for ONE completed swap.
-   * Claim-protected; safe to call from multiple places concurrently.
+   * Poll both balances after a jetton fee broadcast:
+   *
+   *  DELIVERED  — admin ATF rose by ≥ ~fee AND user ATF fell by ≥ ~fee
+   *  BOUNCED    — neither balance moved meaningfully (fee demonstrably
+   *               returned → safe to retry)
+   *  UNCERTAIN  — anything else (concurrent activity) → NEVER auto-retry
    */
+  private async verifyJettonFeeDelivery(
+    userWalletAddress: string,
+    adminWalletAddress: string,
+    feeBase: bigint,
+    userAtfBefore: bigint,
+    adminAtfBefore: bigint
+  ): Promise<'delivered' | 'bounced' | 'uncertain'> {
+    const threshold = feeBase / 2n;
+
+    for (let i = 0; i < DELIVERY_POLL_ATTEMPTS; i++) {
+      await new Promise((r) => setTimeout(r, DELIVERY_POLL_INTERVAL_MS));
+
+      try {
+        const [{ atf: userAtf }, { atf: adminAtf }] = await Promise.all([
+          this.walletService.getBalance(userWalletAddress),
+          this.walletService.getBalance(adminWalletAddress),
+        ]);
+
+        const userDelta = userAtfBefore - userAtf;
+        const adminDelta = adminAtf - adminAtfBefore;
+
+        if (userDelta >= threshold && adminDelta >= threshold) {
+          return 'delivered';
+        }
+
+        if (
+          userDelta <= threshold / 2n &&
+          adminDelta <= threshold / 2n &&
+          i >= 2 // at least ~8s before declaring a bounce
+        ) {
+          return 'bounced';
+        }
+      } catch {
+        // RPC hiccup — keep polling; unknown never reads as bounced.
+      }
+    }
+
+    return 'uncertain';
+  }
+
+  /* ─────────────────────────────────────────
+     MAIN COLLECTION
+     ───────────────────────────────────────── */
+
   async collectSwapFee(
     swapId: string
   ): Promise<'collected' | 'pending' | 'skipped' | 'uncertain'> {
@@ -118,7 +171,15 @@ export class FeeCollectionService {
     if (!swap || swap.type !== 'swap') return 'skipped';
     if (swap.status !== 'completed') return 'skipped';
     if (swap.feeStatus === 'completed') return 'skipped';
-    if (BigInt(swap.fee || '0') <= 0n) return 'skipped';
+
+    const user = await User.findById(swap.userId);
+    if (!user) return 'skipped';
+
+    // No primary fee — still attempt the disclosed token→TON output fee.
+    if (BigInt(swap.fee || '0') <= 0n) {
+      await this.collectTonOutputFee(swap, user.telegramId).catch(() => {});
+      return 'skipped';
+    }
 
     const feeTxId = await this.ensureFeeRecord(swap);
 
@@ -129,16 +190,92 @@ export class FeeCollectionService {
     );
     if (!feeTx) return 'pending'; // claimed elsewhere or already settled
 
-    const user = await User.findById(swap.userId);
-    if (!user) return 'skipped';
+    const feeAsset = feeTx.asset || swap.feeAsset || swap.asset;
+    const feeAmount = BigInt(feeTx.amount);
+    const meta = (swap.metadata || {}) as any;
+    const userWalletAddress: string =
+      meta.walletAddress ||
+      (await this.walletService.getAddress(user.telegramId))!;
+
+    // Pre-send snapshots for delivery verification (jetton fees only).
+    let userAtfBefore = 0n;
+    let adminAtfBefore = 0n;
+    let needsDeliveryCheck = feeAsset !== 'TON';
+    if (needsDeliveryCheck) {
+      try {
+        const [u, a] = await Promise.all([
+          this.walletService.getBalance(userWalletAddress),
+          this.walletService.getBalance(config.adminFeeWalletAddress),
+        ]);
+        userAtfBefore = u.atf;
+        adminAtfBefore = a.atf;
+      } catch {
+        // Snapshot failure: proceed unverified rather than block collection.
+        needsDeliveryCheck = false;
+      }
+    }
 
     try {
       const txHash = await this.sendFeeAsset(
         user.telegramId,
-        feeTx.asset || swap.feeAsset || swap.asset,
-        BigInt(feeTx.amount),
-        (swap.metadata as any)?.tokenMaster
+        feeAsset,
+        feeAmount,
+        meta.tokenMaster
       );
+
+      /* ── FIX C: prove delivery before declaring success ── */
+      if (needsDeliveryCheck) {
+        const outcome = await this.verifyJettonFeeDelivery(
+          userWalletAddress,
+          config.adminFeeWalletAddress,
+          feeAmount,
+          userAtfBefore,
+          adminAtfBefore
+        );
+
+        if (outcome === 'bounced') {
+          // Jettons demonstrably returned — safe to let the sweeper retry.
+          await Transaction.updateOne(
+            { _id: feeTx._id },
+            {
+              $set: {
+                status: 'failed',
+                txHash,
+                'metadata.bounced': true,
+                'metadata.error':
+                  'fee transfer bounced back (destination not deliverable)',
+              },
+              $inc: { 'metadata.feeRetryCount': 1 },
+            }
+          );
+          await Transaction.updateOne(
+            { _id: swap._id },
+            { $set: { feeStatus: 'pending' }, $unset: { feeTxHash: '' } }
+          );
+          return 'pending';
+        }
+
+        if (outcome === 'uncertain') {
+          // NEVER auto-requeue — a retry here could double-charge.
+          await Transaction.updateOne(
+            { _id: feeTx._id },
+            {
+              $set: {
+                status: 'failed',
+                txHash,
+                'metadata.deliveryUncertain': true,
+                'metadata.error':
+                  'fee delivery unconfirmed — manual verification required',
+              },
+            }
+          );
+          await Transaction.updateOne(
+            { _id: swap._id },
+            { $set: { feeStatus: 'failed' } }
+          );
+          return 'uncertain';
+        }
+      }
 
       await Transaction.updateOne(
         { _id: feeTx._id },
@@ -150,12 +287,10 @@ export class FeeCollectionService {
       );
 
       console.log(
-        `[FeeCollector] Platform fee sent for swap ${swapId}: ${feeTx.amount} ${feeTx.asset} (${txHash})`
+        `[FeeCollector] Platform fee DELIVERED for swap ${swapId}: ${feeTx.amount} ${feeAsset} (${txHash})`
       );
 
-      // FIX A (secondary): token→TON swaps carry an additional disclosed
-      // output-side TON fee (tokenToTonOutputPercent) that lives only in
-      // metadata.feePlan. Collect it exactly once, guarded by a metadata flag.
+      /* ── FIX D: disclosed token→TON output fee (1% default) ── */
       await this.collectTonOutputFee(swap, user.telegramId);
 
       return 'collected';
@@ -170,7 +305,9 @@ export class FeeCollectionService {
           $set: {
             status: 'failed',
             'metadata.error': msg,
-            ...(broadcastUncertain ? { 'metadata.broadcastUncertain': true } : {}),
+            ...(broadcastUncertain
+              ? { 'metadata.broadcastUncertain': true }
+              : {}),
           },
           $inc: { 'metadata.feeRetryCount': 1 },
         }
@@ -181,19 +318,39 @@ export class FeeCollectionService {
     }
   }
 
+  /* ─────────────────────────────────────────
+     TOKEN→TON OUTPUT FEE (FIX D)
+     ───────────────────────────────────────── */
+
   /**
-   * Collect the disclosed token→TON extra output fee (1% default) once.
-   * No-op for other directions, missing plans, or already-collected fees.
+   * Collect the disclosed token→TON extra output fee (1% default).
+   * Sources the amount from metadata.feePlan when present; for LEGACY
+   * swaps (no feePlan) derives it from metadata.expectedOutputBaseUnits
+   * — which legacy ATF→TON swaps always record.
    */
   private async collectTonOutputFee(swap: any, telegramId: number): Promise<void> {
     const meta = (swap.metadata || {}) as any;
-    if (meta.swapDirection !== 'atf_to_ton' && meta.feePlan?.kind !== 'token_to_ton') {
-      return;
-    }
+
+    const isTokenToTon =
+      meta.swapDirection === 'atf_to_ton' ||
+      meta.feePlan?.kind === 'token_to_ton';
+    if (!isTokenToTon) return;
+
     if (meta.tonOutputFeeCollected) return;
 
-    const tonFee = BigInt(meta.feePlan?.tonOutputFeeBase || '0');
-    if (tonFee <= 0n) return;
+    let tonFeeBase: bigint;
+    if (meta.feePlan?.tonOutputFeeBase) {
+      tonFeeBase = BigInt(meta.feePlan.tonOutputFeeBase);
+    } else {
+      const grossOut = BigInt(meta.expectedOutputBaseUnits || '0');
+      if (grossOut <= 0n) return;
+      tonFeeBase = FeeEngine.percentOf(
+        grossOut,
+        config.feePolicy.tokenToTonOutputPercent
+      );
+    }
+
+    if (tonFeeBase <= 0n) return;
 
     // Atomic claim — concurrent sweeps/reconciler can never double-send.
     const claimed = await Transaction.findOneAndUpdate(
@@ -206,13 +363,13 @@ export class FeeCollectionService {
       const txHash = await this.walletService.sendTon(
         telegramId,
         config.adminFeeWalletAddress,
-        tonFee
+        tonFeeBase
       );
       await Transaction.create({
         userId: swap.userId,
         type: 'fee',
         asset: 'TON',
-        amount: tonFee.toString(),
+        amount: tonFeeBase.toString(),
         feePercentage: config.feePolicy.tokenToTonOutputPercent,
         feeWallet: config.adminFeeWalletAddress,
         status: 'completed',
@@ -233,11 +390,10 @@ export class FeeCollectionService {
     }
   }
 
-  /**
-   * Sweeper: every tick, collect fees for all completed swaps whose fee
-   * never settled. This is the safety net that runs independently of the
-   * reconciler's finalize path.
-   */
+  /* ─────────────────────────────────────────
+     SWEEPER
+     ───────────────────────────────────────── */
+
   async sweepDueFees(): Promise<{ scanned: number; collected: number }> {
     const swaps = await Transaction.find({
       type: 'swap',
@@ -254,10 +410,11 @@ export class FeeCollectionService {
     for (const swap of swaps) {
       const meta = (swap.metadata || {}) as any;
 
-      // Respect the broadcast-uncertain flag — never auto-requeue those.
       if (meta.feeTxId) {
         const feeTx = await Transaction.findById(meta.feeTxId).lean();
+        // Never auto-requeue uncertain rows (double-charge protection).
         if (feeTx?.metadata?.broadcastUncertain) continue;
+        if (feeTx?.metadata?.deliveryUncertain) continue;
         if (feeTx && (feeTx.status === 'completed' || feeTx.txHash)) continue;
         if (feeTx && feeTx.status === 'processing') continue; // claimed, in flight
       }
@@ -302,5 +459,5 @@ export class FeeCollectorJob {
       this.running = false;
     }
   }
-        }
+  }
         
