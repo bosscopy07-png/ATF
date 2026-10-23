@@ -331,8 +331,7 @@ export class SwapService {
       }
     });
   }
-
-  /* ─────────────────────────────────────────────
+    /* ─────────────────────────────────────────────
      PREPARE QUOTE
      ───────────────────────────────────────────── */
 
@@ -752,9 +751,8 @@ export class SwapService {
       tokenOutDecimals,
       direction,
     };
-  }
-
-  /**
+      }
+    /**
    * Execute a generic token swap THROUGH the existing idempotency and
    * locking engine (same pattern as executeSwap). A retried callback,
    * double tap, or worker restart converges on the SAME idempotency row.
@@ -835,21 +833,24 @@ export class SwapService {
         if (!walletAddress) throw new Error('Wallet not found');
 
         // Fallback fee plan (defensive; normally present on confirmation)
+        // FIX A: derive from FeeEngine so the direction-specific FEE_*
+        // percentages are the single source of truth (was: legacy flat
+        // config.platformSwapFeePercent).
+        const fallbackOutputQuote = confirmation.quote?.askUnits ?? '0';
+        const fallbackPlan = FeeEngine.planSwapFees(
+          pair.kind,
+          amountBase,
+          BigInt(String(fallbackOutputQuote))
+        );
         const feePlan = (confirmation as any).feePlan ?? {
-          kind: pair.kind,
-          feeBase: 'input',
-          platformPercent: config.platformSwapFeePercent,
-          platformFeeInputBase: Precision.calculateFee(
-            amountBase,
-            config.platformSwapFeePercent
-          ).toString(),
-          platformFeeOutputBase: '0',
-          tonOutputFeeBase: '0',
-          netInputBase: Precision.subtract(
-            amountBase,
-            Precision.calculateFee(amountBase, config.platformSwapFeePercent)
-          ).toString(),
-          netOutputBase: '0',
+          kind: fallbackPlan.kind,
+          feeBase: fallbackPlan.feeBase,
+          platformPercent: fallbackPlan.platformPercent,
+          platformFeeInputBase: fallbackPlan.platformFeeInputBase.toString(),
+          platformFeeOutputBase: fallbackPlan.platformFeeOutputBase.toString(),
+          tonOutputFeeBase: fallbackPlan.tonOutputFeeBase.toString(),
+          netInputBase: fallbackPlan.netInputBase.toString(),
+          netOutputBase: fallbackPlan.netOutputBase.toString(),
         };
 
         const platformFeeBase = BigInt(feePlan.platformFeeInputBase || '0');
@@ -860,7 +861,9 @@ export class SwapService {
           type: 'swap',
           asset: pair.kind === 'ton_to_token' ? 'TON' : 'TOKEN',
           amount: amountBase.toString(),
-          fee: Precision.fromBaseUnits(platformFeeBase, inputDecimals),
+          // FIX A: store the fee in BASE UNITS, matching executeSwapDirect.
+          // (was: Precision.fromBaseUnits(...) — a display string 10^9x off)
+          fee: platformFeeBase.toString(),
           feeAsset: pair.kind === 'ton_to_token' ? 'TON' : 'TOKEN',
           feePercentage: feePlan.platformPercent,
           feeWallet: config.adminFeeWalletAddress,
@@ -988,8 +991,8 @@ export class SwapService {
         throw error;
       }
     });
-              }
-            /* ─────────────────────────────────────────────
+  }
+              /* ─────────────────────────────────────────────
      DIRECT EXECUTION
      ───────────────────────────────────────────── */
 
@@ -1310,6 +1313,7 @@ export class SwapService {
        *
        * The swap has only been broadcast at this point. The DEX may still
        * succeed, refund, or fail after the wallet transaction is consumed.
+       *
        * The reconciler now determines the real swap outcome first and then
        * invokes GasRecoveryService with the correct outcome.
        */
@@ -1325,6 +1329,22 @@ export class SwapService {
 
       return tx._id.toString();
     } catch (error) {
+      const errorMsg = (error as Error)?.message || String(error);
+
+      /**
+       * FIX B (defense in depth): wallet-service classifies uncertain
+       * broadcasts itself (seqno check) and rethrows a definite-failure
+       * error when the message never reached the chain. If an
+       * uncertain-class message still reaches this catch block, the
+       * broadcast outcome is UNKNOWN: do NOT refund, do NOT claw back
+       * gas, and keep the swap visible to the reconciler so on-chain
+       * verification decides exactly once.
+       */
+      const broadcastUncertain =
+        /HTTP 5\d\d|500|502|503|504|Internal Server Error|timeout|timed out|ETIMEDOUT|ECONNRESET|ECONNABORTED|socket/i.test(
+          errorMsg
+        );
+
       /**
        * Explicit broadcast flag is authoritative.
        */
@@ -1334,7 +1354,7 @@ export class SwapService {
          FAILED ATF → TON BEFORE BROADCAST
          ───────────────────────────────────────── */
 
-      if (gasAdvanced && !broadcasted && tx) {
+      if (gasAdvanced && !broadcasted && !broadcastUncertain && tx) {
         try {
           const result = await this.gasRecovery.recoverAdminGasSafely({
             swapTransactionId: tx._id.toString(),
@@ -1363,7 +1383,11 @@ export class SwapService {
          ROLLBACK INTERNAL BALANCE
          ───────────────────────────────────────── */
 
-      if (deducted && !broadcasted) {
+      // FIX B: never refund on an uncertain broadcast — only on a proven
+      // pre-broadcast failure (wallet-service now guarantees that any
+      // thrown error reaching here with `deducted` is definite-failure
+      // unless it matches the uncertainty pattern above).
+      if (deducted && !broadcasted && !broadcastUncertain) {
         try {
           const currentUser = await User.findById(user._id);
 
@@ -1403,12 +1427,19 @@ export class SwapService {
           const latest = await Transaction.findById(tx._id);
 
           if (latest) {
-            latest.status = broadcasted ? 'processing' : 'failed';
+            latest.status =
+              broadcasted || broadcastUncertain ? 'processing' : 'failed';
 
             latest.metadata = {
               ...latest.metadata,
-              error: (error as Error).message,
+              error: errorMsg,
               broadcasted,
+              ...(broadcastUncertain
+                ? {
+                    broadcastUncertain: true,
+                    broadcastTriedAt: new Date().toISOString(),
+                  }
+                : {}),
               gasAdvanceTxId: gasAdvanceTxId || undefined,
               gasClawbackTxHash: gasClawbackTxHash || undefined,
               // FIX A: preserve the numeric counter written by
@@ -1419,7 +1450,8 @@ export class SwapService {
                 typeof latest?.metadata?.gasRecoveryAttempted === 'number'
                   ? latest.metadata.gasRecoveryAttempted
                   : 0,
-              swapOutcome: broadcasted ? 'pending' : 'failed',
+              swapOutcome:
+                broadcasted || broadcastUncertain ? 'pending' : 'failed',
             };
 
             await latest.save();
@@ -1486,4 +1518,5 @@ export class SwapService {
       console.error('[SwapService] Fee transfer failed:', error);
     }
   }
-}
+  }
+            
