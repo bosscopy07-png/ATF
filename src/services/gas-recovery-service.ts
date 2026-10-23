@@ -40,8 +40,11 @@ export interface RecoveryResult {
 export class GasRecoveryService {
   private walletService: WalletService;
 
-  constructor(walletService?: WalletService) {
-    this.walletService = walletService || new WalletService();
+  constructor(_walletService?: WalletService) {
+    // FIX E: recovery always uses the fee-profile RPC/API key so a
+    // rate-limit on the swap or monitor path can't stall clawbacks.
+    // The optional parameter is kept for backward compatibility.
+    this.walletService = new WalletService(undefined, 'fee');
   }
 
   async recordAdvance(params: {
@@ -236,16 +239,46 @@ export class GasRecoveryService {
 
       /**
        * CRITICAL: send from the exact wallet that received the advance.
+       *
+       * FIX E (delivery verification): a returned hash/tracking ref only
+       * proves the message LEFT our node — not that it LANDED. The old
+       * code credited `recovered` on broadcast alone; that is exactly
+       * how 289597274 was marked recovered while the TON never moved.
+       * Recovery is credited only after both balances are observed to
+       * shift by ≈ the sent amount.
        */
+      const [adminBefore, walletBefore] = await Promise.all([
+        this.walletService.getTonBalanceStrict(config.adminFeeWalletAddress),
+        this.walletService.getTonBalanceStrict(record.walletAddress),
+      ]);
+
       const txHash = await this.walletService.sendTonFromWalletAddress(
         record.walletAddress,
         config.adminFeeWalletAddress,
         safeRecoverable
       );
 
+      const delivered = await this.verifyTonDelivery(
+        record.walletAddress,
+        config.adminFeeWalletAddress,
+        walletBefore,
+        adminBefore,
+        safeRecoverable
+      );
+
+      if (!delivered) {
+        // Throw WITHOUT crediting — the catch path resets the claim and
+        // the retry job re-attempts. Exactly-once is preserved because
+        // gasRecoveredAmountNano was never bumped.
+        throw new Error(
+          `Gas recovery transfer of ${safeRecoverable} nanoTON not ` +
+          `confirmed on-chain (tracking ref ${txHash}) — not crediting recovery`
+        );
+      }
+
       const newRecovered = recovered + safeRecoverable;
       const pending = advanced > newRecovered + writtenOff
-        ? advanced - newRecovered - writtenOff
+        ? advanced - newRecovered + writtenOff
         : 0n;
       const status: GasRecoveryStatus = pending > 0n ? 'partial' : 'completed';
 
@@ -337,6 +370,44 @@ export class GasRecoveryService {
       skippedReason,
     };
   }
+
+  /**
+   * FIX E: poll both ends of a clawback. Delivered only when the source
+   * wallet dropped by ≥ ~amount AND the destination rose by ~amount.
+   * Timeout → NOT delivered (caller throws; the retry job resumes).
+   * An RPC hiccup never reads as delivered — it keeps polling.
+   */
+  private async verifyTonDelivery(
+    fromAddress: string,
+    toAddress: string,
+    fromBefore: bigint,
+    toBefore: bigint,
+    amount: bigint
+  ): Promise<boolean> {
+    const threshold = amount / 2n;
+
+    for (let attempt = 0; attempt < 15; attempt++) {
+      await new Promise((r) => setTimeout(r, 3000));
+
+      try {
+        const [fromNow, toNow] = await Promise.all([
+          this.walletService.getTonBalanceStrict(fromAddress),
+          this.walletService.getTonBalanceStrict(toAddress),
+        ]);
+
+        const fromDelta = fromBefore - fromNow;
+        const toDelta = toNow - toBefore;
+
+        if (fromDelta >= threshold && toDelta >= threshold) {
+          return true;
+        }
+      } catch {
+        // RPC hiccup — keep polling.
+      }
+    }
+
+    return false;
+  }
 }
 
 function min2(a: bigint, b: bigint): bigint {
@@ -345,4 +416,5 @@ function min2(a: bigint, b: bigint): bigint {
 
 export function gasTonToNano(gasTon: string): bigint {
   return Precision.toBaseUnits(gasTon, TON_DECIMALS);
-}
+                                        }
+          
