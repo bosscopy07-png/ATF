@@ -24,20 +24,81 @@ import { User } from '../models/User';
 import { config } from '../config';
 
 /**
- * FIX B: classify TON Center / transport errors surfaced by
- * sendExternalMessage.
+ * Thrown when a broadcast's on-chain outcome cannot be determined: the
+ * provider returned an uncertain-class error (HTTP 5xx / timeout /
+ * connection reset / aborted request) and the wallet seqno did not
+ * advance within the bounded verification window.
  *
- * 5xx responses, timeouts and connection resets mean the submission
- * outcome is unknown — the node may have accepted the BoC before the
- * error was produced. Everything else thrown from sendExternalMessage
- * is a definite pre-broadcast rejection.
- *
- * Never log request payloads or API keys here.
+ * ERROR CONTRACT (for the unmodified callers):
+ *  - code: 'BROADCAST_OUTCOME_UNKNOWN'
+ *  - The transaction MAY still land on-chain at any time.
+ *  - Callers must keep the operation pending, reconcile on-chain, and
+ *    MUST NOT auto-refund, auto-fail, or auto-resubmit.
+ *  - The message intentionally contains 'timed out' and the HTTP status
+ *    so the existing uncertainty regexes in swap-service and
+ *    fee-collection-service classify it correctly without modification.
+ *  - Never carries mnemonics, keys, API keys, or signed payloads.
  */
-function isUncertainBroadcastError(message: string): boolean {
-  return /HTTP 5\d\d|500|502|503|504|Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout|timeout|timed out|ETIMEDOUT|ECONNRESET|ECONNABORTED|aborted|socket|fetch failed/i.test(
-    message
-  );
+export class BroadcastOutcomeUnknownError extends Error {
+  readonly code = 'BROADCAST_OUTCOME_UNKNOWN' as const;
+
+  constructor(
+    message: string,
+    readonly walletAddress: string,
+    readonly seqno: number,
+    readonly httpStatus?: number
+  ) {
+    super(message);
+    this.name = 'BroadcastOutcomeUnknownError';
+  }
+}
+
+interface BroadcastErrorInfo {
+  uncertain: boolean;
+  httpStatus?: number;
+  bodySnippet: string;
+}
+
+/**
+ * Classify a sendExternalMessage failure.
+ *
+ * Uncertain (outcome unknown — the node may have accepted the BoC before
+ * the response failed): HTTP 5xx, timeouts, connection resets/aborts.
+ *
+ * Everything else (4xx validation errors, insufficient funds, wallet
+ * mismatch, bad request) is a VERIFIED pre-submission rejection: the
+ * message never reached the chain and callers may safely treat it as
+ * failed. Never log secrets here — only status + a bounded body snippet.
+ */
+function classifyBroadcastError(error: any): BroadcastErrorInfo {
+  const msg = error?.message || String(error);
+
+  const httpStatus: number | undefined =
+    typeof error?.response?.status === 'number'
+      ? error.response.status
+      : undefined;
+
+  let bodySnippet = '';
+  try {
+    const data = error?.response?.data;
+    bodySnippet = (typeof data === 'string' ? data : JSON.stringify(data))
+      ?.slice(0, 300) || '';
+  } catch {
+    // ignore
+  }
+
+  const messageUncertain =
+    /HTTP 5\d\d|500|502|503|504|Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout|timeout|timed out|ETIMEDOUT|ECONNRESET|ECONNABORTED|aborted|socket|fetch failed/i.test(
+      msg
+    );
+
+  const statusUncertain = httpStatus !== undefined && httpStatus >= 500;
+
+  return {
+    uncertain: messageUncertain || statusUncertain,
+    httpStatus,
+    bodySnippet,
+  };
 }
 
 /**
@@ -372,8 +433,8 @@ export class WalletService {
         deployed: false,
       };
     }
-  }
-    /**
+                   }
+        /**
    * Automatically determine which wallet version is actually being used.
    *
    * Rules:
@@ -971,8 +1032,8 @@ export class WalletService {
       version,
       contract,
     };
-}
-      // ===========================================================================
+    }
+    // ===========================================================================
   // SEND TON
   // ===========================================================================
 
@@ -1034,21 +1095,12 @@ export class WalletService {
     const opened = this.client.open(contract);
 
     /**
-     * FIX D — undeployed-wallet support.
-     *
-     * A freshly created wallet has no on-chain state yet, and
-     * getSeqno() throws for a non-existent account. An undeployed
-     * wallet's seqno is definitionally 0, and sendExternalMessage
-     * auto-attaches the contract init on first send (self-deploy).
-     * Without this fallback the very first swap on a new wallet
-     * always errors out before broadcast.
+     * SAFE SEQNO RESOLUTION (replaces the removed unsafe catch→0 fallback):
+     * the contract state is verified on-chain first; seqno 0 is only used
+     * when the RPC confirms the wallet is uninitialized. An RPC outage is
+     * never treated as proof of an undeployed wallet.
      */
-    let seqno: number;
-    try {
-      seqno = await opened.getSeqno();
-    } catch {
-      seqno = 0; // undeployed wallet — first transaction deploys it
-    }
+    const seqno = await this.resolveSeqno(opened, walletDoc.address);
 
     const message = internal({
       to: destination,
@@ -1076,60 +1128,54 @@ export class WalletService {
     }
 
     /**
-     * FIX B — broadcast-outcome classification.
+     * BROADCAST-OUTCOME HANDLING (FIX B):
      *
-     * An HTTP 5xx / transport error from TON Center does NOT prove the
-     * external message failed: the node may have accepted the BoC
-     * before the error response was produced. Decide using the only
-     * authoritative local signal — the wallet seqno:
+     * An HTTP 5xx / timeout / connection reset does NOT prove the message
+     * failed — the node may have accepted the BoC before the response
+     * broke. Classification uses both the error message and the HTTP
+     * status. Verified pre-submission rejections (4xx, validation,
+     * insufficient funds) propagate unchanged so callers may safely treat
+     * them as failed.
      *
-     *  - seqno advanced  → the message WAS consumed on-chain. Return the
-     *    same 2-part tracking reference waitForTransaction mints in this
-     *    case ("addr_seqno"), which the reconciler's verifier treats as
-     *    'confirmed' and reconciles normally (success → finalize + fee,
-     *    or on-chain failure → exactly-once refund via failSwap).
+     * On an UNCERTAIN error: poll the wallet seqno (bounded). If it
+     * advanced past the pre-broadcast seqno, the message was consumed —
+     * return the reconciler-compatible "address_seqno" tracking reference
+     * (this format is only returned when seqno advancement was actually
+     * established). If the seqno never advanced, the outcome is genuinely
+     * unknown: throw BroadcastOutcomeUnknownError (code
+     * BROADCAST_OUTCOME_UNKNOWN). We never fabricate a hash, never
+     * auto-retry a potentially-submitted message, and never report a
+     * definitive failure merely because indexing lagged.
      *
-     *  - seqno unchanged → the message definitively never reached the
-     *    chain. Throw a definite pre-broadcast error so the caller's
-     *    existing failure path (internal balance rollback) is safe.
-     *
-     * Deterministic errors (bad request, insufficient funds, wallet
-     * mismatch — all thrown before this point) propagate unchanged.
+     * The message contains 'timed out' and the HTTP status so the
+     * unmodified callers' uncertainty regexes classify it correctly.
      */
     try {
       await this.client.sendExternalMessage(opened, transfer);
     } catch (error: any) {
-      const msg = error?.message || String(error);
+      const info = classifyBroadcastError(error);
 
       /**
-       * FIX E-diag: surface the HTTP status + response body. Toncenter's
-       * 500s carry the real reason ("cannot apply external message…",
-       * rate limit, unknown method) but it lives in error.response.data,
-       * not error.message. Truncated; never contains keys or the BoC.
+       * Diagnostics: surface the HTTP status + response body. Toncenter's
+       * errors carry the real reason in the body, not the message.
+       * Truncated; never contains keys, mnemonics, or the signed payload.
        */
-      const status = error?.response?.status;
-      let bodySnippet = '';
-      try {
-        const data = error?.response?.data;
-        bodySnippet = (typeof data === 'string' ? data : JSON.stringify(data))
-          ?.slice(0, 300) || '';
-      } catch { /* ignore */ }
-
-      if (status || bodySnippet) {
+      if (info.httpStatus || info.bodySnippet) {
         console.error(
           `[WalletService] Broadcast rejected by endpoint` +
-          (status ? ` (HTTP ${status})` : '') +
-          (bodySnippet ? `: ${bodySnippet}` : '')
+          (info.httpStatus ? ` (HTTP ${info.httpStatus})` : '') +
+          (info.bodySnippet ? `: ${info.bodySnippet}` : '')
         );
       }
 
-      if (!isUncertainBroadcastError(msg)) {
-        throw error; // definite pre-broadcast failure — safe to refund
+      if (!info.uncertain) {
+        throw error; // verified pre-submission rejection — safe to treat as failed
       }
 
       console.warn(
-        `[WalletService] Uncertain broadcast outcome for ${walletAddress}: ${msg}. ` +
-        `Checking wallet seqno to classify...`
+        `[WalletService] Uncertain broadcast outcome for ${walletAddress}` +
+        (info.httpStatus ? ` (HTTP ${info.httpStatus})` : '') +
+        `. Checking wallet seqno to classify...`
       );
 
       const consumed = await this.waitForSeqnoAdvance(opened, seqno, 10, 1500);
@@ -1137,14 +1183,19 @@ export class WalletService {
       if (consumed) {
         console.warn(
           `[WalletService] Seqno advanced — message WAS consumed on-chain despite the error. ` +
-          `Marking as broadcast for reconciliation.`
+          `Returning tracking reference for reconciliation.`
         );
         return `${Address.parse(walletDoc.address).toString({ bounceable: false })}_${seqno}`;
       }
 
-      throw new Error(
-        `Broadcast definitively failed before chain submission ` +
-        `(HTTP ${status || 'n/a'}): ${bodySnippet || msg}`
+      throw new BroadcastOutcomeUnknownError(
+        `Broadcast outcome unknown: endpoint returned an uncertain error` +
+        (info.httpStatus ? ` (HTTP ${info.httpStatus})` : '') +
+        ` and the wallet seqno did not advance before the verification window timed out. ` +
+        `The transaction may still land on-chain — keep the operation pending and reconcile.`,
+        walletDoc.address,
+        seqno,
+        info.httpStatus
       );
     }
 
@@ -1152,10 +1203,10 @@ export class WalletService {
   }
 
   /**
-   * FIX B: returns true if the wallet seqno advanced past
-   * previousSeqno within maxAttempts polls — i.e. an external message
-   * was consumed on-chain. "Unknown" (RPC hiccup) never reads as
-   * "failed" here; it keeps polling.
+   * Returns true if the wallet seqno advanced past previousSeqno within
+   * maxAttempts polls — i.e. an external message was consumed on-chain.
+   * An RPC hiccup never reads as "not advanced" prematurely; it keeps
+   * polling until the bounded window is exhausted.
    */
   private async waitForSeqnoAdvance(
     opened: ReturnType<TonClient['open']>,
@@ -1178,8 +1229,8 @@ export class WalletService {
     }
 
     return false;
-  }
-    // ===========================================
+    }
+        // ===========================================
   async sendJetton(
     userId: number,
     toAddress: string,
@@ -1214,21 +1265,16 @@ export class WalletService {
     const opened = this.client.open(contract);
 
     /**
-     * FIX D — undeployed-wallet support (see sendTonFromWalletAddress).
+     * SAFE SEQNO RESOLUTION — same as sendTonFromWalletAddress.
      */
-    let seqno: number;
-    try {
-      seqno = await opened.getSeqno();
-    } catch {
-      seqno = 0; // undeployed wallet — first transaction deploys it
-    }
+    const seqno = await this.resolveSeqno(opened, walletDoc.address);
 
     const message = internal({
       to: userJettonWallet,
-      // FIX C: 0.05 → 0.1 — a fee transfer to a wallet whose jetton
-      // wallet isn't deployed yet needs this headroom; the standard
-      // jetton contract otherwise BOUNCES the transfer ("fee returned").
-      // Unused excess is refunded to the sender.
+      // 0.1 TON attached value (unchanged): a transfer to a wallet whose
+      // jetton wallet isn't deployed yet needs this headroom; the standard
+      // jetton contract otherwise BOUNCES the transfer. Unused excess is
+      // refunded to the sender.
       value: toNano('0.1'),
       bounce: true,
       body: transferBody,
@@ -1254,65 +1300,118 @@ export class WalletService {
     }
 
     /**
-     * FIX B — same broadcast-outcome classification as
-     * sendTonFromWalletAddress (see its comment). On an uncertain
-     * error, the wallet seqno decides: consumed on-chain → return the
-     * 2-part tracking reference; never reached the chain → throw a
-     * definite pre-broadcast failure so callers never treat a fee
-     * transfer as failed when it may actually be on-chain.
+     * BROADCAST-OUTCOME HANDLING — identical contract to
+     * sendTonFromWalletAddress (see its comment block).
      */
     try {
       await this.client.sendExternalMessage(opened, transfer);
     } catch (error: any) {
-      const msg = error?.message || String(error);
+      const info = classifyBroadcastError(error);
 
-      /**
-       * FIX E-diag: surface the HTTP status + response body (see
-       * sendTonFromWalletAddress for the full rationale).
-       */
-      const status = error?.response?.status;
-      let bodySnippet = '';
-      try {
-        const data = error?.response?.data;
-        bodySnippet = (typeof data === 'string' ? data : JSON.stringify(data))
-          ?.slice(0, 300) || '';
-      } catch { /* ignore */ }
-
-      if (status || bodySnippet) {
+      if (info.httpStatus || info.bodySnippet) {
         console.error(
           `[WalletService] Broadcast rejected by endpoint` +
-          (status ? ` (HTTP ${status})` : '') +
-          (bodySnippet ? `: ${bodySnippet}` : '')
+          (info.httpStatus ? ` (HTTP ${info.httpStatus})` : '') +
+          (info.bodySnippet ? `: ${info.bodySnippet}` : '')
         );
       }
 
-      if (!isUncertainBroadcastError(msg)) {
-        throw error; // definite pre-broadcast failure
+      if (!info.uncertain) {
+        throw error; // verified pre-submission rejection
       }
 
       console.warn(
-        `[WalletService] Uncertain jetton broadcast outcome for ${walletDoc.address}: ${msg}. ` +
-        `Checking wallet seqno to classify...`
+        `[WalletService] Uncertain jetton broadcast outcome for ${walletDoc.address}` +
+        (info.httpStatus ? ` (HTTP ${info.httpStatus})` : '') +
+        `. Checking wallet seqno to classify...`
       );
 
       const consumed = await this.waitForSeqnoAdvance(opened, seqno, 10, 1500);
 
       if (consumed) {
         console.warn(
-          `[WalletService] Seqno advanced — jetton message WAS consumed on-chain despite the error.`
+          `[WalletService] Seqno advanced — jetton message WAS consumed on-chain despite the error. ` +
+          `Returning tracking reference for reconciliation.`
         );
         return `${Address.parse(walletDoc.address).toString({ bounceable: false })}_${seqno}`;
       }
 
-      throw new Error(
-        `Broadcast definitively failed before chain submission ` +
-        `(HTTP ${status || 'n/a'}): ${bodySnippet || msg}`
+      throw new BroadcastOutcomeUnknownError(
+        `Broadcast outcome unknown: endpoint returned an uncertain error` +
+        (info.httpStatus ? ` (HTTP ${info.httpStatus})` : '') +
+        ` and the wallet seqno did not advance before the verification window timed out. ` +
+        `The transaction may still land on-chain — keep the operation pending and reconcile.`,
+        walletDoc.address,
+        seqno,
+        info.httpStatus
       );
     }
 
     return this.waitForTransaction(opened, walletDoc.address, seqno);
         }
 
+
+  // ===========================================================================
+  // SAFE SEQNO RESOLUTION
+  // ===========================================================================
+
+  /**
+   * SAFE SEQNO RESOLUTION (replaces the removed unsafe catch→0 fallback).
+   *
+   * 1. Query the contract state from the configured RPC.
+   *    - 'uninitialized' → seqno is definitionally 0.
+   *    - 'active'        → read the real on-chain seqno.
+   *    - 'frozen'        → refuse; the wallet must be unfrozen first.
+   * 2. If the state or seqno CANNOT be verified (RPC outage), abort with a
+   *    meaningful error. An RPC outage is NEVER treated as proof that a
+   *    wallet is undeployed, and we never guess a seqno.
+   */
+  private async resolveSeqno(
+    opened: ReturnType<TonClient['open']>,
+    address: string
+  ): Promise<number> {
+    const parsed = Address.parse(address);
+
+    let state: { state?: string } | undefined;
+    try {
+      state = await this.client.getContractState(parsed);
+    } catch (error: any) {
+      throw new Error(
+        `Cannot verify wallet state for ${address} ` +
+        `(RPC failure: ${error?.message || error}). ` +
+        `Refusing to assume an undeployed wallet or seqno 0.`
+      );
+    }
+
+    const st = state?.state;
+
+    if (st === 'uninitialized' || st === 'uninit') {
+      return 0;
+    }
+
+    if (st === 'frozen') {
+      throw new Error(
+        `Wallet ${address} is frozen (storage dues exceeded). ` +
+        `Fund it and execute any transaction to unfreeze before sending.`
+      );
+    }
+
+    if (st === 'active') {
+      try {
+        return await (opened as any).getSeqno();
+      } catch (error: any) {
+        throw new Error(
+          `Wallet ${address} is active but its seqno could not be read ` +
+          `(${error?.message || error}). Refusing to broadcast without a confirmed seqno.`
+        );
+      }
+    }
+
+    throw new Error(
+      `Wallet ${address} is in an unverifiable contract state ('${String(st)}'). ` +
+      `Refusing to broadcast without a confirmed seqno.`
+    );
+  }
 
   // ===========================================================================
   // JETTON WALLET
@@ -1343,8 +1442,16 @@ export class WalletService {
   /**
    * Wait briefly for the external message to appear on-chain.
    *
-   * IMPORTANT:
-   * We don't treat "not indexed yet" as a failed transaction.
+   * RETURN CONTRACT:
+   *  - seqno advanced + tx indexed → real transaction hash.
+   *  - seqno advanced + indexing lag → the reconciler-compatible
+   *    "walletAddress_seqno" tracking reference. This format is ONLY
+   *    returned here when seqno advancement was established.
+   *  - seqno never advanced within the window → the outcome is genuinely
+   *    unknown (mempool eviction, node lag). We do NOT fabricate a
+   *    "walletAddress_seqno_timestamp" reference and do NOT declare
+   *    failure — we throw BroadcastOutcomeUnknownError so the caller keeps
+   *    the operation pending and reconciles.
    */
   private async waitForTransaction(
     opened:
@@ -1409,13 +1516,17 @@ export class WalletService {
     }
 
     /**
-     * We don't claim that a fabricated value is a blockchain
-     * transaction hash.
-     *
-     * This is only a tracking identifier when the provider has
-     * not indexed the transaction yet.
+     * The seqno never advanced. The message may have been dropped by the
+     * mempool or the node may be lagging — the outcome is unknown. Throw
+     * the distinct error instead of returning a fabricated reference.
      */
-    return `${address}_${previousSeqno}_${Date.now()}`;
+    throw new BroadcastOutcomeUnknownError(
+      `Broadcast outcome unknown: the wallet seqno did not advance before ` +
+      `the verification window timed out. The message may still be accepted ` +
+      `by the network later — keep the operation pending and reconcile.`,
+      address,
+      previousSeqno
+    );
   }
 
   // ===========================================================================
@@ -1492,4 +1603,5 @@ export class WalletService {
       ),
     };
   }
-    }
+  }
+    
