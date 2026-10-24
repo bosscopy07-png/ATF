@@ -18,7 +18,6 @@ import {
   JettonWallet,
 } from '@ton/ton';
 
-import { storeMessage } from '@ton/core';
 import { encrypt, decrypt } from '../utils/encryption';
 import { Wallet, IWallet } from '../models/Wallet';
 import { User } from '../models/User';
@@ -434,8 +433,8 @@ export class WalletService {
         deployed: false,
       };
     }
-  }
-    /**
+    }
+                                         /**
    * Automatically determine which wallet version is actually being used.
    *
    * Rules:
@@ -1034,7 +1033,7 @@ export class WalletService {
       contract,
     };
   }
-    // ===========================================================================
+      // ===========================================================================
   // SEND TON
   // ===========================================================================
 
@@ -1101,7 +1100,7 @@ export class WalletService {
      * uninitialized. An RPC outage is never treated as proof of an
      * undeployed wallet. The deployment decision returned here is the
      * SINGLE source of truth for whether the external message carries
-     * the contract init (see buildExternalMessage).
+     * the contract init (see contractForSend below).
      */
     const { seqno, deployed } = await this.resolveSeqno(opened, walletDoc.address);
 
@@ -1131,6 +1130,22 @@ export class WalletService {
     }
 
     /**
+     * FORCE THE INIT DECISION FROM OUR VERIFIED SNAPSHOT.
+     *
+     * sendExternalMessage internally re-checks isContractDeployed via its
+     * own RPC call; on toncenter's multi-liteserver pool that second call
+     * can hit a stale server and attach the init to an already-deployed
+     * account ("Failed to unpack account state"). By passing a shim with
+     * init stripped for DEPLOYED wallets, the message goes out WITHOUT an
+     * init no matter what the internal re-check concludes. For
+     * UNINITIALIZED wallets the real contract keeps its init, so the
+     * message doubles as the deploy.
+     */
+    const contractForSend: any = deployed
+      ? { ...contract, init: null }
+      : contract;
+
+    /**
      * BROADCAST-OUTCOME HANDLING:
      *
      * An HTTP 5xx / timeout / connection reset does NOT prove the message
@@ -1149,9 +1164,7 @@ export class WalletService {
      * definitive failure merely because indexing lagged.
      */
     try {
-      await this.client.sendMessage(
-        this.buildExternalMessage(contract, walletDoc.address, deployed, transfer)
-      );
+      await this.client.sendExternalMessage(contractForSend, transfer);
     } catch (error: any) {
       const info = classifyBroadcastError(error);
 
@@ -1264,7 +1277,7 @@ export class WalletService {
     const opened = this.client.open(contract);
 
     /**
-     * SAFE SEQNO RESOLUTION — same single source of truth as
+     * SAFE SEQNO RESOLUTION — same single verified snapshot as
      * sendTonFromWalletAddress.
      */
     const { seqno, deployed } = await this.resolveSeqno(opened, walletDoc.address);
@@ -1300,13 +1313,21 @@ export class WalletService {
     }
 
     /**
+     * FORCE THE INIT DECISION — identical shim to sendTonFromWalletAddress:
+     * deployed wallets send with init stripped (immune to a stale internal
+     * isContractDeployed read); uninitialized wallets carry the real init
+     * so the message doubles as the deploy.
+     */
+    const contractForSend: any = deployed
+      ? { ...contract, init: null }
+      : contract;
+
+    /**
      * BROADCAST-OUTCOME HANDLING — identical contract to
      * sendTonFromWalletAddress (see its comment block).
      */
     try {
-      await this.client.sendMessage(
-        this.buildExternalMessage(contract, walletDoc.address, deployed, transfer)
-      );
+      await this.client.sendExternalMessage(contractForSend, transfer);
     } catch (error: any) {
       const info = classifyBroadcastError(error);
 
@@ -1415,50 +1436,6 @@ export class WalletService {
       `Wallet ${address} is in an unverifiable contract state ('${String(st)}'). ` +
       `Refusing to broadcast without a confirmed seqno.`
     );
-  }
-
-  // ===========================================================================
-  // EXTERNAL MESSAGE CONSTRUCTION
-  // ===========================================================================
-
-  /**
-   * Build the external message EXPLICITLY from the deployment decision
-   * made in resolveSeqno, and send it via client.sendMessage.
-   *
-   * Replaces client.sendExternalMessage, which makes its OWN independent
-   * isContractDeployed RPC call before sending. On toncenter's
-   * multi-liteserver pool that second call can hit a server with a stale
-   * view and attach the state-init to an already-deployed account (or
-   * omit it from a deploy), producing collator rejections like
-   * "cannot apply external message … Failed to unpack account state".
-   * Here the init decision and the seqno come from the SAME verified
-   * state snapshot — one decision, one message.
-   */
-  private buildExternalMessage(
-    contract: WalletContractV4 | WalletContractV5R1,
-    address: string,
-    deployed: boolean,
-    transfer: Cell
-  ): Cell {
-    if (!deployed && !contract.init) {
-      throw new Error(
-        `Wallet ${address} is uninitialized but no contract init is available.`
-      );
-    }
-
-    return beginCell()
-      .storeWritable(
-        storeMessage({
-          info: {
-            type: 'external-in',
-            to: Address.parse(address),
-            importFee: 0n,
-          },
-          init: deployed ? null : (contract.init as any),
-          body: transfer,
-        })
-      )
-      .endCell();
   }
 
   // ===========================================================================
@@ -1651,4 +1628,5 @@ export class WalletService {
       ),
     };
   }
-    }
+      }
+                                    
