@@ -57,11 +57,11 @@ export const config = {
   // or 5xx storm on one path can't corrupt another. All fall back to the
   // existing values — nothing breaks if the new env vars are unset.
   tonRpcUrlSwap:
-    process.env.TON_RPC_URL_SWAP || process.env.TON_RPC_URL,
+    process.env.TON_RPC_URL_SWAP || requireEnv('TON_RPC_URL'),
   tonApiKeySwap:
     process.env.TON_API_KEY_SWAP || process.env.TON_API_KEY || undefined,
   tonRpcUrlFee:
-    process.env.TON_RPC_URL_FEE || process.env.TON_RPC_URL,
+    process.env.TON_RPC_URL_FEE || requireEnv('TON_RPC_URL'),
   tonApiKeyFee:
     process.env.TON_API_KEY_FEE || process.env.TON_API_KEY || undefined,
 
@@ -259,4 +259,3 @@ export const TON_DECIMALS = 9;
 export const GRAM_DECIMALS = 9;
 
 export const ATF_DECIMALS = 9;
-  
