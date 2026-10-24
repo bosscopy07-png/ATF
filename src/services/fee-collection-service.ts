@@ -2,8 +2,12 @@
  * FeeCollectionService — the SINGLE place platform swap fees are collected.
  *
  * Guarantees:
- *  - Idempotent: upsert-on-swapTxId record creation + status claims mean
- *    the reconciler fast path AND this sweeper can never double-send.
+ *  - Idempotent: upsert-on-swapTxId record creation + atomic status claims
+ *    mean the reconciler fast path AND this sweeper can never double-send.
+ *  - Claim-retryable: records in 'failed' are re-claimable on the next
+ *    sweep (they used to deadlock silently because the claim filter only
+ *    matched 'pending'). Uncertain records (broadcastUncertain /
+ *    deliveryUncertain) are NEVER auto-requeued — double-charge guard.
  *  - Asset-aware (FIX A): TON fees via sendTon, ATF via sendJetton,
  *    generic tokens via their own master.
  *  - Delivery-verified (FIX C): a jetton fee is only 'completed' after
@@ -183,12 +187,25 @@ export class FeeCollectionService {
 
     const feeTxId = await this.ensureFeeRecord(swap);
 
+    /**
+     * Atomic claim. CRITICAL FIX: the claim matches BOTH 'pending' and
+     * 'failed' — a record that failed its send must be retryable on the
+     * next sweep, otherwise the sweeper deadlocks silently at
+     * "scanned=N collected=0" forever. Uncertain records (never safe to
+     * auto-retry) are excluded by the $ne guards, preserving the
+     * double-charge protection.
+     */
     const feeTx = await Transaction.findOneAndUpdate(
-      { _id: feeTxId, status: 'pending' },
+      {
+        _id: feeTxId,
+        status: { $in: ['pending', 'failed'] },
+        'metadata.deliveryUncertain': { $ne: true },
+        'metadata.broadcastUncertain': { $ne: true },
+      },
       { $set: { status: 'processing' } },
       { new: true }
     );
-    if (!feeTx) return 'pending'; // claimed elsewhere or already settled
+    if (!feeTx) return 'pending'; // claimed elsewhere, settled, or uncertain
 
     const feeAsset = feeTx.asset || swap.feeAsset || swap.asset;
     const feeAmount = BigInt(feeTx.amount);
@@ -459,5 +476,5 @@ export class FeeCollectorJob {
       this.running = false;
     }
   }
-  }
-        
+      }
+  
