@@ -1,3 +1,4 @@
+
 import mongoose, { ClientSession } from 'mongoose';
 import { TonClient, Address } from '@ton/ton';
 import { Transaction, TransactionStatus, TransactionType } from '../models/Transaction';
@@ -285,7 +286,7 @@ class ReconciliationService {
       }
     }
   }
-      // ─── Swaps ─────────────────────────────────────────────────────────────
+    // ─── Swaps ─────────────────────────────────────────────────────────────
 
   private async reconcileSwaps(metrics: ReconcileMetrics): Promise<void> {
     // NO createdAt window: a swap stays reconcilable until it is finalized
@@ -557,9 +558,18 @@ class ReconciliationService {
     return async () => {
       const meta = swap.metadata as any;
 
-      // ── Step 1: claw back the admin gas advance FIRST, while the
-      // wallet still holds it (recoverAdminGasSafely is idempotent and
-      // re-entrant — a no-op call is harmless).
+      // ── Steps 1 + 2 FIRST: platform fees — while the wallet is flush
+      // (advance leftover + swap output) and can definitely afford the
+      // 0.1 TON attach the jetton fee transfer needs. Running the gas
+      // clawback first could drain the wallet below that threshold on
+      // small swaps, silently blocking fee collection forever.
+      const { FeeCollectionService } = await import('../services/fee-collection-service');
+      await new FeeCollectionService().collectSwapFee(swapId);
+
+      // ── Step 3 LAST: claw back the admin gas advance — it takes
+      // whatever platform TON remains (still ≈0.28 minus fee gas).
+      // recoverAdminGasSafely is idempotent and re-entrant; the
+      // GasRecoveryRetry job resumes anything the 3 attempts miss.
       if (meta.gasAdvanceTxId || meta.gasRecoveryWalletAddress) {
         for (let attempt = 1; attempt <= 3; attempt++) {
           try {
@@ -576,14 +586,9 @@ class ReconciliationService {
           }
         }
       }
-
-      // ── Steps 2 + 3: input fee, then output fee — sequential and
-      // idempotent inside the dedicated fee service.
-      const { FeeCollectionService } = await import('../services/fee-collection-service');
-      await new FeeCollectionService().collectSwapFee(swapId);
     };
-      }
-            /**
+    }
+                  /**
    * Delegates to FeeCollectionService (kept as the reconciler's entry
    * point so older call sites keep working). All fee logic — record
    * creation, claims, sending, broadcast-uncertain handling — lives in
@@ -944,4 +949,4 @@ export function stopReconciler(): void {
   service.stop();
                  }
 
-            
+          
