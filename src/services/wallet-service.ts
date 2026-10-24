@@ -18,6 +18,7 @@ import {
   JettonWallet,
 } from '@ton/ton';
 
+import { storeMessage } from '@ton/core';
 import { encrypt, decrypt } from '../utils/encryption';
 import { Wallet, IWallet } from '../models/Wallet';
 import { User } from '../models/User';
@@ -60,7 +61,7 @@ interface BroadcastErrorInfo {
 }
 
 /**
- * Classify a sendExternalMessage failure.
+ * Classify a broadcast failure.
  *
  * Uncertain (outcome unknown — the node may have accepted the BoC before
  * the response failed): HTTP 5xx, timeouts, connection resets/aborts.
@@ -433,8 +434,8 @@ export class WalletService {
         deployed: false,
       };
     }
-                   }
-        /**
+  }
+    /**
    * Automatically determine which wallet version is actually being used.
    *
    * Rules:
@@ -1032,7 +1033,7 @@ export class WalletService {
       version,
       contract,
     };
-    }
+  }
     // ===========================================================================
   // SEND TON
   // ===========================================================================
@@ -1095,12 +1096,14 @@ export class WalletService {
     const opened = this.client.open(contract);
 
     /**
-     * SAFE SEQNO RESOLUTION (replaces the removed unsafe catch→0 fallback):
-     * the contract state is verified on-chain first; seqno 0 is only used
-     * when the RPC confirms the wallet is uninitialized. An RPC outage is
-     * never treated as proof of an undeployed wallet.
+     * SAFE SEQNO RESOLUTION: the contract state is verified on-chain
+     * first; seqno 0 is only used when the RPC confirms the wallet is
+     * uninitialized. An RPC outage is never treated as proof of an
+     * undeployed wallet. The deployment decision returned here is the
+     * SINGLE source of truth for whether the external message carries
+     * the contract init (see buildExternalMessage).
      */
-    const seqno = await this.resolveSeqno(opened, walletDoc.address);
+    const { seqno, deployed } = await this.resolveSeqno(opened, walletDoc.address);
 
     const message = internal({
       to: destination,
@@ -1128,37 +1131,33 @@ export class WalletService {
     }
 
     /**
-     * BROADCAST-OUTCOME HANDLING (FIX B):
+     * BROADCAST-OUTCOME HANDLING:
      *
      * An HTTP 5xx / timeout / connection reset does NOT prove the message
      * failed — the node may have accepted the BoC before the response
-     * broke. Classification uses both the error message and the HTTP
-     * status. Verified pre-submission rejections (4xx, validation,
+     * broke. Verified pre-submission rejections (4xx, validation,
      * insufficient funds) propagate unchanged so callers may safely treat
      * them as failed.
      *
      * On an UNCERTAIN error: poll the wallet seqno (bounded). If it
      * advanced past the pre-broadcast seqno, the message was consumed —
      * return the reconciler-compatible "address_seqno" tracking reference
-     * (this format is only returned when seqno advancement was actually
-     * established). If the seqno never advanced, the outcome is genuinely
-     * unknown: throw BroadcastOutcomeUnknownError (code
+     * (only ever returned when seqno advancement was established). If the
+     * seqno never advanced, throw BroadcastOutcomeUnknownError (code
      * BROADCAST_OUTCOME_UNKNOWN). We never fabricate a hash, never
      * auto-retry a potentially-submitted message, and never report a
      * definitive failure merely because indexing lagged.
-     *
-     * The message contains 'timed out' and the HTTP status so the
-     * unmodified callers' uncertainty regexes classify it correctly.
      */
     try {
-      await this.client.sendExternalMessage(opened, transfer);
+      await this.client.sendMessage(
+        this.buildExternalMessage(contract, walletDoc.address, deployed, transfer)
+      );
     } catch (error: any) {
       const info = classifyBroadcastError(error);
 
       /**
-       * Diagnostics: surface the HTTP status + response body. Toncenter's
-       * errors carry the real reason in the body, not the message.
-       * Truncated; never contains keys, mnemonics, or the signed payload.
+       * Diagnostics: surface the HTTP status + response body (truncated;
+       * never contains keys, mnemonics, or the signed payload).
        */
       if (info.httpStatus || info.bodySnippet) {
         console.error(
@@ -1229,8 +1228,8 @@ export class WalletService {
     }
 
     return false;
-    }
-        // ===========================================
+  }
+    // ===========================================
   async sendJetton(
     userId: number,
     toAddress: string,
@@ -1265,9 +1264,10 @@ export class WalletService {
     const opened = this.client.open(contract);
 
     /**
-     * SAFE SEQNO RESOLUTION — same as sendTonFromWalletAddress.
+     * SAFE SEQNO RESOLUTION — same single source of truth as
+     * sendTonFromWalletAddress.
      */
-    const seqno = await this.resolveSeqno(opened, walletDoc.address);
+    const { seqno, deployed } = await this.resolveSeqno(opened, walletDoc.address);
 
     const message = internal({
       to: userJettonWallet,
@@ -1304,7 +1304,9 @@ export class WalletService {
      * sendTonFromWalletAddress (see its comment block).
      */
     try {
-      await this.client.sendExternalMessage(opened, transfer);
+      await this.client.sendMessage(
+        this.buildExternalMessage(contract, walletDoc.address, deployed, transfer)
+      );
     } catch (error: any) {
       const info = classifyBroadcastError(error);
 
@@ -1358,18 +1360,20 @@ export class WalletService {
   /**
    * SAFE SEQNO RESOLUTION (replaces the removed unsafe catch→0 fallback).
    *
-   * 1. Query the contract state from the configured RPC.
-   *    - 'uninitialized' → seqno is definitionally 0.
-   *    - 'active'        → read the real on-chain seqno.
-   *    - 'frozen'        → refuse; the wallet must be unfrozen first.
-   * 2. If the state or seqno CANNOT be verified (RPC outage), abort with a
-   *    meaningful error. An RPC outage is NEVER treated as proof that a
-   *    wallet is undeployed, and we never guess a seqno.
+   * Queries the contract state from the configured RPC and returns BOTH
+   * the seqno and the deployment decision:
+   *   - 'uninitialized' → { seqno: 0, deployed: false }  (RPC-confirmed)
+   *   - 'active'        → { seqno: <real>, deployed: true }
+   *   - 'frozen'        → refuse; the wallet must be unfrozen first.
+   *
+   * If the state or seqno CANNOT be verified (RPC outage), aborts with a
+   * meaningful error. An RPC outage is NEVER treated as proof that a
+   * wallet is undeployed, and we never guess a seqno.
    */
   private async resolveSeqno(
     opened: ReturnType<TonClient['open']>,
     address: string
-  ): Promise<number> {
+  ): Promise<{ seqno: number; deployed: boolean }> {
     const parsed = Address.parse(address);
 
     let state: { state?: string } | undefined;
@@ -1386,7 +1390,7 @@ export class WalletService {
     const st = state?.state;
 
     if (st === 'uninitialized' || st === 'uninit') {
-      return 0;
+      return { seqno: 0, deployed: false };
     }
 
     if (st === 'frozen') {
@@ -1398,7 +1402,7 @@ export class WalletService {
 
     if (st === 'active') {
       try {
-        return await (opened as any).getSeqno();
+        return { seqno: await (opened as any).getSeqno(), deployed: true };
       } catch (error: any) {
         throw new Error(
           `Wallet ${address} is active but its seqno could not be read ` +
@@ -1411,6 +1415,50 @@ export class WalletService {
       `Wallet ${address} is in an unverifiable contract state ('${String(st)}'). ` +
       `Refusing to broadcast without a confirmed seqno.`
     );
+  }
+
+  // ===========================================================================
+  // EXTERNAL MESSAGE CONSTRUCTION
+  // ===========================================================================
+
+  /**
+   * Build the external message EXPLICITLY from the deployment decision
+   * made in resolveSeqno, and send it via client.sendMessage.
+   *
+   * Replaces client.sendExternalMessage, which makes its OWN independent
+   * isContractDeployed RPC call before sending. On toncenter's
+   * multi-liteserver pool that second call can hit a server with a stale
+   * view and attach the state-init to an already-deployed account (or
+   * omit it from a deploy), producing collator rejections like
+   * "cannot apply external message … Failed to unpack account state".
+   * Here the init decision and the seqno come from the SAME verified
+   * state snapshot — one decision, one message.
+   */
+  private buildExternalMessage(
+    contract: WalletContractV4 | WalletContractV5R1,
+    address: string,
+    deployed: boolean,
+    transfer: Cell
+  ): Cell {
+    if (!deployed && !contract.init) {
+      throw new Error(
+        `Wallet ${address} is uninitialized but no contract init is available.`
+      );
+    }
+
+    return beginCell()
+      .storeWritable(
+        storeMessage({
+          info: {
+            type: 'external-in',
+            to: Address.parse(address),
+            importFee: 0n,
+          },
+          init: deployed ? null : (contract.init as any),
+          body: transfer,
+        })
+      )
+      .endCell();
   }
 
   // ===========================================================================
@@ -1450,8 +1498,8 @@ export class WalletService {
    *  - seqno never advanced within the window → the outcome is genuinely
    *    unknown (mempool eviction, node lag). We do NOT fabricate a
    *    "walletAddress_seqno_timestamp" reference and do NOT declare
-   *    failure — we throw BroadcastOutcomeUnknownError so the caller keeps
-   *    the operation pending and reconciles.
+   *    failure — we throw BroadcastOutcomeUnknownError so the caller
+   *    keeps the operation pending and reconciles.
    */
   private async waitForTransaction(
     opened:
@@ -1603,5 +1651,4 @@ export class WalletService {
       ),
     };
   }
-  }
-    
+    }
