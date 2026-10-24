@@ -164,6 +164,37 @@ class OnChainVerifier {
     }
   }
 
+  /**
+   * FIX (output accounting): on-chain total fees of a specific tx (by
+   * hash). This is the EXACT gas measure — unlike the attached swap
+   * value, which STON.fi forwards through the router and refunds in
+   * whole or part (adding it back double-counts and inflates the
+   * observed "user output", hiding the platform's gas advance leftover
+   * from recovery). Returns 0n when unreadable so the caller falls back
+   * to the conservative (over-protecting) path.
+   */
+  async getTransactionFees(txHash: string, toAddress?: string): Promise<bigint> {
+    if (!toAddress || txHash.includes('_')) return 0n;
+
+    try {
+      const addr = Address.parse(toAddress);
+      const transactions = await this.withRetry(() =>
+        this.client.getTransactions(addr, { limit: 100 })
+      );
+
+      for (const tx of transactions) {
+        if (tx.hash().toString('hex') === txHash) {
+          const fees = (tx as any).totalFees;
+          return typeof fees === 'bigint' ? fees : 0n;
+        }
+      }
+    } catch {
+      // fall through — caller falls back to the conservative path
+    }
+
+    return 0n;
+  }
+
   private async withRetry<T>(fn: () => Promise<T>, attempts = RPC_RETRY_ATTEMPTS): Promise<T> {
     let lastError: Error | undefined;
 
@@ -253,8 +284,8 @@ class ReconciliationService {
         );
       }
     }
-      }
-          // ─── Swaps ─────────────────────────────────────────────────────────────
+  }
+      // ─── Swaps ─────────────────────────────────────────────────────────────
 
   private async reconcileSwaps(metrics: ReconcileMetrics): Promise<void> {
     // NO createdAt window: a swap stays reconcilable until it is finalized
@@ -408,14 +439,33 @@ class ReconciliationService {
       };
     }
 
-    // ATF → TON: TON balance increase equals swap output; the platform gas
-    // advance and the spent swapValue are excluded from the delta.
+    // ATF → TON. Exact identity: the wallet's TON change over the swap
+    // equals (output − totalFees), so output = tonDelta + totalFees.
+    //
+    // FIX (output accounting): the attached swapValue must NOT be used as
+    // the gas add-back — STON.fi forwards it through the router and
+    // refunds the unused part, so the balance delta already contains the
+    // refund and adding swapValue double-counted. That inflated
+    // "actualOutputBaseUnits" by the full tx value (~0.2+ TON), and the
+    // gas recovery then protected phantom user money and reported
+    // "nothing recoverable" while the platform's advance sat in the
+    // wallet. We now read the tx's real on-chain fees instead; if they
+    // can't be read we fall back to swapValue, which OVER-protects the
+    // user (the safe direction — never under-protects).
     const swapValue = BigInt(meta.swapValueNano || '0');
+
+    const fees = await this.verifier.getTransactionFees(
+      swap.txHash as string,
+      walletAddress
+    );
+
+    const addBack = fees > 0n ? fees : swapValue;
+
     const adjustedDelta =
-      balances.ton + swapValue - BigInt(meta.preSwapTonBalanceNano || '0');
+      balances.ton + addBack - BigInt(meta.preSwapTonBalanceNano || '0');
 
     if (minOutput > 0n && adjustedDelta >= minOutput) {
-      return { status: 'success', actualOutputBaseUnits: adjustedDelta, method: 'ton_balance_delta' };
+      return { status: 'success', actualOutputBaseUnits: adjustedDelta, method: 'ton_balance_delta_plus_fees' };
     }
 
     if (ageMs < 90_000) {
@@ -532,7 +582,7 @@ class ReconciliationService {
       const { FeeCollectionService } = await import('../services/fee-collection-service');
       await new FeeCollectionService().collectSwapFee(swapId);
     };
-          }
+      }
             /**
    * Delegates to FeeCollectionService (kept as the reconciler's entry
    * point so older call sites keep working). All fee logic — record
@@ -894,4 +944,4 @@ export function stopReconciler(): void {
   service.stop();
                  }
 
-          
+            
