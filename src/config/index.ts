@@ -53,6 +53,18 @@ export const config = {
 
   tonApiKey: process.env.TON_API_KEY || undefined,
 
+  // FIX E: dedicated RPC endpoints/API keys per workload, so a rate-limit
+  // or 5xx storm on one path can't corrupt another. All fall back to the
+  // existing values — nothing breaks if the new env vars are unset.
+  tonRpcUrlSwap:
+    process.env.TON_RPC_URL_SWAP || process.env.TON_RPC_URL,
+  tonApiKeySwap:
+    process.env.TON_API_KEY_SWAP || process.env.TON_API_KEY || undefined,
+  tonRpcUrlFee:
+    process.env.TON_RPC_URL_FEE || process.env.TON_RPC_URL,
+  tonApiKeyFee:
+    process.env.TON_API_KEY_FEE || process.env.TON_API_KEY || undefined,
+
   stonfiApiUrl: process.env.STONFI_API_URL || 'https://api.ston.fi',
 
   stonfiApiKey: process.env.STONFI_API_KEY || undefined,
@@ -66,6 +78,12 @@ export const config = {
   atfJettonAddress: requireEnv('ATF_JETTON_ADDRESS'),
 
   adminFeeWalletAddress: requireEnv('ADMIN_FEE_WALLET_ADDRESS'),
+
+  // FIX A: the admin treasury wallet that sends gas advances. Optional
+  // but strongly recommended — the deposit watcher excludes transfers
+  // from this address (and from adminFeeWalletAddress) so platform
+  // loans are never booked as user deposits.
+  adminWalletAddress: process.env.ADMIN_WALLET_ADDRESS || undefined,
 
   adminWalletMnemonic: process.env.ADMIN_WALLET_MNEMONIC || '',
 
@@ -241,3 +259,4 @@ export const TON_DECIMALS = 9;
 export const GRAM_DECIMALS = 9;
 
 export const ATF_DECIMALS = 9;
+  
