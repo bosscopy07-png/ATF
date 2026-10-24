@@ -372,7 +372,7 @@ export class WalletService {
         deployed: false,
       };
     }
-      }
+  }
     /**
    * Automatically determine which wallet version is actually being used.
    *
@@ -971,8 +971,8 @@ export class WalletService {
       version,
       contract,
     };
-  }
-    // ===========================================================================
+}
+      // ===========================================================================
   // SEND TON
   // ===========================================================================
 
@@ -1101,6 +1101,28 @@ export class WalletService {
     } catch (error: any) {
       const msg = error?.message || String(error);
 
+      /**
+       * FIX E-diag: surface the HTTP status + response body. Toncenter's
+       * 500s carry the real reason ("cannot apply external message…",
+       * rate limit, unknown method) but it lives in error.response.data,
+       * not error.message. Truncated; never contains keys or the BoC.
+       */
+      const status = error?.response?.status;
+      let bodySnippet = '';
+      try {
+        const data = error?.response?.data;
+        bodySnippet = (typeof data === 'string' ? data : JSON.stringify(data))
+          ?.slice(0, 300) || '';
+      } catch { /* ignore */ }
+
+      if (status || bodySnippet) {
+        console.error(
+          `[WalletService] Broadcast rejected by endpoint` +
+          (status ? ` (HTTP ${status})` : '') +
+          (bodySnippet ? `: ${bodySnippet}` : '')
+        );
+      }
+
       if (!isUncertainBroadcastError(msg)) {
         throw error; // definite pre-broadcast failure — safe to refund
       }
@@ -1121,7 +1143,8 @@ export class WalletService {
       }
 
       throw new Error(
-        `Broadcast definitively failed before chain submission: ${msg}`
+        `Broadcast definitively failed before chain submission ` +
+        `(HTTP ${status || 'n/a'}): ${bodySnippet || msg}`
       );
     }
 
@@ -1156,7 +1179,7 @@ export class WalletService {
 
     return false;
   }
-      // ===========================================
+    // ===========================================
   async sendJetton(
     userId: number,
     toAddress: string,
@@ -1243,6 +1266,26 @@ export class WalletService {
     } catch (error: any) {
       const msg = error?.message || String(error);
 
+      /**
+       * FIX E-diag: surface the HTTP status + response body (see
+       * sendTonFromWalletAddress for the full rationale).
+       */
+      const status = error?.response?.status;
+      let bodySnippet = '';
+      try {
+        const data = error?.response?.data;
+        bodySnippet = (typeof data === 'string' ? data : JSON.stringify(data))
+          ?.slice(0, 300) || '';
+      } catch { /* ignore */ }
+
+      if (status || bodySnippet) {
+        console.error(
+          `[WalletService] Broadcast rejected by endpoint` +
+          (status ? ` (HTTP ${status})` : '') +
+          (bodySnippet ? `: ${bodySnippet}` : '')
+        );
+      }
+
       if (!isUncertainBroadcastError(msg)) {
         throw error; // definite pre-broadcast failure
       }
@@ -1262,7 +1305,8 @@ export class WalletService {
       }
 
       throw new Error(
-        `Broadcast definitively failed before chain submission: ${msg}`
+        `Broadcast definitively failed before chain submission ` +
+        `(HTTP ${status || 'n/a'}): ${bodySnippet || msg}`
       );
     }
 
@@ -1448,4 +1492,4 @@ export class WalletService {
       ),
     };
   }
-}
+    }
