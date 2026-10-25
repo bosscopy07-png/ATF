@@ -1,3 +1,4 @@
+
 /**
  * FeeCollectionService — the SINGLE place platform swap fees are collected.
  *
@@ -353,9 +354,8 @@ export class FeeCollectionService {
       }
     }
     return 'unknown';
-  }
-
-  /** TON fee: verify the broadcast tx itself (bounce / phase failure). */
+        }
+                /** TON fee: verify the broadcast tx itself (bounce / phase failure). */
   protected async verifyTonTransfer(txHash: string, userWalletAddress: string): Promise<DeliveryOutcome> {
     try {
       const tx = await this.findWalletTxByHash(userWalletAddress, txHash);
@@ -364,8 +364,9 @@ export class FeeCollectionService {
     } catch {
       return 'unknown';
     }
-      }
-    /* ─────────────────────────────────────────
+  }
+
+  /* ─────────────────────────────────────────
      MAIN COLLECTION
      ───────────────────────────────────────── */
 
@@ -521,8 +522,7 @@ export class FeeCollectionService {
     await this.markUncertain(claimed, swap, 'fee delivery unconfirmed — manual reconciliation required', txHash);
     return 'uncertain';
   }
-
-  /* ─────────────────────────────────────────
+    /* ─────────────────────────────────────────
      UNCERTAIN-RECORD RECONCILIATION
      ───────────────────────────────────────── */
 
@@ -898,5 +898,6 @@ export class FeeCollectorJob {
     } finally {
       this.running = false;
     }
-              }
-                     
+  }
+            }
+                       
