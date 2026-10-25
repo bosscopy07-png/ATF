@@ -1,4 +1,3 @@
-
 import mongoose, { ClientSession } from 'mongoose';
 import { TonClient, Address } from '@ton/ton';
 import { Transaction, TransactionStatus, TransactionType } from '../models/Transaction';
@@ -212,9 +211,8 @@ class OnChainVerifier {
 
     throw lastError;
   }
-}
-
-// ─── Atomic Reconciliation Service ─────────────────────────────────────────
+        }
+  // ─── Atomic Reconciliation Service ─────────────────────────────────────────
 
 class ReconciliationService {
   private verifier: OnChainVerifier;
@@ -286,7 +284,8 @@ class ReconciliationService {
       }
     }
   }
-    // ─── Swaps ─────────────────────────────────────────────────────────────
+
+  // ─── Swaps ─────────────────────────────────────────────────────────────
 
   private async reconcileSwaps(metrics: ReconcileMetrics): Promise<void> {
     // NO createdAt window: a swap stays reconcilable until it is finalized
@@ -396,7 +395,8 @@ class ReconciliationService {
       }
     }
   }
-    /**
+
+  /**
    * Determines whether the DEX swap actually produced the expected output,
    * using on-chain balance deltas captured before the swap was broadcast.
    * 'pending' while the chain is still settling (90s grace), then 'failed'.
@@ -517,6 +517,11 @@ class ReconciliationService {
    * Ensures a fee record exists for a completed swap (created inside the
    * finalize transaction so it's atomic with completion) and returns a
    * post-commit closure that hands off to the FeeCollectionService.
+   *
+   * DUPLICATE-BROADCAST FIX: the record is an UPSERT keyed by the unique
+   * metadata.feeKey (`<swapId>:platform`) instead of an unconditional
+   * create — a duplicate here would abort the finalize transaction with
+   * DuplicateKey, and pre-existing records are adopted rather than doubled.
    */
   private async ensureFeeTransfer(
     swap: any,
@@ -531,9 +536,12 @@ class ReconciliationService {
     let feeTxId = (swap.metadata as any)?.feeTxId as string | undefined;
 
     if (!feeTxId) {
-      const feeRecord = await Transaction.create(
-        [
-          {
+      // Canonical record, one per swap — unique index on metadata.feeKey.
+      const feeKey = `${swapId}:platform`;
+      const rec = await Transaction.findOneAndUpdate(
+        { type: 'fee' as TransactionType, 'metadata.feeKey': feeKey },
+        {
+          $setOnInsert: {
             userId: swap.userId,
             type: 'fee' as TransactionType,
             asset: swap.asset,
@@ -543,12 +551,17 @@ class ReconciliationService {
             status: 'pending' as TransactionStatus,
             toAddress: config.adminFeeWalletAddress,
             txHash: `fee-pending-${swapId}`,
-            metadata: { swapTxId: swapId, feeKind: 'swap_platform_fee' },
+            metadata: {
+              swapTxId: swapId,
+              feeKind: 'swap_platform_fee',
+              feeKey,
+              attempts: 0,
+            },
           },
-        ],
-        { session }
+        },
+        { upsert: true, new: true, session }
       );
-      feeTxId = feeRecord[0]._id.toString();
+      feeTxId = rec._id.toString();
     }
 
     swap.feeStatus = 'pending';
@@ -587,8 +600,8 @@ class ReconciliationService {
         }
       }
     };
-    }
-                  /**
+  }
+    /**
    * Delegates to FeeCollectionService (kept as the reconciler's entry
    * point so older call sites keep working). All fee logic — record
    * creation, claims, sending, broadcast-uncertain handling — lives in
@@ -600,30 +613,22 @@ class ReconciliationService {
   }
 
   /**
-   * Sweeps completed swaps whose platform fee never settled. Delegates to
-   * the FeeCollectionService — broadcast-uncertain records are never
-   * auto-requeued there (double-charge guard).
+   * Sweeps platform fees that never settled. Delegates entirely to the
+   * FeeCollectionService, which selects from the CANONICAL FEE RECORDS.
+   *
+   * DUPLICATE-BROADCAST FIX: the old implementation queried swaps by
+   * swap.feeStatus ∈ {pending, processing, failed} and called
+   * collectSwapFee() directly — a stale mirror (e.g. reset to 'pending'
+   * by the bounce path, or an error that didn't set the uncertain flag)
+   * re-authorized a broadcast of an already-broadcast fee on every 30s
+   * tick. Selection now lives in collectDueFees(), which is driven by the
+   * fee record's status/feeOutcome/attempts/cooldown and never by the
+   * swap mirror.
    */
   private async retryUnpaidSwapFees(metrics: ReconcileMetrics): Promise<void> {
-    const swaps = await Transaction.find({
-      type: 'swap' as TransactionType,
-      status: 'completed' as TransactionStatus,
-      feeStatus: { $in: ['pending', 'processing', 'failed'] },
-      createdAt: { $gte: new Date(Date.now() - MAX_CONFIRMATION_WAIT_MS) },
-    })
-      .sort({ createdAt: 1 })
-      .limit(BATCH_SIZE)
-      .lean();
-
     const { FeeCollectionService } = await import('../services/fee-collection-service');
-    const feeService = new FeeCollectionService();
-
-    for (const swap of swaps) {
-      if (this.shuttingDown) break;
-
-      const result = await feeService.collectSwapFee(swap._id.toString());
-      if (result === 'collected') metrics.feesRecovered++;
-    }
+    const { collected } = await new FeeCollectionService().collectDueFees();
+    metrics.feesRecovered += collected;
   }
 
   private async failSwap(
@@ -667,8 +672,9 @@ class ReconciliationService {
           });
       }
     });
-        }
-    private async rollbackSwap(swap: any, session: ClientSession): Promise<void> {
+  }
+
+  private async rollbackSwap(swap: any, session: ClientSession): Promise<void> {
     const meta = (swap.metadata || {}) as Record<string, any>;
     if (meta.rolledBack) return;
 
@@ -913,7 +919,7 @@ class ReconciliationService {
    * Re-queues orphaned fee_transfer records stuck in 'processing' (e.g.
    * after a worker crash between claim and broadcast) once their lock is
    * stale. Platform-fee records (type 'fee') are NOT touched here — they
-   * belong to the FeeCollectionService.
+   * belong to the FeeCollectionService (reconcileUncertainFees).
    */
   private async claimFeeTransfer(metrics: ReconcileMetrics): Promise<void> {
     const stale = await Transaction.find({
@@ -947,6 +953,5 @@ export async function startReconciler(): Promise<void> {
 
 export function stopReconciler(): void {
   service.stop();
-                 }
-
-          
+      }
+            
