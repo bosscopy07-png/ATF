@@ -155,6 +155,14 @@ export const config = {
     3_000
   ),
 
+  // Minimum TON the user wallet must hold before we attach gas to a
+  // jetton fee transfer. 0.1 TON matches sendJetton's forward amount; the
+  // earlier hardcoded 0.15 was higher than post-swap balances and blocked
+  // all ATF fee collection. Optional env override, safe default.
+  minTonForFeeTransferNano: BigInt(
+    requireEnvNumber('MIN_TON_FOR_FEE_TRANSFER_NANO', 100_000_000)
+  ),
+
   // ─────────────────────────────────────────────
   // Swap rate limiting / idempotency
   // ─────────────────────────────────────────────
@@ -168,13 +176,14 @@ export const config = {
   swapExecuteRateWindowMs: requireEnvNumber('SWAP_EXECUTE_RATE_WINDOW_MS', 10_000),
 
   swapLockTtlMs: requireEnvNumber('SWAP_LOCK_TTL_MS', 30_000),
+
    /**
    * Extra TON reserve required ON TOP of STON.fi's swap value, to cover
    * the wallet's own processing fee in the exact-balance edge case.
    * Default 0 = trust STON.fi's computation (original behavior).
    */
   swapGasReserveNano: BigInt(requireEnvNumber('SWAP_GAS_RESERVE_NANO', 0)),
-  
+
   // ─────────────────────────────────────────────
   // ⛳ Feature flags — ALL new capabilities OFF by default
   // ─────────────────────────────────────────────
@@ -259,3 +268,4 @@ export const TON_DECIMALS = 9;
 export const GRAM_DECIMALS = 9;
 
 export const ATF_DECIMALS = 9;
+    
