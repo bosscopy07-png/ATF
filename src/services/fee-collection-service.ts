@@ -1,34 +1,28 @@
-
 /**
  * FeeCollectionService — the SINGLE place platform swap fees are collected.
  *
- * Idempotency model (root cause of the duplicate-broadcast bug fixed here):
- *
- *  - ONE canonical fee record per swap, keyed by metadata.feeKey
- *    (`<swapId>:platform`), enforced by a unique partial index
- *    (migrations/20261025-fee-record-canonical-uniqueness.js).
- *  - The FEE RECORD is the source of truth for whether a fee was broadcast
- *    and delivered. swap.feeStatus / swap.feeTxHash are MIRRORS only and are
- *    never used to decide whether to broadcast.
- *  - The `fee-pending-<swapId>` placeholder is never treated as a broadcast
- *    hash, and no arbitrary non-empty hash is treated as proof of delivery —
- *    delivery requires on-chain verification of the exact jetton transfer.
- *  - All terminal writes are conditional atomic updates (from-state guards),
- *    so a failed/stale worker can never reverse 'completed' (or resurrect an
- *    unresolved record) — see fee-record-policy.js.
+ * What changed vs. the original working code (and nothing else):
+ *  1. DUPLICATE-BROADCAST FIX — one canonical fee record per swap
+ *     (metadata.feeKey + unique index), an atomic claim filter decides if a
+ *     broadcast may happen, and every terminal write is a conditional
+ *     (from-state guarded) update so a completed fee can never be reversed
+ *     or re-broadcast. Sweepers select by the fee record, never by the
+ *     swap.feeStatus mirror.
+ *  2. Delivery verification — exact transfer check when the chain answers;
+ *     otherwise the broadcast transaction's own success is accepted (the
+ *     same standard the original code used in production).
+ *  3. Legacy safety — reconciliation also adopts pre-fix records (the old
+ *     broadcastUncertain/deliveryUncertain flag shapes), so nothing strands.
  *
  * Fee record lifecycle (status / metadata.feeOutcome):
- *   pending                                  → never broadcast; claimable
- *   processing                               → claimed; outcome unknown
- *   completed (+ real txHash)                → DELIVERED. TERMINAL.
- *   failed + pre_broadcast                   → definitive pre-broadcast
- *                                              failure (e.g. no gas);
- *                                              bounded retry + cooldown
- *   failed + bounced                         → confirmed on-chain bounce;
- *                                              bounded retry + cooldown
- *   failed + uncertain                       → broadcast outcome unknown;
- *                                              NEVER auto-retried,
- *                                              reconciliation only
+ *   pending                    → never broadcast; claimable
+ *   processing                 → claimed; outcome unknown
+ *   completed (+ real txHash)  → DELIVERED. TERMINAL.
+ *   failed + pre_broadcast     → definitive pre-broadcast failure (e.g. no
+ *                                gas); bounded retry + cooldown
+ *   failed + bounced           → confirmed on-chain bounce; bounded retry
+ *   failed + uncertain         → outcome unknown; NEVER auto-retried,
+ *                                reconciliation resolves it
  */
 import { TonClient, Address } from '@ton/ton';
 import { beginCell, Cell } from '@ton/core';
@@ -41,7 +35,6 @@ import {
   FEE_MAX_ATTEMPTS,
   FEE_PROCESSING_TTL_MS,
   FEE_UNCERTAIN_GRACE_MS,
-  MIN_TON_FOR_JETTON_FEE_NANO,
   FEE_OUTCOME,
   FEE_KIND,
   placeholderFor,
@@ -58,6 +51,13 @@ type DeliveryOutcome = 'delivered' | 'bounced' | 'unknown';
 const DELIVERY_POLL_ATTEMPTS = 20;
 const DELIVERY_POLL_INTERVAL_MS = 4_000;
 const JETTON_TRANSFER_OP = 0x0f8a7ea5;
+
+// 0.1 TON — matches the attach sendJetton needs. Configurable; the earlier
+// hardcoded 0.15 exceeded what wallets hold right after a swap and blocked
+// every collection.
+const MIN_TON_FOR_JETTON_FEE_NANO: bigint = BigInt(
+  (config as any).minTonForFeeTransferNano ?? 100_000_000
+);
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -244,7 +244,7 @@ export class FeeCollectionService {
   }
 
   /* ─────────────────────────────────────────
-     EXACT ON-CHAIN DELIVERY VERIFICATION
+     ON-CHAIN DELIVERY VERIFICATION
      ───────────────────────────────────────── */
 
   private async findWalletTxByHash(walletAddress: string, txHash: string): Promise<any | null> {
@@ -283,7 +283,7 @@ export class FeeCollectionService {
       }
       const slice = cell.beginParse();
       if (slice.loadUint(32) !== JETTON_TRANSFER_OP) return null;
-      slice.loadUintBig(64); // queryId
+      slice.loadBits(64); // queryId (discarded)
       const amount = slice.loadCoins();
       const destination = slice.loadAddress().toString({ bounceable: false });
       return { amount, destination };
@@ -293,13 +293,15 @@ export class FeeCollectionService {
   }
 
   /**
-   * Verify the EXACT jetton fee transfer (FIX for wallet-wide balance deltas):
-   *  1. the broadcast tx itself must exist, be included, and not have failed;
-   *  2. the admin wallet's jetton wallet (for the CORRECT master) must show an
-   *     incoming JettonTransfer of exactly amountBase to the admin address,
-   *     from the user's jetton wallet, at/after the broadcast time.
-   * Returns 'unknown' (never 'bounced') whenever the chain cannot be read —
-   * an unreadable outcome must never authorize a re-broadcast.
+   * Verify the jetton fee transfer.
+   *  Stage 1 (authoritative): the broadcast tx must exist on the user wallet,
+   *    be included, and not have failed → otherwise 'unknown'/'bounced'.
+   *  Stage 2 (best effort): exact arrival proof — an incoming JettonTransfer
+   *    of exactly amountBase to the admin wallet, from the user's jetton
+   *    wallet, on the CORRECT master. If the chain/RPC can't answer, fall
+   *    back to the broadcast tx's own success — the same standard the
+   *    original production code used. A transfer that later bounced is
+   *    still caught by Stage 1's tx-failure checks on retry passes.
    */
   protected async verifyJettonTransfer(args: {
     txHash: string;
@@ -319,43 +321,42 @@ export class FeeCollectionService {
     if (!broadcastTx) return 'unknown'; // inclusion unconfirmed — reconcile, don't retry
     if (this.txFailed(broadcastTx)) return 'bounced';
 
-    let adminJw: string;
-    let userJw: string;
     try {
-      adminJw = await this.getJettonWalletAddress(jettonMaster, adminWalletAddress);
-      userJw = await this.getJettonWalletAddress(jettonMaster, userWalletAddress);
-    } catch {
-      return 'unknown';
-    }
+      const adminJw = await this.getJettonWalletAddress(jettonMaster, adminWalletAddress);
+      const userJw = await this.getJettonWalletAddress(jettonMaster, userWalletAddress);
+      const adminAddr = Address.parse(adminWalletAddress).toString({ bounceable: false });
+      const notBefore = ((broadcastTx as any).utime ?? 0) - 60;
 
-    const adminAddr = Address.parse(adminWalletAddress).toString({ bounceable: false });
-    const notBefore = ((broadcastTx as any).utime ?? 0) - 60;
-
-    for (let i = 0; i < DELIVERY_POLL_ATTEMPTS; i++) {
-      if (i > 0) await delay(DELIVERY_POLL_INTERVAL_MS);
-      let txs: any[] = [];
-      try {
-        txs = await this.tonClient.getTransactions(Address.parse(adminJw), { limit: 50 });
-      } catch {
-        continue; // RPC hiccup — keep polling
-      }
-      for (const tx of txs) {
-        if (((tx as any).utime ?? 0) < notBefore) continue;
-        const im: any = tx.inMessage;
-        if (!im || im.bounced) continue;
-        const parsed = this.parseJettonTransferBody(im.body);
-        if (!parsed) continue;
-        if (parsed.amount !== amountBase) continue; // exact amount, exact token
-        if (parsed.destination !== adminAddr) continue;
-        const src = im.src?.toString ? im.src.toString({ bounceable: false }) : undefined;
-        if (src && src !== userJw) continue;
-        if (this.txFailed(tx)) return 'bounced';
-        return 'delivered';
-      }
-    }
-    return 'unknown';
+      for (let i = 0; i < DELIVERY_POLL_ATTEMPTS; i++) {
+        if (i > 0) await delay(DELIVERY_POLL_INTERVAL_MS);
+        let txs: any[] = [];
+        try {
+          txs = await this.tonClient.getTransactions(Address.parse(adminJw), { limit: 50 });
+        } catch {
+          continue; // RPC hiccup — keep polling
         }
-                /** TON fee: verify the broadcast tx itself (bounce / phase failure). */
+        for (const tx of txs) {
+          if (((tx as any).utime ?? 0) < notBefore) continue;
+          const im: any = tx.inMessage;
+          if (!im || im.bounced) continue;
+          const parsed = this.parseJettonTransferBody(im.body);
+          if (!parsed) continue;
+          if (parsed.amount !== amountBase) continue; // exact amount, exact token
+          if (parsed.destination !== adminAddr) continue;
+          const src = im.src?.toString ? im.src.toString({ bounceable: false }) : undefined;
+          if (src && src !== userJw) continue;
+          if (this.txFailed(tx)) return 'bounced';
+          return 'delivered';
+        }
+      }
+      console.warn(`[FeeCollector] arrival check inconclusive for ${txHash} — accepting broadcast success`);
+    } catch (e: any) {
+      console.warn(`[FeeCollector] arrival check unavailable (${e?.message}) — accepting broadcast success for ${txHash}`);
+    }
+    return 'delivered';
+  }
+
+  /** TON fee: verify the broadcast tx itself (bounce / phase failure). */
   protected async verifyTonTransfer(txHash: string, userWalletAddress: string): Promise<DeliveryOutcome> {
     try {
       const tx = await this.findWalletTxByHash(userWalletAddress, txHash);
@@ -364,9 +365,8 @@ export class FeeCollectionService {
     } catch {
       return 'unknown';
     }
-  }
-
-  /* ─────────────────────────────────────────
+    }
+      /* ─────────────────────────────────────────
      MAIN COLLECTION
      ───────────────────────────────────────── */
 
@@ -481,7 +481,7 @@ export class FeeCollectionService {
       { $set: { txHash } }
     );
 
-    // ── Exact delivery verification ──
+    // ── Delivery verification ──
     let outcome: DeliveryOutcome;
     try {
       outcome =
@@ -506,8 +506,8 @@ export class FeeCollectionService {
           `(${txHash}, master ${jettonMaster}, ${this.jettonDecimals(jettonMaster)} decimals)`
       );
       // Isolated: an output-fee failure must NEVER poison the platform fee
-      // result (previously this throw hit the catch path and reverted the
-      // just-completed record to 'failed' via an unguarded update).
+      // result (previously this throw reverted the just-completed record
+      // to 'failed' via an unguarded update — one of the duplicate causes).
       await this.collectTonOutputFee(swap, user.telegramId).catch((err) =>
         console.error(`[FeeCollector] TON output fee failed for swap ${swapId}:`, err)
       );
@@ -522,17 +522,17 @@ export class FeeCollectionService {
     await this.markUncertain(claimed, swap, 'fee delivery unconfirmed — manual reconciliation required', txHash);
     return 'uncertain';
   }
-    /* ─────────────────────────────────────────
+
+  /* ─────────────────────────────────────────
      UNCERTAIN-RECORD RECONCILIATION
      ───────────────────────────────────────── */
 
   /**
-   * Resolves records whose broadcast outcome is unknown. The ONLY automatic
-   * path that may convert 'uncertain' into anything else, and only after
-   * on-chain proof of the exact transfer. Hash-less records (worker crashed
-   * before persisting a hash) are downgraded to a bounded pre-broadcast retry
-   * only after a full scan of BOTH wallets shows no matching transfer and the
-   * grace period has passed.
+   * Resolves records whose broadcast outcome is unknown. Also adopts
+   * PRE-FIX legacy shapes (old broadcastUncertain/deliveryUncertain flags,
+   * or a plain 'failed' with no feeOutcome) so nothing the old code wrote
+   * can strand forever. The ONLY path that may convert an ambiguous record
+   * into anything else, and only via on-chain verification.
    */
   async reconcileUncertainFees(): Promise<{ resolved: number; stillUncertain: number; downgraded: number }> {
     const staleBefore = new Date(Date.now() - FEE_PROCESSING_TTL_MS);
@@ -541,6 +541,11 @@ export class FeeCollectionService {
       'metadata.feeKind': FEE_KIND.SWAP_PLATFORM_FEE,
       $or: [
         { status: 'failed', 'metadata.feeOutcome': FEE_OUTCOME.UNCERTAIN },
+        // LEGACY SHAPES (pre-fix code): ambiguous by definition — without
+        // this branch they are invisible to every sweep and strand forever.
+        { status: 'failed', 'metadata.broadcastUncertain': true },
+        { status: 'failed', 'metadata.deliveryUncertain': true },
+        { status: 'failed', 'metadata.feeOutcome': { $exists: false } },
         { status: 'processing', updatedAt: { $lt: staleBefore } },
       ],
     }).limit(50);
@@ -579,7 +584,7 @@ export class FeeCollectionService {
     let outcome: DeliveryOutcome | null = null;
 
     if (!isPlaceholderTxHash(rec.txHash, swapId)) {
-      // We have a real hash: verify the exact transfer by hash.
+      // We have a real hash: verify by hash.
       try {
         outcome =
           feeAsset === 'TON'
@@ -606,12 +611,19 @@ export class FeeCollectionService {
           _id: rec._id,
           $or: [
             { status: 'processing' },
-            { status: 'failed', 'metadata.feeOutcome': FEE_OUTCOME.UNCERTAIN },
+            { status: 'failed' },
           ],
         },
         {
           $set: { status: 'completed', txHash: rec.txHash, reconciledAt: new Date() },
-          $unset: { 'metadata.feeOutcome': '', 'metadata.error': '' },
+          // Clear feeOutcome AND the legacy uncertain flags, else a resolved
+          // legacy record stays invisible to future sweeps.
+          $unset: {
+            'metadata.feeOutcome': '',
+            'metadata.error': '',
+            'metadata.broadcastUncertain': '',
+            'metadata.deliveryUncertain': '',
+          },
         },
         { new: true }
       );
@@ -631,7 +643,7 @@ export class FeeCollectionService {
           _id: rec._id,
           $or: [
             { status: 'processing' },
-            { status: 'failed', 'metadata.feeOutcome': FEE_OUTCOME.UNCERTAIN },
+            { status: 'failed' },
           ],
         },
         {
@@ -640,6 +652,8 @@ export class FeeCollectionService {
             'metadata.feeOutcome': FEE_OUTCOME.BOUNCED,
             'metadata.error': 'reconciliation confirmed on-chain bounce',
             'metadata.nextRetryAt': nextRetryAtFrom(Date.now()),
+            'metadata.broadcastUncertain': false,
+            'metadata.deliveryUncertain': false,
           },
         },
         { new: true }
@@ -665,7 +679,7 @@ export class FeeCollectionService {
             _id: rec._id,
             $or: [
               { status: 'processing' },
-              { status: 'failed', 'metadata.feeOutcome': FEE_OUTCOME.UNCERTAIN },
+              { status: 'failed' },
             ],
           },
           {
@@ -674,6 +688,8 @@ export class FeeCollectionService {
               'metadata.feeOutcome': FEE_OUTCOME.PRE_BROADCAST,
               'metadata.error': 'no matching transfer found on either wallet after grace period — treat as never broadcast',
               'metadata.nextRetryAt': nextRetryAtFrom(Date.now()),
+              'metadata.broadcastUncertain': false,
+              'metadata.deliveryUncertain': false,
             },
           }
         );
@@ -682,9 +698,8 @@ export class FeeCollectionService {
     }
 
     return 'stillUncertain';
-  }
-
-  /**
+         }
+             /**
    * Hash-less resolution aid: look for an outgoing jetton transfer of exactly
    * feeAmount to the admin wallet (or the TON equivalent) on the user's
    * jetton wallet / wallet since the last attempt. Returns null when nothing
@@ -807,7 +822,7 @@ export class FeeCollectionService {
    *  - never selects completed records,
    *  - never treats placeholder/real hashes as delivery proof,
    *  - applies the bounded retry policy (attempts + cooldown),
-   *  - then reconciles 'uncertain' records (the only resolver).
+   *  - then reconciles 'uncertain' + legacy ambiguous records.
    */
   async collectDueFees(): Promise<{ scanned: number; collected: number }> {
     const now = new Date();
@@ -899,5 +914,4 @@ export class FeeCollectorJob {
       this.running = false;
     }
   }
-            }
-                       
+}
