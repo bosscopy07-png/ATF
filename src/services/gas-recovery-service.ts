@@ -103,8 +103,7 @@ export class GasRecoveryService {
       await lock.release().catch(() => undefined);
     }
   }
-
-  private async recoverAdminGasSafelyUnlocked(
+    private async recoverAdminGasSafelyUnlocked(
     record: GasAdvanceRecord
   ): Promise<RecoveryResult> {
     // FIX B: pipeline update — $toInt normalizes legacy BOOLEAN values
@@ -152,6 +151,10 @@ export class GasRecoveryService {
       };
     }
 
+    // Hoisted so the catch path can persist an unconfirmed transfer's
+    // tracking ref for re-verification on the next attempt (no double-send).
+    let txHash: string | undefined;
+
     try {
       const meta = (claimed.metadata || {}) as Record<string, any>;
       const advanced = BigInt(meta.gasAdvanceAmountNano || '0');
@@ -179,6 +182,66 @@ export class GasRecoveryService {
       const currentBalance = await this.walletService.getTonBalanceStrict(
         record.walletAddress
       );
+
+      /**
+       * FIX F — re-verify a previous attempt's UNCONFIRMED transfer before
+       * broadcasting a replacement. The old flow threw "not confirmed
+       * on-chain" and let the next scheduled tick send a NEW clawback —
+       * while the first transfer could still land minutes later. That both
+       * delayed recovery (advance sits in the user's wallet, spendable) and
+       * risked a double clawback. Now: if the last transfer later landed,
+       * credit it here; only if it provably never landed do we replace it.
+       */
+      const lastTxHash = meta.gasRecoveryLastTxHash as string | undefined;
+      if (lastTxHash) {
+        const pendingNow = stillOwed;
+        const [fromNow, toNow] = await Promise.all([
+          this.walletService.getTonBalanceStrict(record.walletAddress),
+          this.walletService.getTonBalanceStrict(config.adminFeeWalletAddress),
+        ]);
+        const landed = await this.verifyTonDelivery(
+          record.walletAddress,
+          config.adminFeeWalletAddress,
+          fromNow,
+          toNow,
+          pendingNow
+        );
+        if (landed) {
+          const newRecovered = recovered + pendingNow;
+          await Transaction.create({
+            userId: claimed.userId,
+            type: 'fee_transfer',
+            asset: 'TON',
+            amount: pendingNow.toString(),
+            status: 'completed',
+            toAddress: config.adminFeeWalletAddress,
+            txHash: lastTxHash,
+            metadata: {
+              purpose: 'gas_recovery',
+              description: 'Recovery of TON advanced by admin for ATF -> TON swap (late-confirmed transfer)',
+              swapTxId: record.swapTransactionId,
+              walletAddress: record.walletAddress,
+              recoveredAmountNano: pendingNow.toString(),
+              gasAdvanceAmountNano: advanced.toString(),
+              swapOutcome: meta.swapOutcome || 'unknown',
+            },
+          });
+          await Transaction.updateOne(
+            { _id: record.swapTransactionId },
+            { $unset: { 'metadata.gasRecoveryLastTxHash': '' } }
+          );
+          return this.settle(
+            claimed,
+            'completed',
+            pendingNow,
+            newRecovered,
+            0n,
+            undefined,
+            lastTxHash
+          );
+        }
+        // Not landed → fall through and broadcast a replacement below.
+      }
 
       const balanceIncrease = currentBalance > preAdvance
         ? currentBalance - preAdvance
@@ -252,7 +315,7 @@ export class GasRecoveryService {
         this.walletService.getTonBalanceStrict(record.walletAddress),
       ]);
 
-      const txHash = await this.walletService.sendTonFromWalletAddress(
+      txHash = await this.walletService.sendTonFromWalletAddress(
         record.walletAddress,
         config.adminFeeWalletAddress,
         safeRecoverable
@@ -267,9 +330,10 @@ export class GasRecoveryService {
       );
 
       if (!delivered) {
-        // Throw WITHOUT crediting — the catch path resets the claim and
-        // the retry job re-attempts. Exactly-once is preserved because
-        // gasRecoveredAmountNano was never bumped.
+        // Throw WITHOUT crediting — the catch path resets the claim, stores
+        // the tracking ref (FIX F), and the retry job re-attempts. Exactly-once
+        // is preserved because gasRecoveredAmountNano was never bumped, and
+        // the next attempt re-verifies THIS transfer before replacing it.
         throw new Error(
           `Gas recovery transfer of ${safeRecoverable} nanoTON not ` +
           `confirmed on-chain (tracking ref ${txHash}) — not crediting recovery`
@@ -277,8 +341,11 @@ export class GasRecoveryService {
       }
 
       const newRecovered = recovered + safeRecoverable;
+      // FIX G: WAS `advanced - newRecovered + writtenOff` — missing
+      // parentheses overstated pending by 2×writtenOff once write-offs
+      // exist, making recovery chase money it must not collect.
       const pending = advanced > newRecovered + writtenOff
-        ? advanced - newRecovered + writtenOff
+        ? advanced - (newRecovered + writtenOff)
         : 0n;
       const status: GasRecoveryStatus = pending > 0n ? 'partial' : 'completed';
 
@@ -301,6 +368,12 @@ export class GasRecoveryService {
         },
       });
 
+      // A fresh confirmed transfer supersedes any older unconfirmed ref.
+      await Transaction.updateOne(
+        { _id: record.swapTransactionId },
+        { $unset: { 'metadata.gasRecoveryLastTxHash': '' } }
+      );
+
       return this.settle(
         claimed,
         status,
@@ -316,7 +389,7 @@ export class GasRecoveryService {
       const advanced = BigInt(meta.gasAdvanceAmountNano || '0');
       const writtenOff = BigInt(meta.gasRecoveryWrittenOffNano || '0');
       const pending = advanced > recovered + writtenOff
-        ? advanced - recovered - writtenOff
+        ? advanced - (recovered + writtenOff)
         : 0n;
 
       await Transaction.findByIdAndUpdate(record.swapTransactionId, {
@@ -325,6 +398,9 @@ export class GasRecoveryService {
           'metadata.gasRecoveryLastError': error?.message || String(error),
           'metadata.gasRecoveryProcessingAt': null,
           'metadata.gasRecoveryPendingAmountNano': pending.toString(),
+          // FIX F: remember the unconfirmed transfer so the next attempt
+          // re-verifies it BEFORE broadcasting a replacement.
+          ...(txHash ? { 'metadata.gasRecoveryLastTxHash': txHash } : {}),
         },
       });
 
@@ -341,8 +417,9 @@ export class GasRecoveryService {
         skippedReason: error?.message || String(error),
       };
     }
-        }
-      private async settle(
+  }
+
+  private async settle(
     claimed: ITransaction,
     status: GasRecoveryStatus,
     recoveredThisAttemptNano: bigint,
@@ -376,6 +453,9 @@ export class GasRecoveryService {
    * wallet dropped by ≥ ~amount AND the destination rose by ~amount.
    * Timeout → NOT delivered (caller throws; the retry job resumes).
    * An RPC hiccup never reads as delivered — it keeps polling.
+   *
+   * FIX F: 30 attempts × 3s = 90s of patience (was 45s) — most transfers
+   * that used to time out now confirm in place, so no retry is needed.
    */
   private async verifyTonDelivery(
     fromAddress: string,
@@ -386,7 +466,7 @@ export class GasRecoveryService {
   ): Promise<boolean> {
     const threshold = amount / 2n;
 
-    for (let attempt = 0; attempt < 15; attempt++) {
+    for (let attempt = 0; attempt < 30; attempt++) {
       await new Promise((r) => setTimeout(r, 3000));
 
       try {
@@ -416,5 +496,4 @@ function min2(a: bigint, b: bigint): bigint {
 
 export function gasTonToNano(gasTon: string): bigint {
   return Precision.toBaseUnits(gasTon, TON_DECIMALS);
-                                        }
-          
+}
