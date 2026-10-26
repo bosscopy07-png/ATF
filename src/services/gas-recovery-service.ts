@@ -103,7 +103,8 @@ export class GasRecoveryService {
       await lock.release().catch(() => undefined);
     }
   }
-    private async recoverAdminGasSafelyUnlocked(
+
+  private async recoverAdminGasSafelyUnlocked(
     record: GasAdvanceRecord
   ): Promise<RecoveryResult> {
     // FIX B: pipeline update — $toInt normalizes legacy BOOLEAN values
@@ -242,8 +243,7 @@ export class GasRecoveryService {
         }
         // Not landed → fall through and broadcast a replacement below.
       }
-
-      const balanceIncrease = currentBalance > preAdvance
+            const balanceIncrease = currentBalance > preAdvance
         ? currentBalance - preAdvance
         : 0n;
 
@@ -278,10 +278,19 @@ export class GasRecoveryService {
         );
       }
 
+      // ── FEE FIRST ── While the platform fee is unsettled, leave the
+      // jetton fee attach (0.1 TON) in the wallet even if this recovery
+      // runs before the fee. The retry job also defers such swaps; this
+      // reserve is the second line of defence so the fee can never be
+      // starved of gas by a clawback.
+      const feeUnsettled =
+        BigInt(claimed.fee || '0') > 0n && claimed.feeStatus !== 'completed';
+
       const reserve =
         config.tonTransferFeeReserveNano +
         config.gasRecoveryBufferNano +
-        config.gasRecoveryMinBalanceNano;
+        config.gasRecoveryMinBalanceNano +
+        (feeUnsettled ? config.minTonForFeeTransferNano : 0n);
 
       const maxSendable = currentBalance > reserve
         ? currentBalance - reserve
