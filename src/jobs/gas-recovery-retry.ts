@@ -1,3 +1,4 @@
+
 import { Transaction } from '../models/Transaction';
 import { User } from '../models/User';
 import { GasRecoveryService } from '../services/gas-recovery-service';
@@ -82,27 +83,33 @@ export class GasRecoveryRetryJob {
         'metadata.gasRecoveryStatus': {
           $in: ['pending', 'partial'],
         },
-        $or: [
+        $and: [
           {
-            'metadata.gasRecoveryPendingAmountNano': {
-              $exists: false,
-            },
+            $or: [
+              {
+                'metadata.gasRecoveryPendingAmountNano': {
+                  $exists: false,
+                },
+              },
+              {
+                'metadata.gasRecoveryPendingAmountNano': {
+                  $nin: ['0', 0, null],
+                },
+              },
+            ],
           },
           {
-            'metadata.gasRecoveryPendingAmountNano': {
-              $nin: ['0', 0, null],
-            },
+            // ── FEE FIRST ── The ATF platform fee transfer needs ~0.1 TON
+            // attached. Clawing back before the fee settles starves the fee
+            // (previously masked by the recovery confirmation bug: recovery
+            // failed → wallet kept TON → fee worked). Swaps with no platform
+            // fee ('0'/missing — includes failed swaps) stay eligible.
+            $or: [
+              { fee: { $in: ['0', 0, null] } },
+              { fee: { $exists: false } },
+              { feeStatus: 'completed' },
+            ],
           },
-        ],
-        // ── FEE FIRST ── The ATF platform fee transfer needs ~0.1 TON
-        // attached. Clawing back before the fee settles starves the fee
-        // (previously masked by the recovery confirmation bug: recovery
-        // failed → wallet kept TON → fee worked). Swaps with no platform
-        // fee ('0'/missing — includes failed swaps) stay eligible.
-        $or: [
-          { fee: { $in: ['0', 0, null] } },
-          { fee: { $exists: false } },
-          { feeStatus: 'completed' },
         ],
       })
         .sort({ createdAt: 1 })
@@ -197,4 +204,4 @@ export class GasRecoveryRetryJob {
       this.running = false;
     }
   }
-              }
+          }
