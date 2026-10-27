@@ -3,6 +3,7 @@ import { Transaction } from '../models/Transaction';
 import { User } from '../models/User';
 import { GasRecoveryService } from '../services/gas-recovery-service';
 import { config } from '../config';
+import { gasRecoveryGate, platformFeeKey, outputFeeKey } from '../services/fee-record-policy';
 
 export class GasRecoveryRetryJob {
   private timer: NodeJS.Timeout | null = null;
@@ -55,10 +56,14 @@ export class GasRecoveryRetryJob {
           },
           $or: [
             {
+              // Stored as an ISO string (GasRecoveryService claim); comparing
+              // it to a Date never matched, so crashed claims stayed
+              // 'processing' forever. Compare string-to-string.
               'metadata.gasRecoveryProcessingAt': {
-                $lte: staleBefore,
+                $lte: staleBefore.toISOString(),
               },
             },
+            { 'metadata.gasRecoveryProcessingAt': null },
             {
               'metadata.gasRecoveryProcessingAt': {
                 $exists: false,
@@ -76,44 +81,24 @@ export class GasRecoveryRetryJob {
         }
       );
 
-      // Select only unfinished recoveries with a positive pending amount.
-      // Legacy records without a pending amount remain eligible.
+      // Select unfinished recoveries on TERMINAL swaps with a positive pending
+      // amount (legacy records without a pending amount stay eligible).
+      // Fee dependency is decided per swap below from the durable fee
+      // RECORDS (gasRecoveryGate), not from swap.fee/feeStatus: a failed swap
+      // must never wait for a fee that is never charged.
       const candidates = await Transaction.find({
         type: 'swap',
+        status: { $in: ['failed', 'completed'] },
         'metadata.gasRecoveryStatus': {
           $in: ['pending', 'partial'],
         },
-        $and: [
-          {
-            $or: [
-              {
-                'metadata.gasRecoveryPendingAmountNano': {
-                  $exists: false,
-                },
-              },
-              {
-                'metadata.gasRecoveryPendingAmountNano': {
-                  $nin: ['0', 0, null],
-                },
-              },
-            ],
-          },
-          {
-            // ── FEE FIRST ── The ATF platform fee transfer needs ~0.1 TON
-            // attached. Clawing back before the fee settles starves the fee
-            // (previously masked by the recovery confirmation bug: recovery
-            // failed → wallet kept TON → fee worked). Swaps with no platform
-            // fee ('0'/missing — includes failed swaps) stay eligible.
-            $or: [
-              { fee: { $in: ['0', 0, null] } },
-              { fee: { $exists: false } },
-              { feeStatus: 'completed' },
-            ],
-          },
+        $or: [
+          { 'metadata.gasRecoveryPendingAmountNano': { $exists: false } },
+          { 'metadata.gasRecoveryPendingAmountNano': { $nin: ['0', 0, null] } },
         ],
       })
-        .sort({ createdAt: 1 })
-        .limit(25)
+        .sort({ updatedAt: 1 })
+        .limit(100)
         .lean();
 
       for (const swap of candidates) {
@@ -135,6 +120,23 @@ export class GasRecoveryRetryJob {
           ) {
             continue;
           }
+
+          // Eligibility from durable state. Failed → always; successful →
+          // only after platform + output fee records are completed.
+          const swapId = swap._id.toString();
+          const feeRecs = (await Transaction.find({
+            type: 'fee',
+            'metadata.feeKey': { $in: [platformFeeKey(swapId), outputFeeKey(swapId)] },
+          }).lean()) as any[];
+          const gate = gasRecoveryGate(
+            swap,
+            {
+              platform: feeRecs.find((r) => r.metadata?.feeKey === platformFeeKey(swapId)),
+              output: feeRecs.find((r) => r.metadata?.feeKey === outputFeeKey(swapId)),
+            },
+            Date.now()
+          );
+          if (!gate.eligible) continue;
 
           const user = await User.findById(swap.userId).lean();
 
@@ -204,4 +206,5 @@ export class GasRecoveryRetryJob {
       this.running = false;
     }
   }
-          }
+           }
+              
