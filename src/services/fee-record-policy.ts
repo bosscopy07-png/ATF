@@ -32,8 +32,14 @@ export const FEE_PROCESSING_TTL_MS = 15 * 60 * 1000;
 /** Hash-less 'uncertain' records older than this may be downgraded to a
  *  bounded, pre-broadcast retry after a full wallet scan finds nothing. */
 export const FEE_UNCERTAIN_GRACE_MS = 60 * 60 * 1000;
-/** TON the user wallet must hold to attach gas to a jetton fee transfer. */
-export const MIN_TON_FOR_JETTON_FEE_NANO = BigInt(150_000_000); // 0.15 TON
+/**
+ * TON attached to a jetton transfer by WalletService.sendJetton (hard-coded
+ * toNano('0.1') there). Most of it returns as excess; the wallet only needs
+ * to HOLD it at send time plus the wallet's own message fee.
+ */
+export const JETTON_FEE_ATTACH_NANO = BigInt(100_000_000); // 0.1 TON
+/** After this long blocked only by missing TON, a fee no longer defers gas recovery. */
+export const FEE_GAS_BLOCK_WAIVER_MS = 6 * 60 * 60 * 1000;
 
 export const PLACEHOLDER_PREFIX = 'fee-pending-';
 
@@ -193,3 +199,87 @@ export function classifyBroadcastError(message: string): { kind: FeeOutcome } {
   }
   return { kind: FEE_OUTCOME.UNCERTAIN };
 }
+
+/* ─────────────────────────────────────────────────────────────
+   Required-gas, durable settlement and gas-recovery eligibility
+   ───────────────────────────────────────────────────────────── */
+
+/**
+ * TON the wallet must hold to send the platform fee. Computed from what the
+ * transfer really attaches — not a blanket number.
+ */
+export function requiredFeeGasNano(asset: string, transferFeeReserveNano: bigint, feeAmountNano = 0n): bigint {
+  return asset === 'TON'
+    ? feeAmountNano + transferFeeReserveNano // the fee itself is TON
+    : JETTON_FEE_ATTACH_NANO + transferFeeReserveNano;
+}
+
+export const platformFeeKey = (swapId: string) => `${swapId}:platform`;
+export const outputFeeKey = (swapId: string) => `${swapId}:ton_output`;
+
+/** Does this swap owe the disclosed token→TON output fee? */
+export function swapRequiresTonOutputFee(swapMeta: any): boolean {
+  const m = swapMeta || {};
+  if (!(m.swapDirection === 'atf_to_ton' || (m.feePlan && m.feePlan.kind === 'token_to_ton'))) return false;
+  if (m.feePlan && m.feePlan.tonOutputFeeBase !== undefined) {
+    try { return BigInt(m.feePlan.tonOutputFeeBase) > 0n; } catch { return false; }
+  }
+  return true; // legacy swap: amount derived from expectedOutputBaseUnits
+}
+
+/** Durable proof a fee transfer is delivered: completed + a real (non-placeholder) hash. */
+export function isFeeRecordSettled(rec: any): boolean {
+  return !!rec && rec.status === 'completed' && !isPlaceholderTxHash(rec.txHash);
+}
+
+/** A fee blocked ONLY by missing wallet TON for long enough stops deferring gas recovery. */
+export function isFeeGasBlockWaived(rec: any, nowMs: number): boolean {
+  if (!rec || rec.status !== 'failed') return false;
+  if (feeOutcomeOf(rec) !== FEE_OUTCOME.PRE_BROADCAST) return false;
+  const since = rec.metadata && rec.metadata.insufficientGasSince;
+  const t = since ? Date.parse(since) : NaN;
+  return Number.isFinite(t) && nowMs - t >= FEE_GAS_BLOCK_WAIVER_MS;
+}
+
+export interface GasRecoveryGate {
+  eligible: boolean;
+  reason:
+    | 'failed_swap'
+    | 'fees_settled'
+    | 'awaiting_platform_fee'
+    | 'awaiting_output_fee'
+    | 'swap_unresolved';
+}
+
+/**
+ * The ONE authority for "may gas be clawed back for this swap now".
+ *  - failed swap            → yes; no fee is ever owed, never wait on one.
+ *  - successful swap        → only once EVERY required fee record is durably
+ *                             settled (or waived for a long no-gas block).
+ *  - anything unresolved    → no (user output unknown; never claw back).
+ */
+export function gasRecoveryGate(
+  swap: any,
+  feeRecords: { platform?: any; output?: any },
+  nowMs: number
+): GasRecoveryGate {
+  const meta = (swap && swap.metadata) || {};
+  const outcome = meta.swapOutcome;
+
+  if (swap && (swap.status === 'failed' || outcome === 'failed')) {
+    return { eligible: true, reason: 'failed_swap' };
+  }
+  if (!(swap && swap.status === 'completed' && outcome === 'success')) {
+    return { eligible: false, reason: 'swap_unresolved' };
+  }
+
+  let platformOwed = false;
+  try { platformOwed = BigInt(swap.fee || '0') > 0n; } catch { platformOwed = false; }
+  if (platformOwed && !isFeeRecordSettled(feeRecords.platform) && !isFeeGasBlockWaived(feeRecords.platform, nowMs)) {
+    return { eligible: false, reason: 'awaiting_platform_fee' };
+  }
+  if (swapRequiresTonOutputFee(meta) && !isFeeRecordSettled(feeRecords.output) && !isFeeGasBlockWaived(feeRecords.output, nowMs)) {
+    return { eligible: false, reason: 'awaiting_output_fee' };
+  }
+  return { eligible: true, reason: 'fees_settled' };
+            }
