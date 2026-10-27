@@ -494,8 +494,211 @@ export class FeeCollectionService {
       return 'pending'; // in flight (or just downgraded — resolved on a later tick)
     }
 
-    // ── Atomic claim: the ONLY code path that authorizes a broadcast ──
+    // Atomic claim — the ONLY path that authorizes an output-fee broadcast.
     const claimed = await Transaction.findOneAndUpdate(
-      buildClaimFilter(feeTx._id, new Date(), swapId),
+      buildClaimFilter(rec._id, new Date(), `${swapId}:ton_output`),
       {
-        $set: { status: 'pr
+        $set: { status: 'processing', 'metadata.lastAttemptAt': new Date() },
+        $unset: { 'metadata.nextRetryAt': '' },
+        $inc: { 'metadata.attempts': 1 },
+      },
+      { new: true }
+    );
+    if (!claimed) return 'pending'; // settled, in flight, cooling down, or uncertain
+
+    const amount = BigInt(claimed.amount || '0');
+    const userWalletAddress: string =
+      meta.walletAddress || ((await this.walletService.getAddress(telegramId)) ?? '');
+
+    // Gas pre-check: the fee itself plus the wallet's message fee.
+    try {
+      const { ton } = await this.walletService.getBalance(userWalletAddress);
+      const needed = requiredFeeGasNano('TON', config.tonTransferFeeReserveNano, amount);
+      if (ton < needed) {
+        await this.markPreBroadcastFailed(
+          claimed,
+          swap,
+          `insufficient TON for output fee: wallet has ${ton} nano, needs ≥ ${needed}`,
+          { noGas: true }
+        );
+        return 'pending';
+      }
+    } catch {
+      // unreadable — let the send path classify
+    }
+
+    let txHash: string;
+    try {
+      txHash = await this.walletService.sendTon(telegramId, config.adminFeeWalletAddress, amount);
+    } catch (error: any) {
+      const message = error?.message || String(error);
+      if (classifyBroadcastError(message).kind === FEE_OUTCOME.PRE_BROADCAST) {
+        await this.markPreBroadcastFailed(claimed, swap, message);
+        return 'pending';
+      }
+      // May have been broadcast → never resend automatically.
+      await this.markUncertain(claimed, swap, message);
+      return 'uncertain';
+    }
+
+    // Persist the real hash IMMEDIATELY: a crash from here on is resolved by
+    // reconcileUncertainFees ('processing' + real hash), never by a resend.
+    await Transaction.updateOne({ _id: claimed._id, status: 'processing' }, { $set: { txHash } });
+
+    let outcome: DeliveryOutcome;
+    try {
+      outcome = await this.verifyTonTransfer(txHash, userWalletAddress, amount, true);
+    } catch (error: any) {
+      await this.markUncertain(claimed, swap, `verification error: ${error?.message || error}`, txHash);
+      return 'uncertain';
+    }
+
+    if (outcome === 'delivered') {
+      await this.markCompleted(claimed, swap, txHash);
+      return 'collected';
+    }
+    if (outcome === 'bounced') {
+      await this.markBounced(claimed, swap, txHash, 'output fee transfer bounced');
+      return 'pending';
+    }
+    await this.markUncertain(claimed, swap, 'output fee delivery unconfirmed — reconcile required', txHash);
+    return 'uncertain';
+  }
+
+  /* ─────────────────────────────────────────
+     SWEEPER — fee-record-driven, never mirror-driven
+     ───────────────────────────────────────── */
+
+  /**
+   * Selects due fees from the CANONICAL FEE RECORDS, never from swap.feeStatus:
+   *  - never selects completed records,
+   *  - never treats placeholder/real hashes as delivery proof,
+   *  - applies the bounded retry policy (attempts + cooldown),
+   *  - then reconciles 'uncertain' + legacy ambiguous records.
+   */
+  async collectDueFees(): Promise<{ scanned: number; collected: number }> {
+    const now = new Date();
+    const due = await Transaction.find({
+      type: 'fee',
+      'metadata.feeKind': { $in: [FEE_KIND.SWAP_PLATFORM_FEE, FEE_KIND.SWAP_TON_OUTPUT_FEE] },
+      $and: [
+        {
+          $or: [
+            { status: 'pending' },
+            {
+              status: 'failed',
+              'metadata.feeOutcome': { $in: [FEE_OUTCOME.PRE_BROADCAST, FEE_OUTCOME.BOUNCED] },
+              'metadata.nextRetryAt': { $lte: now },
+            },
+            {
+              status: 'failed',
+              'metadata.feeOutcome': { $in: [FEE_OUTCOME.PRE_BROADCAST, FEE_OUTCOME.BOUNCED] },
+              'metadata.nextRetryAt': { $exists: false },
+            },
+          ],
+        },
+        {
+          $or: [
+            { 'metadata.attempts': { $lt: FEE_MAX_ATTEMPTS } },
+            { 'metadata.attempts': { $exists: false } },
+          ],
+        },
+      ],
+    })
+      .sort({ updatedAt: 1 })
+      .limit(50)
+      .lean();
+
+    let collected = 0;
+
+    for (const fee of due) {
+      const swapId = fee.metadata?.swapTxId;
+      if (!swapId) continue;
+      const swap = await Transaction.findOne({ _id: swapId, type: 'swap' }).lean();
+      if (!swap || swap.status !== 'completed') continue; // fee follows the swap outcome
+
+      if (fee.metadata?.feeKind === FEE_KIND.SWAP_TON_OUTPUT_FEE) {
+        const owner = await User.findById((swap as any).userId);
+        if (!owner) continue;
+        const r = await this.collectTonOutputFee(swap, owner.telegramId).catch((err) => {
+          console.error(`[FeeCollector] TON output fee failed for swap ${swapId}:`, err);
+          return 'pending' as CollectResult;
+        });
+        if (r === 'collected') collected++;
+        continue;
+      }
+
+      const result = await this.collectSwapFee(swapId);
+      if (result === 'collected') collected++;
+    }
+
+    // Successful token→TON swaps whose output-fee record was never created
+    // (process died between settlement and record creation).
+    const unensured = await Transaction.find({
+      type: 'swap',
+      status: 'completed',
+      'metadata.swapOutcome': 'success',
+      'metadata.tonOutputFeeEnsured': { $ne: true },
+      $or: [{ 'metadata.swapDirection': 'atf_to_ton' }, { 'metadata.feePlan.kind': 'token_to_ton' }],
+    })
+      .sort({ updatedAt: 1 })
+      .limit(50)
+      .lean();
+
+    for (const sw of unensured) {
+      const owner = await User.findById((sw as any).userId);
+      if (!owner) continue;
+      const r = await this.collectTonOutputFee(sw, owner.telegramId).catch((err) => {
+        console.error(`[FeeCollector] TON output fee failed for swap ${sw._id}:`, err);
+        return 'pending' as CollectResult;
+      });
+      if (r === 'collected') collected++;
+    }
+
+    await this.reconcileUncertainFees().catch((error) =>
+      console.error('[FeeCollector] uncertain reconciliation error:', error)
+    );
+
+    return { scanned: due.length, collected };
+  }
+
+  /** Backwards-compatible name used by FeeCollectorJob. */
+  async sweepDueFees(): Promise<{ scanned: number; collected: number }> {
+    return this.collectDueFees();
+  }
+}
+
+/* ─── Sweeper job (registered in app.ts, BOTH server and worker mode) ─── */
+
+export class FeeCollectorJob {
+  private timer: NodeJS.Timeout | null = null;
+  private running = false;
+  private readonly service = new FeeCollectionService();
+
+  start(): void {
+    if (this.timer) return;
+    this.timer = setInterval(() => this.tick(), 30_000);
+    console.log('[FeeCollector] started');
+  }
+
+  stop(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+  }
+
+  private async tick(): Promise<void> {
+    if (this.running) return;
+    this.running = true;
+    try {
+      const { scanned, collected } = await this.service.sweepDueFees();
+      if (scanned > 0) {
+        console.log(`[FeeCollector] scanned=${scanned} collected=${collected}`);
+      }
+    } catch (err) {
+      console.error('[FeeCollector] tick error:', err);
+    } finally {
+      this.running = false;
+    }
+  }
+      }
+        
