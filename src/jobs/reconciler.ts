@@ -585,4 +585,362 @@ class ReconciliationService {
             console.error(`[Reconciler] Gas recovery attempt ${attempt} failed:`, err);
             if (attempt < 3) await new Promise((r) => setTimeout(r, 2000));
           }
-    
+        }
+      }
+    };
+  }
+    /**
+   * Delegates to FeeCollectionService (kept as the reconciler's entry
+   * point so older call sites keep working). All fee logic — record
+   * creation, claims, sending, broadcast-uncertain handling — lives in
+   * the fee service now.
+   */
+  private async processFeeTransfer(swapId: string, _telegramId: number): Promise<void> {
+    const { FeeCollectionService } = await import('../services/fee-collection-service');
+    await new FeeCollectionService().collectSwapFee(swapId);
+  }
+
+  /**
+   * Sweeps platform fees that never settled. Delegates entirely to the
+   * FeeCollectionService, which selects from the CANONICAL FEE RECORDS.
+   *
+   * DUPLICATE-BROADCAST FIX: the old implementation queried swaps by
+   * swap.feeStatus ∈ {pending, processing, failed} and called
+   * collectSwapFee() directly — a stale mirror (e.g. reset to 'pending'
+   * by the bounce path, or an error that didn't set the uncertain flag)
+   * re-authorized a broadcast of an already-broadcast fee on every 30s
+   * tick. Selection now lives in collectDueFees(), which is driven by the
+   * fee record's status/feeOutcome/attempts/cooldown and never by the
+   * swap mirror.
+   */
+  private async retryUnpaidSwapFees(metrics: ReconcileMetrics): Promise<void> {
+    const { FeeCollectionService } = await import('../services/fee-collection-service');
+    const { collected } = await new FeeCollectionService().collectDueFees();
+    metrics.feesRecovered += collected;
+  }
+
+  private async failSwap(
+    swap: any,
+    session: ClientSession,
+    metrics: ReconcileMetrics
+  ): Promise<void> {
+    if (swap.status === 'failed') return;
+
+    await this.rollbackSwap(swap, session);
+
+    swap.status = 'failed';
+    swap.metadata = {
+      ...swap.metadata,
+      onChainFailure: true,
+      swapOutcome: 'failed',
+    };
+    await swap.save({ session });
+    metrics.failed++;
+
+    // Gas recovery runs outside the transaction; the wallet state may lag.
+    setImmediate(() => {
+      const meta = (swap.metadata || {}) as Record<string, any>;
+      if (meta.gasRecoveryWalletAddress && meta.gasRecoveryStatus) {
+        this.gasRecovery
+          .recoverAdminGasSafely({
+            swapTransactionId: swap._id.toString(),
+            userId: swap.userId,
+            walletAddress: meta.gasRecoveryWalletAddress as string,
+          })
+          .then((result) => {
+            console.log(
+              `[Reconciler] Gas recovery after failed swap ${swap._id}: status=${result.status}, ` +
+              `recovered=${Precision.fromBaseUnits(result.totalRecoveredNano, TON_DECIMALS)} TON, ` +
+              `pending=${Precision.fromBaseUnits(result.pendingNano, TON_DECIMALS)} TON` +
+              (result.skippedReason ? ` (${result.skippedReason})` : '')
+            );
+          })
+          .catch((err) => {
+            console.error(`[Reconciler] Gas recovery failed for swap ${swap._id}:`, err);
+          });
+      }
+    });
+  }
+
+  private async rollbackSwap(swap: any, session: ClientSession): Promise<void> {
+    const meta = (swap.metadata || {}) as Record<string, any>;
+    if (meta.rolledBack) return;
+
+    const user = await User.findById(swap.userId).session(session);
+    if (!user) return;
+
+    const isTonToAtf = meta.swapDirection === 'ton_to_atf';
+    const balanceKey = isTonToAtf ? 'tonBalance' : 'atfBalance';
+
+    const current = BigInt(user[balanceKey] || '0');
+    const amount = BigInt(swap.amount || '0');
+
+    user[balanceKey] = Precision.add(current, amount).toString();
+    await user.save({ session });
+
+    swap.metadata = {
+      ...meta,
+      rolledBack: true,
+      rolledBackAt: new Date().toISOString(),
+    };
+  }
+
+  private async handleSwapError(swap: any, error: Error, metrics: ReconcileMetrics): Promise<void> {
+    const isRecoverable =
+      error instanceof ReconcileError ? error.recoverable : true;
+
+    if (isRecoverable) {
+      console.warn(
+        `[Reconciler] Recoverable error on swap ${swap._id}: ${error.message} — will retry next tick`
+      );
+      return;
+    }
+
+    const ageMs = Date.now() - new Date(swap.createdAt).getTime();
+    if (ageMs > MAX_CONFIRMATION_WAIT_MS) {
+      const session = await mongoose.startSession();
+      try {
+        await session.withTransaction(async () => {
+          const lockedSwap = await Transaction.findOne(
+            { _id: swap._id, status: { $in: ['pending', 'processing'] } },
+            null,
+            { session }
+          );
+          if (lockedSwap) {
+            await this.failSwap(lockedSwap, session, metrics);
+          }
+        });
+      } catch (txError) {
+        console.error(`[Reconciler] Failed to mark timed-out swap ${swap._id} as failed:`, txError);
+      } finally {
+        await session.endSession();
+      }
+    }
+  }
+
+  // ─── Withdrawals ───────────────────────────────────────────────────────
+
+  private async reconcileWithdrawals(metrics: ReconcileMetrics): Promise<void> {
+    const pendingWithdrawals = await Transaction.find({
+      type: 'withdrawal' as TransactionType,
+      status: { $in: ['pending', 'processing'] as TransactionStatus[] },
+      createdAt: { $gte: new Date(Date.now() - MAX_CONFIRMATION_WAIT_MS) },
+    })
+      .sort({ createdAt: 1 })
+      .limit(BATCH_SIZE)
+      .lean();
+
+    for (const withdrawal of pendingWithdrawals) {
+      if (this.shuttingDown) break;
+      metrics.processed++;
+
+      if (!withdrawal.txHash || !withdrawal.toAddress) {
+        metrics.skipped++;
+        continue;
+      }
+
+      try {
+        // txHash is wallet-side (waitForTransaction); verify at the
+        // sender wallet, not the destination. Underscore seqno refs are
+        // handled inside the verifier. Fall back to toAddress if the
+        // wallet cannot be resolved.
+        let verifyAddress = withdrawal.toAddress as string;
+        try {
+          const wUser = await User.findById(withdrawal.userId).lean();
+          if (wUser) {
+            const wAddr = await this.walletService.getAddress(wUser.telegramId);
+            if (wAddr) verifyAddress = wAddr;
+          }
+        } catch { /* fall back to toAddress */ }
+
+        const verified = await this.verifier.verifyTransaction(
+          withdrawal.txHash,
+          verifyAddress
+        );
+
+        if (verified === 'pending') {
+          metrics.skipped++;
+          continue;
+        }
+
+        if (verified === 'confirmed') {
+          await Transaction.findByIdAndUpdate(withdrawal._id, {
+            status: 'completed',
+            reconciledAt: new Date(),
+          });
+          metrics.confirmed++;
+          continue;
+        }
+
+        // failed
+        await Transaction.findByIdAndUpdate(withdrawal._id, {
+          status: 'failed',
+          metadata: {
+            ...(withdrawal.metadata || {}),
+            onChainFailure: true,
+            error: 'Withdrawal transaction failed on-chain',
+          },
+        });
+        metrics.failed++;
+      } catch (error) {
+        console.warn(
+          `[Reconciler] Withdrawal verification error for ${withdrawal._id}:`,
+          (error as Error).message
+        );
+      }
+    }
+  }
+
+  // ─── Deposits ──────────────────────────────────────────────────────────
+
+  private async reconcileDeposits(metrics: ReconcileMetrics): Promise<void> {
+    const pendingDeposits = await Transaction.find({
+      type: 'deposit' as TransactionType,
+      status: 'pending' as TransactionStatus,
+      txHash: { $exists: true, $ne: '' },
+      createdAt: { $gte: new Date(Date.now() - MAX_CONFIRMATION_WAIT_MS) },
+    })
+      .sort({ createdAt: 1 })
+      .limit(BATCH_SIZE)
+      .lean();
+
+    for (const deposit of pendingDeposits) {
+      if (this.shuttingDown) break;
+
+      try {
+        const amount = BigInt(deposit.amount || '0');
+        if (amount <= 0n) continue;
+
+        // Atomic claim — prevents double-credit when the monitor and the
+        // reconciler both observe the same deposit.
+        const claimed = await Transaction.findOneAndUpdate(
+          { _id: deposit._id, status: 'pending' },
+          { $set: { status: 'processing' } },
+          { new: true }
+        );
+        if (!claimed) {
+          console.log(`ATF deposit check for ${deposit.fromAddress || ''}: deposit already recorded by another check (safe, no double-credit).`);
+          continue;
+        }
+
+        /**
+         * FIX A: platform-internal inflows are never user deposits.
+         * Absorb any pre-fix records silently without crediting.
+         */
+        if (deposit.fromAddress && isInternalSender(deposit.fromAddress)) {
+          await Transaction.findByIdAndUpdate(deposit._id, {
+            status: 'completed',
+            reconciledAt: new Date(),
+          });
+          continue;
+        }
+
+        const user = await User.findById(deposit.userId);
+        if (!user) {
+          await Transaction.findByIdAndUpdate(deposit._id, { status: 'failed' });
+          continue;
+        }
+
+        const balanceKey = deposit.asset === 'TON' ? 'tonBalance' : 'atfBalance';
+        const current = BigInt(user[balanceKey] || '0');
+        user[balanceKey] = Precision.add(current, amount).toString();
+        await user.save();
+
+        await Transaction.findByIdAndUpdate(deposit._id, {
+          status: 'completed',
+          reconciledAt: new Date(),
+        });
+
+        console.log(`TON deposit credited: ${amount.toString()} nanoTON to user ${user.telegramId}`);
+        metrics.confirmed++;
+      } catch (error) {
+        console.error(`[Reconciler] Deposit credit failed for ${deposit._id}:`, error);
+      }
+    }
+  }
+
+  // ─── Fee transfers ─────────────────────────────────────────────────────
+
+  private async reconcileFeeTransfers(metrics: ReconcileMetrics): Promise<void> {
+    const pendingFees = await Transaction.find({
+      type: 'fee_transfer' as TransactionType,
+      status: 'processing' as TransactionStatus,
+      txHash: { $exists: true, $ne: '' },
+      createdAt: { $gte: new Date(Date.now() - MAX_CONFIRMATION_WAIT_MS) },
+    })
+      .sort({ createdAt: 1 })
+      .limit(BATCH_SIZE)
+      .lean();
+
+    for (const fee of pendingFees) {
+      if (this.shuttingDown) break;
+      metrics.processed++;
+
+      try {
+        const verified = await this.verifier.verifyTransaction(
+          fee.txHash as string,
+          fee.toAddress || config.adminFeeWalletAddress
+        );
+
+        if (verified === 'pending') {
+          metrics.skipped++;
+          continue;
+        }
+
+        await Transaction.findByIdAndUpdate(fee._id, {
+          status: verified === 'confirmed' ? 'completed' : 'failed',
+          reconciledAt: verified === 'confirmed' ? new Date() : undefined,
+        });
+        metrics.confirmed++;
+      } catch (error) {
+        console.warn(
+          `[Reconciler] Fee transfer verification error for ${fee._id}:`,
+          (error as Error).message
+        );
+      }
+    }
+
+    await this.claimFeeTransfer(metrics);
+  }
+
+  /**
+   * Re-queues orphaned fee_transfer records stuck in 'processing' (e.g.
+   * after a worker crash between claim and broadcast) once their lock is
+   * stale. Platform-fee records (type 'fee') are NOT touched here — they
+   * belong to the FeeCollectionService (reconcileUncertainFees).
+   */
+  private async claimFeeTransfer(metrics: ReconcileMetrics): Promise<void> {
+    const stale = await Transaction.find({
+      type: 'fee_transfer' as TransactionType,
+      status: 'processing' as TransactionStatus,
+      txHash: { $exists: false },
+      updatedAt: { $lt: new Date(Date.now() - 5 * 60 * 1000) },
+    })
+      .limit(BATCH_SIZE)
+      .lean();
+
+    for (const fee of stale) {
+      if (this.shuttingDown) break;
+
+      await Transaction.updateOne(
+        { _id: fee._id, status: 'processing', txHash: { $exists: false } },
+        { $set: { status: 'pending' } }
+      );
+      metrics.skipped++;
+    }
+  }
+}
+
+// ─── Singleton ─────────────────────────────────────────────────────────────
+
+const service = new ReconciliationService();
+
+export async function startReconciler(): Promise<void> {
+  await service.start();
+}
+
+export function stopReconciler(): void {
+  service.stop();
+      }
+
+            
