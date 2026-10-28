@@ -5,10 +5,25 @@ import { GasRecoveryService } from '../services/gas-recovery-service';
 import { config } from '../config';
 import { gasRecoveryGate, platformFeeKey, outputFeeKey } from '../services/fee-record-policy';
 
+/** Identical non-success log lines for the same swap repeat at most this often. */
+const LOG_REPEAT_MS = 10 * 60 * 1000;
+
 export class GasRecoveryRetryJob {
   private timer: NodeJS.Timeout | null = null;
   private running = false;
   private gasRecovery = new GasRecoveryService();
+  // swapId -> last logged message key + time (log throttling only; no effect
+  // on retry cadence or recovery behavior).
+  private lastLogged = new Map<string, { key: string; at: number }>();
+
+  /** True when this message is new for the swap, or 10 min passed since it was last logged. */
+  private shouldLog(swapId: string, key: string): boolean {
+    const prev = this.lastLogged.get(swapId);
+    const now = Date.now();
+    if (prev && prev.key === key && now - prev.at < LOG_REPEAT_MS) return false;
+    this.lastLogged.set(swapId, { key, at: now });
+    return true;
+  }
 
   start(): void {
     if (this.timer) return;
@@ -101,6 +116,12 @@ export class GasRecoveryRetryJob {
         .limit(100)
         .lean();
 
+      // Forget throttle state for swaps that are no longer retry candidates.
+      const live = new Set(candidates.map((c: any) => c._id.toString()));
+      for (const id of Array.from(this.lastLogged.keys())) {
+        if (!live.has(id)) this.lastLogged.delete(id);
+      }
+
       for (const swap of candidates) {
         try {
           const metadata = (swap.metadata || {}) as Record<string, any>;
@@ -141,9 +162,11 @@ export class GasRecoveryRetryJob {
           const user = await User.findById(swap.userId).lean();
 
           if (!user) {
-            console.error(
-              `[GasRecoveryRetry] User not found for swap ${swap._id}`
-            );
+            if (this.shouldLog(swap._id.toString(), 'no-user')) {
+              console.error(
+                `[GasRecoveryRetry] User not found for swap ${swap._id}`
+              );
+            }
             continue;
           }
 
@@ -168,9 +191,11 @@ export class GasRecoveryRetryJob {
           }
 
           if (!walletAddress) {
-            console.error(
-              `[GasRecoveryRetry] Cannot resolve original gas wallet for swap ${swap._id}`
-            );
+            if (this.shouldLog(swap._id.toString(), 'no-wallet')) {
+              console.error(
+                `[GasRecoveryRetry] Cannot resolve original gas wallet for swap ${swap._id}`
+              );
+            }
             continue;
           }
 
@@ -180,31 +205,39 @@ export class GasRecoveryRetryJob {
             walletAddress,
           });
 
-          if (
-            result.recoveredThisAttemptNano > 0n ||
-            result.status !== 'completed'
-          ) {
-            console.log(
-              `[GasRecoveryRetry] Swap ${swap._id}: ` +
-                `status=${result.status}, ` +
-                `recovered=${result.recoveredThisAttemptNano} nanoTON, ` +
-                `total=${result.totalRecoveredNano} nanoTON, ` +
-                `pending=${result.pendingNano} nanoTON` +
-                (result.skippedReason
-                  ? ` (${result.skippedReason})`
-                  : '')
-            );
+          const line =
+            `[GasRecoveryRetry] Swap ${swap._id}: ` +
+            `status=${result.status}, ` +
+            `recovered=${result.recoveredThisAttemptNano} nanoTON, ` +
+            `total=${result.totalRecoveredNano} nanoTON, ` +
+            `pending=${result.pendingNano} nanoTON` +
+            (result.skippedReason ? ` (${result.skippedReason})` : '');
+
+          if (result.recoveredThisAttemptNano > 0n) {
+            // Successful recovery: always log immediately.
+            this.lastLogged.delete(swap._id.toString());
+            console.log(line);
+          } else if (result.status !== 'completed') {
+            // Same outcome as last time → at most once per 10 minutes;
+            // a changed outcome/error is logged immediately.
+            const key =
+              `${result.status}|${result.totalRecoveredNano}|` +
+              `${result.pendingNano}|${result.skippedReason ?? ''}`;
+            if (this.shouldLog(swap._id.toString(), key)) console.log(line);
           }
         } catch (err) {
-          console.error(
-            `[GasRecoveryRetry] Failed for swap ${swap._id}:`,
-            err
-          );
+          const errKey = `err|${(err as any)?.message ?? String(err)}`;
+          if (this.shouldLog(swap._id.toString(), errKey)) {
+            console.error(
+              `[GasRecoveryRetry] Failed for swap ${swap._id}:`,
+              err
+            );
+          }
         }
       }
     } finally {
       this.running = false;
     }
   }
-           }
-              
+      }
+                                  
