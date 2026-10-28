@@ -466,6 +466,11 @@ class ReconciliationService {
       minOutputNano: minOutput,
       ageMs,
       tx: evidence,
+      atf: {
+        preSwapNano: BigInt(meta.preSwapAtfBalanceNano || '0'),
+        nowNano: balances.atf,
+        expectedInputNano: BigInt(meta.quote?.offerUnits || '0'),
+      },
     });
   }
 
@@ -943,4 +948,4 @@ export function stopReconciler(): void {
   service.stop();
       }
 
-            
+                                  
