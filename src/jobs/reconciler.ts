@@ -428,7 +428,15 @@ class ReconciliationService {
     );
 
     const balances = await this.walletService.getBalance(walletAddress);
-    const ageMs = Date.now() - new Date(swap.createdAt).getTime();
+    // Grace window runs from the BROADCAST, not from record creation. ATF→TON
+    // swaps queue for the admin gas advance and wait for wallet confirmation
+    // before broadcasting, so createdAt is often minutes old: measuring from
+    // it made the 90s grace already expired on the first tick, and a swap
+    // the DEX had not settled yet was declared failed (→ no fee, gas clawed
+    // back, internal balance refunded).
+    const broadcastMs = meta.broadcastedAt ? Date.parse(String(meta.broadcastedAt)) : NaN;
+    const startMs = Number.isFinite(broadcastMs) ? broadcastMs : new Date(swap.createdAt).getTime();
+    const ageMs = Math.max(0, Date.now() - startMs);
 
     if (isTonToAtf) {
       // Expected: ATF balance increased
@@ -948,4 +956,4 @@ export function stopReconciler(): void {
   service.stop();
       }
 
-                                  
+      
