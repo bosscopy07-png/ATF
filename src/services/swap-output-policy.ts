@@ -37,6 +37,16 @@ export interface AtfToTonEvidence {
   ageMs: number;
   graceMs?: number;
   tx: WalletTxEvidence;
+  /**
+   * Token-side proof (independent of gas accounting): the offered jettons
+   * must have LEFT the wallet and not come back. STON.fi either swaps them
+   * (output ≥ minOutput is enforced by the contract) or refunds them.
+   */
+  atf?: {
+    preSwapNano: bigint;
+    nowNano: bigint;
+    expectedInputNano: bigint; // quote.offerUnits (net swapped amount)
+  };
 }
 
 export interface OutputVerdict {
@@ -70,6 +80,31 @@ export function evaluateAtfToTonOutput(e: AtfToTonEvidence): OutputVerdict {
     return { status: 'failed', actualOutputBaseUnits: 0n, method: 'no_swap_message_sent' };
   }
 
+  // Token-side evidence. Used when present because TON balance deltas are
+  // unreliable here: STON.fi consumes part of the attached gas, so
+  // (balance + fees − pre) can be negative even for a successful swap.
+  if (e.atf && e.atf.expectedInputNano > 0n && e.minOutputNano > 0n) {
+    const drop = e.atf.preSwapNano > e.atf.nowNano ? e.atf.preSwapNano - e.atf.nowNano : 0n;
+    const lower =
+      e.tx.state === 'found' && e.tx.feesNano !== null
+        ? e.balanceTonNano + e.tx.feesNano - e.preSwapTonNano
+        : 0n;
+
+    if (drop * 100n >= e.atf.expectedInputNano * 99n) {
+      if (e.ageMs < grace) {
+        return { status: 'pending', actualOutputBaseUnits: 0n, method: 'atf_left_waiting_refund_window' };
+      }
+      // Tokens consumed and not refunded → swap executed. The contract
+      // guarantees output ≥ minOutput; credit the larger PROVEN bound.
+      const proven = lower > e.minOutputNano ? lower : e.minOutputNano;
+      return { status: 'success', actualOutputBaseUnits: proven, method: 'atf_consumed_min_output_guaranteed' };
+    }
+    if (e.ageMs >= grace && drop * 100n <= e.atf.expectedInputNano) {
+      return { status: 'failed', actualOutputBaseUnits: 0n, method: 'atf_not_consumed' };
+    }
+    return { status: 'pending', actualOutputBaseUnits: 0n, method: 'atf_partial_or_waiting' };
+  }
+
   if (e.tx.state !== 'found' || e.tx.feesNano === null) {
     return { status: 'pending', actualOutputBaseUnits: 0n, method: 'fees_unreadable' };
   }
@@ -93,4 +128,5 @@ export function evaluateAtfToTonOutput(e: AtfToTonEvidence): OutputVerdict {
   }
 
   return { status: 'pending', actualOutputBaseUnits: adjusted, method: 'inconclusive_partial_gain' };
-      }
+  }
+            
