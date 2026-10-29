@@ -1130,4 +1130,5 @@ export class FeeCollectorJob {
       this.running = false;
     }
   }
-}
+        }
+              
