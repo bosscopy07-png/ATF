@@ -312,10 +312,19 @@ class ReconciliationService {
         // different hash. Verify at the wallet address.
         const verifyAddress = (swapMeta.walletAddress || swap.toAddress) as string;
 
-        const verified = await this.verifier.verifyTransaction(
+        let verified = await this.verifier.verifyTransaction(
           swap.txHash,
           verifyAddress
         );
+
+        // The wallet-tx check can read 'failed' even though the swap ran.
+        // For ATF→TON the token side is the authority: if the ATF actually
+        // left the wallet, the swap is NOT failed — let detectSwapOutput decide.
+        if (verified === 'failed' && swapMeta.swapDirection === 'atf_to_ton') {
+          const left = await this.atfLeftWallet(swapMeta);
+          console.log(`[Reconciler] Swap ${swap._id}: wallet-tx check said failed; ATF left wallet=${left}`);
+          if (left) verified = 'confirmed';
+        }
 
         if (verified === 'pending') {
           metrics.skipped++;
@@ -346,6 +355,11 @@ class ReconciliationService {
           metrics.skipped++;
           continue;
         }
+
+        console.log(
+          `[Reconciler] Swap ${swap._id} outcome=${outcome.status} method=${outcome.method} ` +
+            `actualOutput=${outcome.actualOutputBaseUnits}`
+        );
 
         let postCommit = undefined as (() => Promise<void>) | undefined;
         const session = await mongoose.startSession();
@@ -387,6 +401,21 @@ class ReconciliationService {
       } catch (error) {
         await this.handleSwapError(swap, error as Error, metrics);
       }
+    }
+  }
+
+  /** True when the offered ATF has left the swap wallet (>= 99% of the swapped amount). */
+  private async atfLeftWallet(meta: Record<string, any>): Promise<boolean> {
+    try {
+      const wallet = (meta.walletAddress || '') as string;
+      const expected = BigInt(meta.quote?.offerUnits || '0');
+      if (!wallet || expected <= 0n) return false;
+      const balances = await this.walletService.getBalance(wallet);
+      const pre = BigInt(meta.preSwapAtfBalanceNano || '0');
+      const drop = pre > balances.atf ? pre - balances.atf : 0n;
+      return drop * 100n >= expected * 99n;
+    } catch {
+      return false;
     }
   }
 
@@ -934,4 +963,4 @@ export function stopReconciler(): void {
   service.stop();
       }
 
-  
+            
