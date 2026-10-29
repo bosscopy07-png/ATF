@@ -38,7 +38,7 @@ function isInternalSender(address: string): boolean {
 }
 
 
-const RECONCILE_INTERVAL_MS = 30_000;
+const RECONCILE_INTERVAL_MS = 10_000; // was 30s: swaps settle ~10s after broadcast
 
 // Reconciliation must never abandon a swap by age while it is still
 // pending/processing — a stranded swap meant a stranded platform fee.
@@ -170,38 +170,22 @@ class OnChainVerifier {
     }
   }
 
-  /**
-   * Reads the swap's WALLET-side transaction and returns the evidence the
-   * output decision needs: the real total fees (`tx.totalFees.coins` —
-   * totalFees is a CurrencyCollection, not a bigint) and how many
-   * outbound messages the wallet actually emitted.
-   *
-   * 'unreadable' is returned for tracking-ref hashes ("addr_seqno"),
-   * RPC failures, and when the tx is not in the fetched window. It is
-   * NEVER mapped to zero fees: callers must keep the swap unresolved.
-   */
+  /** Wallet-side tx evidence (real fees via totalFees.coins, outbound message count). */
   async inspectWalletTx(txHash: string, walletAddress?: string): Promise<WalletTxEvidence> {
     if (!walletAddress || txHash.includes('_')) return { state: 'unreadable' };
-
     try {
       const addr = Address.parse(walletAddress);
       const transactions = await this.withRetry(() =>
         this.client.getTransactions(addr, { limit: 100 })
       );
-
       for (const tx of transactions) {
         if (tx.hash().toString('hex') === txHash) {
-          return {
-            state: 'found',
-            feesNano: txTotalFeesNano(tx),
-            outMessages: txOutMessageCount(tx),
-          };
+          return { state: 'found', feesNano: txTotalFeesNano(tx), outMessages: txOutMessageCount(tx) };
         }
       }
     } catch {
       // fall through
     }
-
     return { state: 'unreadable' };
   }
 
@@ -428,12 +412,9 @@ class ReconciliationService {
     );
 
     const balances = await this.walletService.getBalance(walletAddress);
-    // Grace window runs from the BROADCAST, not from record creation. ATF→TON
-    // swaps queue for the admin gas advance and wait for wallet confirmation
-    // before broadcasting, so createdAt is often minutes old: measuring from
-    // it made the 90s grace already expired on the first tick, and a swap
-    // the DEX had not settled yet was declared failed (→ no fee, gas clawed
-    // back, internal balance refunded).
+    // Grace runs from the BROADCAST. createdAt is often minutes old for
+    // ATF→TON (queue + gas advance), which made the 90s grace already
+    // expired on the first tick and a still-settling swap was marked failed.
     const broadcastMs = meta.broadcastedAt ? Date.parse(String(meta.broadcastedAt)) : NaN;
     const startMs = Number.isFinite(broadcastMs) ? broadcastMs : new Date(swap.createdAt).getTime();
     const ageMs = Math.max(0, Date.now() - startMs);
@@ -458,15 +439,11 @@ class ReconciliationService {
       };
     }
 
-    // ATF → TON. A consumed wallet message is NOT proof of output: the
-    // verdict comes only from the wallet's real tx fees plus its TON
-    // balance change (see evaluateAtfToTonOutput). The attached
-    // swapValueNano is never added back — STON.fi refunds part of it, so
-    // that inflated output. Unreadable evidence leaves the swap pending.
-    const evidence = await this.verifier.inspectWalletTx(
-      swap.txHash as string,
-      walletAddress
-    );
+    // ATF → TON: success when the ATF actually left the wallet and was not
+    // refunded (STON.fi guarantees output >= minOutput); failure when it came
+    // back / never left. TON balance deltas alone are unreliable because the
+    // DEX consumes part of the attached gas.
+    const evidence = await this.verifier.inspectWalletTx(swap.txHash as string, walletAddress);
 
     return evaluateAtfToTonOutput({
       balanceTonNano: balances.ton,
@@ -573,21 +550,21 @@ class ReconciliationService {
     return async () => {
       const meta = swap.metadata as any;
 
-      // ── Steps 1 + 2 FIRST: input/platform fee, then the token→TON output
-      // fee — while the wallet is still flush with the advance leftover.
-      // Neither return value is trusted as "settled": GasRecoveryService
-      // re-reads the DURABLE fee records and refuses to claw back until both
-      // required fees are completed (or waived after a long no-gas block).
+      // ── Steps 1 + 2 FIRST: platform fees — while the wallet is flush
+      // (advance leftover + swap output) and can definitely afford the
+      // 0.1 TON attach the jetton fee transfer needs. Running the gas
+      // clawback first could drain the wallet below that threshold on
+      // small swaps, silently blocking fee collection forever.
       const { FeeCollectionService } = await import('../services/fee-collection-service');
       await new FeeCollectionService().collectSwapFee(swapId);
 
-      // ── Step 3 LAST: claw back the remaining gas advance. Idempotent and
-      // re-entrant; the GasRecoveryRetry job resumes anything deferred.
+      // ── Step 3 LAST: claw back the admin gas advance — it takes
+      // whatever platform TON remains (still ≈0.28 minus fee gas).
+      // recoverAdminGasSafely is idempotent and re-entrant; the
+      // GasRecoveryRetry job resumes anything the 3 attempts miss.
       if (meta.gasAdvanceTxId || meta.gasRecoveryWalletAddress) {
         for (let attempt = 1; attempt <= 3; attempt++) {
           try {
-            // A deferral behind an unsettled fee is a normal result (not a
-            // throw): the GasRecoveryRetry job owns the follow-up.
             await this.gasRecovery.recoverAdminGasSafely({
               swapTransactionId: swapId,
               userId: swap.userId,
@@ -597,6 +574,7 @@ class ReconciliationService {
           } catch (err) {
             console.error(`[Reconciler] Gas recovery attempt ${attempt} failed:`, err);
             if (attempt < 3) await new Promise((r) => setTimeout(r, 2000));
+            // after 3 failures leave it — the GasRecoveryRetry job resumes.
           }
         }
       }
@@ -956,4 +934,4 @@ export function stopReconciler(): void {
   service.stop();
       }
 
-      
+  
