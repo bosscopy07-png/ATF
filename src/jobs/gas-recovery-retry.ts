@@ -239,5 +239,5 @@ export class GasRecoveryRetryJob {
       this.running = false;
     }
   }
-      }
-                                  
+          }
+            
