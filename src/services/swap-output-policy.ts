@@ -1,3 +1,4 @@
+
 /**
  * swap-output-policy — pure (no SDK / DB / RPC) decision helpers for
  * proving what a swap actually produced. Kept dependency-free so the
@@ -36,6 +37,8 @@ export interface AtfToTonEvidence {
   minOutputNano: bigint;
   ageMs: number;
   graceMs?: number;
+  /** How long after broadcast the ATF must stay gone (no refund) before success. */
+  atfSettleMs?: number;
   tx: WalletTxEvidence;
   /**
    * Token-side proof (independent of gas accounting): the offered jettons
@@ -75,6 +78,7 @@ export interface OutputVerdict {
  */
 export function evaluateAtfToTonOutput(e: AtfToTonEvidence): OutputVerdict {
   const grace = e.graceMs ?? 90_000;
+  const settle = e.atfSettleMs ?? 10_000;
 
   if (e.tx.state === 'found' && e.tx.outMessages === 0) {
     return { status: 'failed', actualOutputBaseUnits: 0n, method: 'no_swap_message_sent' };
@@ -91,7 +95,7 @@ export function evaluateAtfToTonOutput(e: AtfToTonEvidence): OutputVerdict {
         : 0n;
 
     if (drop * 100n >= e.atf.expectedInputNano * 99n) {
-      if (e.ageMs < grace) {
+      if (e.ageMs < settle) {
         return { status: 'pending', actualOutputBaseUnits: 0n, method: 'atf_left_waiting_refund_window' };
       }
       // Tokens consumed and not refunded → swap executed. The contract
