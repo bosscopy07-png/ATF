@@ -7,16 +7,6 @@ import { WalletService } from './wallet-service';
 import { Precision } from '../utils/precision';
 import { config, TON_DECIMALS } from '../config';
 import { acquireLock } from '../utils/distributed-lock';
-import { TonClient, Address } from '@ton/ton';
-import {
-  gasRecoveryGate,
-  platformFeeKey,
-  outputFeeKey,
-  GasRecoveryGate,
-} from './fee-record-policy';
-
-/** A previous clawback that never showed up on-chain may only be replaced after this. */
-const RECOVERY_REPLACE_AFTER_MS = 10 * 60 * 1000;
 
 export type GasRecoveryStatus =
   | 'pending'
@@ -91,73 +81,6 @@ export class GasRecoveryService {
     }
   }
 
-  private _tonClient: TonClient | null = null;
-
-  protected get tonClient(): TonClient {
-    if (!this._tonClient) {
-      this._tonClient = new TonClient({
-        endpoint: (config as any).tonFeeRpcUrl ?? config.tonRpcUrl,
-        apiKey: config.tonApiKey,
-      });
-    }
-    return this._tonClient;
-  }
-
-  /**
-   * Durable-state gate. Failed swaps are always eligible (no fee is ever
-   * owed). Successful swaps are eligible only once every required fee
-   * record (platform + token→TON output) is durably completed — read from
-   * the fee RECORDS, never from the swap.feeStatus mirror or a return value.
-   */
-  protected async evaluateGate(record: GasAdvanceRecord): Promise<GasRecoveryGate> {
-    const id = record.swapTransactionId;
-    const swap: any = await Transaction.findById(id).lean();
-    if (!swap) return { eligible: false, reason: 'swap_unresolved' };
-
-    const recs: any[] = await Transaction.find({
-      type: 'fee',
-      'metadata.feeKey': { $in: [platformFeeKey(id), outputFeeKey(id)] },
-    }).lean();
-    const byKey = (k: string) => recs.find((r) => r.metadata && r.metadata.feeKey === k);
-
-    return gasRecoveryGate(
-      swap,
-      { platform: byKey(platformFeeKey(id)), output: byKey(outputFeeKey(id)) },
-      Date.now()
-    );
-  }
-
-  /**
-   * Did an earlier clawback land on-chain? Looks at the ADMIN wallet's
-   * inbound transactions for an internal message from the advance wallet of
-   * ≥ ~amount since the broadcast. Throws on RPC failure (caller must not
-   * replace a transfer it could not rule out).
-   */
-  protected async findLandedRecovery(
-    fromAddress: string,
-    toAddress: string,
-    amount: bigint,
-    sinceUtime: number
-  ): Promise<boolean> {
-    const from = Address.parse(fromAddress).toString({ bounceable: false });
-    const txs = await this.tonClient.getTransactions(Address.parse(toAddress), { limit: 100 });
-    const floor = amount - amount / 20n;
-
-    for (const tx of txs) {
-      if (((tx as any).utime ?? 0) < sinceUtime) continue;
-      const im: any = tx.inMessage;
-      if (!im || im.info?.type !== 'internal') continue;
-      const src = im.info.src?.toString ? im.info.src.toString({ bounceable: false }) : '';
-      if (src !== from) continue;
-      const value: bigint = im.info.value?.coins ?? 0n;
-      if (value < floor) continue;
-      const desc: any = tx.description;
-      if (desc?.aborted || desc?.computePhase?.success === false) continue;
-      return true;
-    }
-    return false;
-  }
-
   async recoverAdminGasSafely(record: GasAdvanceRecord): Promise<RecoveryResult> {
     const lock = await acquireLock(
       `lock:ton-gas:${record.walletAddress}`,
@@ -184,19 +107,6 @@ export class GasRecoveryService {
   private async recoverAdminGasSafelyUnlocked(
     record: GasAdvanceRecord
   ): Promise<RecoveryResult> {
-    // ── ORDERING GATE (successful swaps wait for durable fee settlement) ──
-    const gate = await this.evaluateGate(record);
-    if (!gate.eligible) {
-      const meta0 = ((await Transaction.findById(record.swapTransactionId).lean())?.metadata || {}) as Record<string, any>;
-      return {
-        status: 'pending',
-        recoveredThisAttemptNano: 0n,
-        totalRecoveredNano: BigInt(meta0.gasRecoveredAmountNano || '0'),
-        pendingNano: BigInt(meta0.gasRecoveryPendingAmountNano || '0'),
-        skippedReason: `Gas recovery deferred: ${gate.reason}`,
-      };
-    }
-
     // FIX B: pipeline update — $toInt normalizes legacy BOOLEAN values
     // written by older swap-service code (true → 1) so the attempt counter
     // can never crash the retry job with:
@@ -285,37 +195,25 @@ export class GasRecoveryService {
        */
       const lastTxHash = meta.gasRecoveryLastTxHash as string | undefined;
       if (lastTxHash) {
-        // Amount that transfer actually carried (persisted at broadcast).
-        // Legacy records without it fall back to the outstanding amount but
-        // can never credit more than that.
-        const lastAmount = meta.gasRecoveryLastAmountNano
-          ? min2(BigInt(meta.gasRecoveryLastAmountNano), stillOwed)
-          : stillOwed;
-        const broadcastAtMs = meta.gasRecoveryLastBroadcastAt
-          ? Date.parse(meta.gasRecoveryLastBroadcastAt)
-          : NaN;
-        const sinceUtime = Number.isFinite(broadcastAtMs)
-          ? Math.floor(broadcastAtMs / 1000) - 120
-          : 0;
-
-        // Throws on RPC failure → catch path keeps the ref; never replaces blindly.
-        const landed = await this.findLandedRecovery(
+        const pendingNow = stillOwed;
+        const [fromNow, toNow] = await Promise.all([
+          this.walletService.getTonBalanceStrict(record.walletAddress),
+          this.walletService.getTonBalanceStrict(config.adminFeeWalletAddress),
+        ]);
+        const landed = await this.verifyTonDelivery(
           record.walletAddress,
           config.adminFeeWalletAddress,
-          lastAmount,
-          sinceUtime
+          fromNow,
+          toNow,
+          pendingNow
         );
-
         if (landed) {
-          const newRecovered = recovered + lastAmount;
-          const pendingAfter = advanced > newRecovered + writtenOff
-            ? advanced - (newRecovered + writtenOff)
-            : 0n;
+          const newRecovered = recovered + pendingNow;
           await Transaction.create({
             userId: claimed.userId,
             type: 'fee_transfer',
             asset: 'TON',
-            amount: lastAmount.toString(),
+            amount: pendingNow.toString(),
             status: 'completed',
             toAddress: config.adminFeeWalletAddress,
             txHash: lastTxHash,
@@ -324,46 +222,28 @@ export class GasRecoveryService {
               description: 'Recovery of TON advanced by admin for ATF -> TON swap (late-confirmed transfer)',
               swapTxId: record.swapTransactionId,
               walletAddress: record.walletAddress,
-              recoveredAmountNano: lastAmount.toString(),
+              recoveredAmountNano: pendingNow.toString(),
               gasAdvanceAmountNano: advanced.toString(),
               swapOutcome: meta.swapOutcome || 'unknown',
             },
           });
           await Transaction.updateOne(
             { _id: record.swapTransactionId },
-            {
-              $unset: {
-                'metadata.gasRecoveryLastTxHash': '',
-                'metadata.gasRecoveryLastAmountNano': '',
-                'metadata.gasRecoveryLastBroadcastAt': '',
-              },
-            }
+            { $unset: { 'metadata.gasRecoveryLastTxHash': '' } }
           );
           return this.settle(
             claimed,
-            pendingAfter > 0n ? 'partial' : 'completed',
-            lastAmount,
+            'completed',
+            pendingNow,
             newRecovered,
-            pendingAfter,
+            0n,
             undefined,
             lastTxHash
           );
         }
-
-        // Not seen yet. A broadcast can still land for a while: replace it
-        // only after it is old enough that it provably cannot.
-        if (!Number.isFinite(broadcastAtMs) || Date.now() - broadcastAtMs < RECOVERY_REPLACE_AFTER_MS) {
-          if (Number.isFinite(broadcastAtMs)) {
-            throw new Error(
-              `Previous gas recovery transfer (${lastTxHash}) not yet visible on-chain; ` +
-              `waiting before any replacement`
-            );
-          }
-        }
-        // Old enough and absent on-chain → a replacement is safe below.
+        // Not landed → fall through and broadcast a replacement below.
       }
-
-      const balanceIncrease = currentBalance > preAdvance
+            const balanceIncrease = currentBalance > preAdvance
         ? currentBalance - preAdvance
         : 0n;
 
@@ -398,15 +278,19 @@ export class GasRecoveryService {
         );
       }
 
-      // Reserve: only the recovery transfer's own fee + buffers. By the time
-      // a successful swap reaches this point every required fee transfer is
-      // durably settled (gate above), so no fee-transfer gas needs protecting;
-      // a failed swap never owes a fee. (The old blanket +0.1 TON "fee
-      // unsettled" reserve starved failed swaps, which never settle a fee.)
+      // ── FEE FIRST ── While the platform fee is unsettled, leave the
+      // jetton fee attach (0.1 TON) in the wallet even if this recovery
+      // runs before the fee. The retry job also defers such swaps; this
+      // reserve is the second line of defence so the fee can never be
+      // starved of gas by a clawback.
+      const feeUnsettled =
+        BigInt(claimed.fee || '0') > 0n && claimed.feeStatus !== 'completed';
+
       const reserve =
         config.tonTransferFeeReserveNano +
         config.gasRecoveryBufferNano +
-        config.gasRecoveryMinBalanceNano;
+        config.gasRecoveryMinBalanceNano +
+        (feeUnsettled ? config.minTonForFeeTransferNano : 0n);
 
       const maxSendable = currentBalance > reserve
         ? currentBalance - reserve
@@ -444,20 +328,6 @@ export class GasRecoveryService {
         record.walletAddress,
         config.adminFeeWalletAddress,
         safeRecoverable
-      );
-
-      // Persist the broadcast IMMEDIATELY (hash + exact amount + time): a
-      // crash/restart from here on is resolved by on-chain lookup, never by
-      // a blind second clawback.
-      await Transaction.updateOne(
-        { _id: record.swapTransactionId },
-        {
-          $set: {
-            'metadata.gasRecoveryLastTxHash': txHash,
-            'metadata.gasRecoveryLastAmountNano': safeRecoverable.toString(),
-            'metadata.gasRecoveryLastBroadcastAt': new Date().toISOString(),
-          },
-        }
       );
 
       const delivered = await this.verifyTonDelivery(
@@ -510,13 +380,7 @@ export class GasRecoveryService {
       // A fresh confirmed transfer supersedes any older unconfirmed ref.
       await Transaction.updateOne(
         { _id: record.swapTransactionId },
-        {
-          $unset: {
-            'metadata.gasRecoveryLastTxHash': '',
-            'metadata.gasRecoveryLastAmountNano': '',
-            'metadata.gasRecoveryLastBroadcastAt': '',
-          },
-        }
+        { $unset: { 'metadata.gasRecoveryLastTxHash': '' } }
       );
 
       return this.settle(
@@ -537,7 +401,6 @@ export class GasRecoveryService {
         ? advanced - (recovered + writtenOff)
         : 0n;
 
-      
       await Transaction.findByIdAndUpdate(record.swapTransactionId, {
         $set: {
           'metadata.gasRecoveryStatus': recovered > 0n ? 'partial' : 'pending',
@@ -642,4 +505,5 @@ function min2(a: bigint, b: bigint): bigint {
 
 export function gasTonToNano(gasTon: string): bigint {
   return Precision.toBaseUnits(gasTon, TON_DECIMALS);
-}
+        }
+      
