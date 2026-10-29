@@ -255,9 +255,16 @@ export class GasRecoveryService {
        * amount that remains in the wallet.
        */
       const swapSucceeded = meta.swapOutcome === 'success';
-      const actualUserOutput = swapSucceeded
-        ? BigInt(meta.actualOutputBaseUnits || '0')
-        : 0n;
+      // Business rule: the gas advance is a debt the user repays in full
+      // whenever the wallet can pay. After a successful swap the wallet holds
+      // the swap proceeds, and those proceeds repay the advance too — they are
+      // no longer carved out (that carve-out left ~0.03 TON unrecovered even
+      // though the wallet could pay). The user's PRE-EXISTING balance is still
+      // protected: only the increase since the advance (balanceIncrease) is
+      // collectable, and the send reserve below is always left behind. If the
+      // wallet cannot cover it, the available part is taken and the rest stays
+      // owed for the next retry (unchanged partial behavior).
+      const actualUserOutput = 0n;
 
       const platformIncrease = balanceIncrease > actualUserOutput
         ? balanceIncrease - actualUserOutput
@@ -505,5 +512,4 @@ function min2(a: bigint, b: bigint): bigint {
 
 export function gasTonToNano(gasTon: string): bigint {
   return Precision.toBaseUnits(gasTon, TON_DECIMALS);
-        }
-      
+}
