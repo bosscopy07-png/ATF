@@ -282,4 +282,5 @@ export function gasRecoveryGate(
     return { eligible: false, reason: 'awaiting_output_fee' };
   }
   return { eligible: true, reason: 'fees_settled' };
-            }
+}
+  
