@@ -128,5 +128,4 @@ export function evaluateAtfToTonOutput(e: AtfToTonEvidence): OutputVerdict {
   }
 
   return { status: 'pending', actualOutputBaseUnits: adjusted, method: 'inconclusive_partial_gain' };
-  }
-            
+}
