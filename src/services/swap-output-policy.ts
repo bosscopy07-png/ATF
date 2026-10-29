@@ -1,4 +1,3 @@
-
 /**
  * swap-output-policy — pure (no SDK / DB / RPC) decision helpers for
  * proving what a swap actually produced. Kept dependency-free so the
@@ -80,10 +79,6 @@ export function evaluateAtfToTonOutput(e: AtfToTonEvidence): OutputVerdict {
   const grace = e.graceMs ?? 90_000;
   const settle = e.atfSettleMs ?? 10_000;
 
-  if (e.tx.state === 'found' && e.tx.outMessages === 0) {
-    return { status: 'failed', actualOutputBaseUnits: 0n, method: 'no_swap_message_sent' };
-  }
-
   // Token-side evidence. Used when present because TON balance deltas are
   // unreliable here: STON.fi consumes part of the attached gas, so
   // (balance + fees − pre) can be negative even for a successful swap.
@@ -109,6 +104,10 @@ export function evaluateAtfToTonOutput(e: AtfToTonEvidence): OutputVerdict {
     return { status: 'pending', actualOutputBaseUnits: 0n, method: 'atf_partial_or_waiting' };
   }
 
+  if (e.tx.state === 'found' && e.tx.outMessages === 0) {
+    return { status: 'failed', actualOutputBaseUnits: 0n, method: 'no_swap_message_sent' };
+  }
+
   if (e.tx.state !== 'found' || e.tx.feesNano === null) {
     return { status: 'pending', actualOutputBaseUnits: 0n, method: 'fees_unreadable' };
   }
@@ -132,4 +131,4 @@ export function evaluateAtfToTonOutput(e: AtfToTonEvidence): OutputVerdict {
   }
 
   return { status: 'pending', actualOutputBaseUnits: adjusted, method: 'inconclusive_partial_gain' };
-}
+    }
