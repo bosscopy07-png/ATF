@@ -537,6 +537,7 @@ export class GasRecoveryService {
         ? advanced - (recovered + writtenOff)
         : 0n;
 
+      
       await Transaction.findByIdAndUpdate(record.swapTransactionId, {
         $set: {
           'metadata.gasRecoveryStatus': recovered > 0n ? 'partial' : 'pending',
@@ -641,5 +642,4 @@ function min2(a: bigint, b: bigint): bigint {
 
 export function gasTonToNano(gasTon: string): bigint {
   return Precision.toBaseUnits(gasTon, TON_DECIMALS);
-          }
-    
+}
