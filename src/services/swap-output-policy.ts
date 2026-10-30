@@ -38,6 +38,8 @@ export interface AtfToTonEvidence {
   graceMs?: number;
   /** How long after broadcast the ATF must stay gone (no refund) before success. */
   atfSettleMs?: number;
+  /** If the ATF has still not left the wallet this long after broadcast, the swap failed. */
+  atfFailMs?: number;
   tx: WalletTxEvidence;
   /**
    * Token-side proof (independent of gas accounting): the offered jettons
@@ -78,6 +80,7 @@ export interface OutputVerdict {
 export function evaluateAtfToTonOutput(e: AtfToTonEvidence): OutputVerdict {
   const grace = e.graceMs ?? 90_000;
   const settle = e.atfSettleMs ?? 10_000;
+  const failAfter = e.atfFailMs ?? 30_000;
 
   // Token-side evidence. Used when present because TON balance deltas are
   // unreliable here: STON.fi consumes part of the attached gas, so
@@ -98,7 +101,13 @@ export function evaluateAtfToTonOutput(e: AtfToTonEvidence): OutputVerdict {
       const proven = lower > e.minOutputNano ? lower : e.minOutputNano;
       return { status: 'success', actualOutputBaseUnits: proven, method: 'atf_consumed_min_output_guaranteed' };
     }
-    if (e.ageMs >= grace && drop * 100n <= e.atf.expectedInputNano) {
+    const notLeft = drop * 100n <= e.atf.expectedInputNano;
+    // Deployment-only / aborted wallet tx (no outbound message) and ATF still
+    // here → no swap was ever submitted: fail NOW so the gas comes back at once.
+    if (notLeft && e.tx.state === 'found' && e.tx.outMessages === 0) {
+      return { status: 'failed', actualOutputBaseUnits: 0n, method: 'no_swap_message_sent' };
+    }
+    if (notLeft && e.ageMs >= failAfter) {
       return { status: 'failed', actualOutputBaseUnits: 0n, method: 'atf_not_consumed' };
     }
     return { status: 'pending', actualOutputBaseUnits: 0n, method: 'atf_partial_or_waiting' };
@@ -131,4 +140,4 @@ export function evaluateAtfToTonOutput(e: AtfToTonEvidence): OutputVerdict {
   }
 
   return { status: 'pending', actualOutputBaseUnits: adjusted, method: 'inconclusive_partial_gain' };
-    }
+}
