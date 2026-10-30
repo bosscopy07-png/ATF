@@ -48,8 +48,12 @@ import {
 type CollectResult = 'collected' | 'pending' | 'skipped' | 'uncertain';
 type DeliveryOutcome = 'delivered' | 'bounced' | 'unknown';
 
-const DELIVERY_POLL_ATTEMPTS = 20;
-const DELIVERY_POLL_INTERVAL_MS = 4_000;
+// Arrival proof is best-effort (it falls back to accepting the broadcast
+// tx's own success). Polling 20 x 4s burned ~80s on EVERY jetton fee before
+// the output fee and the gas clawback could start. 3 x 3s still catches a
+// normal arrival and keeps the whole post-swap sequence to seconds.
+const DELIVERY_POLL_ATTEMPTS = 3;
+const DELIVERY_POLL_INTERVAL_MS = 3_000;
 const JETTON_TRANSFER_OP = 0x0f8a7ea5;
 
 // 0.1 TON — matches the attach sendJetton needs. Configurable; the earlier
@@ -430,7 +434,7 @@ export class FeeCollectionService {
       return 'pending'; // in flight (or just downgraded — resolved on a later tick)
     }
 
-    // ── Atomic claim: the ONLY code path that authorizes a broadcast ──
+  // ── Atomic claim: the ONLY code path that authorizes a broadcast ──
     const claimed = await Transaction.findOneAndUpdate(
       buildClaimFilter(feeTx._id, new Date(), swapId),
       {
@@ -505,7 +509,7 @@ export class FeeCollectionService {
         `[FeeCollector] Platform fee DELIVERED for swap ${swapId}: ${feeTx.amount} ${feeAsset} ` +
           `(${txHash}, master ${jettonMaster}, ${this.jettonDecimals(jettonMaster)} decimals)`
       );
-       // Isolated: an output-fee failure must NEVER poison the platform fee
+      // Isolated: an output-fee failure must NEVER poison the platform fee
       // result (previously this throw reverted the just-completed record
       // to 'failed' via an unguarded update — one of the duplicate causes).
       await this.collectTonOutputFee(swap, user.telegramId).catch((err) =>
@@ -914,5 +918,5 @@ export class FeeCollectorJob {
       this.running = false;
     }
   }
-            }
-      
+       }
+    
