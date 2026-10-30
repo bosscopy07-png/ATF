@@ -290,8 +290,13 @@ export class GasRecoveryService {
       // runs before the fee. The retry job also defers such swaps; this
       // reserve is the second line of defence so the fee can never be
       // starved of gas by a clawback.
+      // Only a SUCCESSFUL swap owes a fee. A failed / deployment-only swap is
+      // never charged, so holding 0.1 TON back for a fee that will never be
+      // sent left half of the advance behind (0.30 → only 0.17 recovered).
       const feeUnsettled =
-        BigInt(claimed.fee || '0') > 0n && claimed.feeStatus !== 'completed';
+        swapSucceeded &&
+        BigInt(claimed.fee || '0') > 0n &&
+        claimed.feeStatus !== 'completed';
 
       const reserve =
         config.tonTransferFeeReserveNano +
@@ -512,4 +517,5 @@ function min2(a: bigint, b: bigint): bigint {
 
 export function gasTonToNano(gasTon: string): bigint {
   return Precision.toBaseUnits(gasTon, TON_DECIMALS);
-}
+  }
+          
