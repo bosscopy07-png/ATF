@@ -156,10 +156,58 @@ export class TransferRelayService {
     }
 
     // Recoverable dust (≤ network reserve) is fine — it can't cover a transfer.
+    // Leftovers from COMPLETED transfers are accounted-for platform residuals
+    // and never block reuse (each new operation measures funding against its
+    // own baseline). Only unaccounted funds (foreign deposits, or funds from a
+    // failed/expired/uncertain operation) still block.
     const balance = await this.getTonBalance(relay.address);
     if (balance > config.relay.forwardFeeEstimateNano) {
-      throw new Error('This address still holds funds. Sweep or reclaim them first.');
+      const unaccounted = await this.unaccountedBalance(relay, balance);
+      if (unaccounted > config.relay.forwardFeeEstimateNano) {
+        throw new Error('This address still holds funds. Sweep or reclaim them first.');
+      }
     }
+  }
+
+  /**
+   * Portion of the relay balance NOT explained by completed-transfer
+   * leftovers. Looks at the most recent operation that actually debited the
+   * user (reached FUNDING):
+   *  - COMPLETED       → everything on the address is an accounted-for platform
+   *                      residual → 0 unaccounted.
+   *  - anything else   → funds may belong to that operation: balance minus its
+   *                      baseline is unaccounted.
+   *  - no such op      → any balance is foreign/unknown → all unaccounted.
+   * Fail-closed: when uncertain, the full balance is reported.
+   */
+  private async unaccountedBalance(relay: any, balance: bigint): Promise<bigint> {
+    const op = await this.latestFundedOp(relay._id);
+    if (!op) return balance;
+    if (op.state === 'COMPLETED') return 0n;
+    const baseline = op.fundingBaselineNano ? BigInt(op.fundingBaselineNano) : 0n;
+    const attributable = balance - baseline;
+    return attributable > 0n ? attributable : 0n;
+  }
+
+  /** Most recent operation on the address that actually debited the user. */
+  private async latestFundedOp(relayId: any): Promise<any | null> {
+    const ops = await TransferOperation.find({ relayAddressId: relayId })
+      .sort({ createdAt: -1 })
+      .select('state stateHistory fundingBaselineNano fundingTxHash fundingActualNano');
+    for (const op of ops) {
+      const reachedFunding =
+        op.state === 'COMPLETED' ||
+        !!op.fundingTxHash ||
+        !!op.fundingActualNano ||
+        (op.stateHistory || []).some((h: any) => h.state === 'FUNDING');
+      if (reachedFunding) return op;
+    }
+    return null;
+  }
+
+  /** Balance read that THROWS on RPC failure (never silently returns 0). */
+  private async getTonBalanceStrict(address: string): Promise<bigint> {
+    return BigInt((await this.tonClient.getBalance(Address.parse(address))).toString());
   }
 
   private async getTonBalance(address: string): Promise<bigint> {
@@ -232,11 +280,15 @@ export class TransferRelayService {
   }
 
   /**
-   * Balance check on the relay address. The address is guaranteed fresh
-   * (selection enforced near-zero balance), so balance ≥ required means
-   * the funds arrived — regardless of tx-hash reference formats.
+   * Balance check on the relay address, measured against THIS operation's
+   * own baseline: funded = balance − baseline. Leftovers from earlier
+   * transfers on a reused address are therefore never credited.
+   * `baselineNano` defaults to 0 only for legacy operations without one.
    */
-  async checkFunding(quote: RelayQuote): Promise<{ ok: boolean; balanceNano: bigint; requiredNano: bigint }> {
+  async checkFunding(
+    quote: RelayQuote,
+    baselineNano: bigint = 0n
+  ): Promise<{ ok: boolean; balanceNano: bigint; fundedNano: bigint; requiredNano: bigint }> {
     this.assertEnabled();
 
     const relay = await RelayAddress.findById(quote.relayAddressId);
@@ -244,9 +296,12 @@ export class TransferRelayService {
 
     const requiredNano = quote.fundingAmountNano;
     const balanceNano = await this.getTonBalance(relay.address);
+    const delta = balanceNano - baselineNano;
+    const fundedNano = delta > 0n ? delta : 0n;
 
-    return { ok: balanceNano >= requiredNano, balanceNano, requiredNano };
+    return { ok: fundedNano >= requiredNano, balanceNano, fundedNano, requiredNano };
   }
+
     /* ══════════════ STEP 2: FUND THE RELAY FROM THE USER'S WALLET ══════════════ */
 
   /**
@@ -297,9 +352,30 @@ export class TransferRelayService {
           }
         }
 
+        // Fresh baseline for THIS operation (never inherited from earlier ones).
+        // Persisted so crash-recovery / reconciler measure against the same
+        // value. Strict read: an RPC failure aborts BEFORE anything is
+        // created or sent (never silently baseline 0). Legacy FUNDING rows
+        // without a baseline keep the old semantics (0).
+        let baselineNano: bigint;
+        if (existing?.fundingBaselineNano) {
+          baselineNano = BigInt(existing.fundingBaselineNano);
+        } else if (existing && existing.state === 'FUNDING') {
+          baselineNano = 0n;
+        } else {
+          baselineNano = await this.getTonBalanceStrict(relay.address);
+        }
+
         let op: ITransferOperation;
         if (existing) {
           op = existing;
+          if (!existing.fundingBaselineNano) {
+            await TransferOperation.updateOne(
+              { _id: existing._id },
+              { $set: { fundingBaselineNano: baselineNano.toString() } }
+            );
+            existing.fundingBaselineNano = baselineNano.toString();
+          }
         } else {
           try {
             op = await TransferOperation.create({
@@ -315,6 +391,7 @@ export class TransferRelayService {
               forwardFeeEstimateNano: quote.forwardFeeEstimateNano.toString(),
               minReserveNano: quote.minReserveNano.toString(),
               totalDebitNano: quote.totalDebitNano.toString(),
+              fundingBaselineNano: baselineNano.toString(),
               destinationAddress: '',
               expiresAt: new Date(Date.now() + 30 * 60 * 1000),
               retryCount: 0,
@@ -329,11 +406,11 @@ export class TransferRelayService {
         }
 
         // Crash-recovery: already funded → do NOT re-send
-        const preCheck = await this.checkFunding(quote);
+        const preCheck = await this.checkFunding(quote, baselineNano);
         if (preCheck.ok) {
           await TransferOperation.updateOne(
             { _id: op._id },
-            { $set: { fundingActualNano: preCheck.balanceNano.toString() } }
+            { $set: { fundingActualNano: preCheck.fundedNano.toString() } }
           );
           await this.transition(op, 'FUNDED', 'Relay already funded (recovered)');
           return { operationId: op.operationId };
@@ -351,7 +428,7 @@ export class TransferRelayService {
 
           const notBefore = Math.floor(Date.now() / 1000) - 60; // 60s clock-skew allowance
 
-          // Sender-side baseline for the cross-check fallback
+           // Sender-side baseline for the cross-check fallback
           const senderBefore = await this.getTonBalance(walletAddress);
 
           // sendTon deducts the forward fee from the carried amount — over-send
@@ -366,7 +443,7 @@ export class TransferRelayService {
             relay.address,
             walletAddress,
             quote.fundingAmountNano,
-            { allowBalanceFallback: true, notBefore, label: 'funding' }
+            { allowBalanceFallback: true, notBefore, label: 'funding', baselineNano }
           );
 
           if (!v.ok) {
@@ -511,15 +588,17 @@ export class TransferRelayService {
               });
 
               /* ── Confirm the funds are still on the relay, then send ── */
-              const fundingCheck = await this.checkFunding(quote);
+              const opBaseline = op.fundingBaselineNano ? BigInt(op.fundingBaselineNano) : 0n;
+              const fundingCheck = await this.checkFunding(quote, opBaseline);
               if (!fundingCheck.ok) {
                 throw new Error(
-                  `Relay balance short (${Precision.fromBaseUnits(fundingCheck.balanceNano, 9)} of ` +
+                  `Relay balance short (${Precision.fromBaseUnits(fundingCheck.fundedNano, 9)} of ` +
                   `${Precision.fromBaseUnits(fundingCheck.requiredNano, 9)} TON). Check Relay History.`
                 );
               }
 
-              const actualReceived = fundingCheck.balanceNano;
+              // Only THIS operation's funding — prior leftovers are excluded.
+              const actualReceived = fundingCheck.fundedNano;
 
               const availableForDestination =
                 actualReceived - quote.platformFeeNano - quote.forwardFeeEstimateNano;
@@ -732,7 +811,12 @@ export class TransferRelayService {
                 op.relayAddress,
                 walletAddress,
                 BigInt(op.fundingAmountNano),
-                { allowBalanceFallback: true, quick: true }
+                {
+                  allowBalanceFallback: true,
+                  quick: true,
+                  baselineNano: op.fundingBaselineNano ? BigInt(op.fundingBaselineNano) : 0n,
+                  notBefore: Math.floor(op.createdAt.getTime() / 1000) - 60,
+                }
               );
               if (v.ok) {
                 await TransferOperation.updateOne(
@@ -836,7 +920,12 @@ export class TransferRelayService {
       if (!reclaimAllowed) continue;
 
       const feeNano = lastOp ? BigInt(lastOp.platformFeeNano || '0') : 0n;
-      const reclaimNano = balance - feeNano - config.relay.forwardFeeEstimateNano;
+      // Only this operation's own funding is user-reclaimable; earlier
+      // leftovers on a reused address stay platform property.
+      const fundedOp = await this.latestFundedOp(relay._id);
+      const baseline = fundedOp?.fundingBaselineNano ? BigInt(fundedOp.fundingBaselineNano) : 0n;
+      const attributable = balance - baseline;
+      const reclaimNano = attributable - feeNano - config.relay.forwardFeeEstimateNano;
 
       if (reclaimNano > 0n) {
         return {
@@ -888,7 +977,10 @@ export class TransferRelayService {
       }
 
       const feeNano = lastOp ? BigInt(lastOp.platformFeeNano || '0') : 0n;
-      const reclaimNano = balance - feeNano - config.relay.forwardFeeEstimateNano;
+      const fundedOp = await this.latestFundedOp(relay._id);
+      const baseline = fundedOp?.fundingBaselineNano ? BigInt(fundedOp.fundingBaselineNano) : 0n;
+      const attributable = balance - baseline; // earlier leftovers are platform property
+      const reclaimNano = attributable - feeNano - config.relay.forwardFeeEstimateNano;
 
       if (reclaimNano <= 0n) {
         throw new Error('Nothing to reclaim — balance only covers the platform fee and network reserve.');
@@ -1249,7 +1341,7 @@ export class TransferRelayService {
     receivingAddress: string,
     senderAddress: string,
     expectedNano: bigint,
-    opts: { allowBalanceFallback: boolean; quick?: boolean; notBefore?: number; label?: string }
+    opts: { allowBalanceFallback: boolean; quick?: boolean; notBefore?: number; label?: string; baselineNano?: bigint }
   ): Promise<
     | { ok: true; receivedNano: bigint; feeNano: bigint; txHash: string }
     | { ok: false; reason: string }
@@ -1263,6 +1355,7 @@ export class TransferRelayService {
     })();
 
     const notBefore = opts.notBefore ?? 0;
+    const baselineNano = opts.baselineNano ?? 0n;
 
     const scanForTx = async (): Promise<{ receivedNano: bigint; feeNano: bigint; txHash: string } | null> => {
       try {
@@ -1298,12 +1391,13 @@ export class TransferRelayService {
         // the tx list isn't queryable yet.
         try {
           const balance = await this.getTonBalance(receivingAddress);
-          console.log(`[Relay] ${label} attempt ${attempt + 1}/${attempts}: relayBalance=${balance} expected=${expectedNano}`);
-          if (balance >= expectedNano) {
+          const delta = balance - baselineNano; // this operation's funding only
+          console.log(`[Relay] ${label} attempt ${attempt + 1}/${attempts}: relayBalance=${balance} baseline=${baselineNano} expected=${expectedNano}`);
+          if (delta >= expectedNano) {
             const found = await scanForTx(); // enrich with the real hash (may be null)
             return {
               ok: true,
-              receivedNano: found?.receivedNano ?? balance,
+              receivedNano: found?.receivedNano ?? delta,
               feeNano: found?.feeNano ?? 0n,
               txHash: found?.txHash ?? '',
             };
@@ -1444,4 +1538,4 @@ export class TransferRelayService {
     return { items, total, page, pageSize };
   }
       }
-    
+
