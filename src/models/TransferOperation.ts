@@ -36,8 +36,17 @@ export interface ITransferOperation extends Document {
    */
   destinationAddress: string;
 
+  /**
+   * Relay on-chain balance (nano) captured under the address lock BEFORE this
+   * operation's funding was broadcast. Every funding/availability check for
+   * this operation is measured as (balance - baseline), so leftovers from
+   * earlier completed transfers are never credited. Absent on legacy rows
+   * (treated as 0, i.e. the previous behaviour).
+   */
+  fundingBaselineNano?: string;
+
   fundingTxHash?: string;
-  fundingActualNano?: string;         // verified on-chain received
+  fundingActualNano?: string;         // verified on-chain received (net of baseline)
   fundingNetworkFeeNano?: string;
 
   outgoingTxHash?: string;
@@ -83,6 +92,8 @@ const TransferOperationSchema = new Schema<ITransferOperation>(
     // Optional: created at funding time, before the destination is known.
     // execute() sets it. Existing documents (all have it) remain valid.
     destinationAddress: { type: String, required: false },
+
+    fundingBaselineNano: { type: String },
 
     fundingTxHash: { type: String, index: true },
     fundingActualNano: { type: String },
