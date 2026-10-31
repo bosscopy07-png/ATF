@@ -67,8 +67,8 @@ function asVerification(value: any): DiscoveredVerification {
  * Default indexer: TonAPI.
  *
  * Optional environment variables:
- *  - TON_INDEXER_URL       Default: https://tonapi.io
- *  - TON_INDEXER_TIMEOUT_MS Default: 8000
+ *  - TON_INDEXER_URL         Default: https://tonapi.io
+ *  - TON_INDEXER_TIMEOUT_MS  Default: 8000
  *
  * TON_API_KEY is reused for authenticated indexer requests when configured.
  */
@@ -122,17 +122,11 @@ export class WalletAssetDiscoveryService {
       return cached.items;
     }
 
-    const response = await axios.get(
-      `${this.indexerBaseUrl}/v2/accounts/${encodeURIComponent(owner)}/jettons`,
+    const response = await this.get(
+      `/v2/accounts/${encodeURIComponent(owner)}/jettons`,
       {
-        timeout: this.requestTimeoutMs,
-        params: {
-          currencies: 'usd',
-          limit: 1000,
-        },
-        headers: this.indexerHeaders(),
-        validateStatus: (status) =>
-          status >= 200 && status < 300,
+        currencies: 'usd',
+        limit: 1000,
       }
     );
 
@@ -252,14 +246,8 @@ export class WalletAssetDiscoveryService {
   private async fetchMetadata(
     masterAddress: string
   ): Promise<JettonMetadata | null> {
-    const response = await axios.get(
-      `${this.indexerBaseUrl}/v2/jettons/${encodeURIComponent(masterAddress)}`,
-      {
-        timeout: this.requestTimeoutMs,
-        headers: this.indexerHeaders(),
-        validateStatus: (status) =>
-          status >= 200 && status < 300,
-      }
+    const response = await this.get(
+      `/v2/jettons/${encodeURIComponent(masterAddress)}`
     );
 
     return this.metadataFromPayload(response.data);
@@ -272,8 +260,7 @@ export class WalletAssetDiscoveryService {
     const symbol = String(
       source?.symbol ?? ''
     ).trim().toUpperCase();
-
-    const name = String(
+      const name = String(
       source?.name ?? source?.display_name ?? ''
     ).trim();
 
@@ -428,12 +415,56 @@ export class WalletAssetDiscoveryService {
     return Number.isFinite(parsed) ? new Date(parsed) : null;
   }
 
-  private indexerHeaders(): Record<string, string> {
+  /**
+   * GET against the configured indexer.
+   *
+   * If a configured API key is rejected (401/403) — e.g. a revoked or
+   * rotated key — retry once WITHOUT credentials instead of failing the
+   * whole discovery. TonAPI also serves unauthenticated requests at a
+   * lower rate limit, so discovery keeps working while the key is fixed.
+   */
+  private async get(
+    path: string,
+    params?: Record<string, any>,
+  ): Promise<any> {
+    const attempt = (authenticated: boolean) =>
+      axios.get(`${this.indexerBaseUrl}${path}`, {
+        timeout: this.requestTimeoutMs,
+        params,
+        headers: this.indexerHeaders(authenticated),
+        validateStatus: (status) =>
+          status >= 200 && status < 300,
+      });
+
+    const hasKey = !!config.tonApiKey;
+
+    try {
+      return await attempt(hasKey);
+    } catch (error: any) {
+      const status = error?.response?.status;
+
+      if (hasKey && (status === 401 || status === 403)) {
+        console.warn(
+          '[WalletAssetDiscovery] Indexer key rejected ' +
+            `(${status}); retrying without credentials. ` +
+            'Update TON_API_KEY.'
+        );
+
+        return await attempt(false);
+      }
+
+      throw error;
+    }
+  }
+
+  private indexerHeaders(
+    authenticated = true,
+  ): Record<string, string> {
     const headers: Record<string, string> = {
       Accept: 'application/json',
     };
 
-    if (config.tonApiKey) {
+    if (authenticated && config.tonApiKey) {
       headers.Authorization = `Bearer ${config.tonApiKey}`;
     }
 
@@ -475,5 +506,4 @@ export class WalletAssetDiscoveryService {
 
     return metadata;
   }
-  }
-        
+    }
