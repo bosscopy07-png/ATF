@@ -1,10 +1,12 @@
-import { TonClient, Address, JettonMaster, JettonWallet } from '@ton/ton';
+import { Address } from '@ton/core';
 import Decimal from 'decimal.js';
 import { config, TON_DECIMALS, ATF_DECIMALS } from '../config';
-import { TokenRegistry } from './token-registry';
 import { PriceService } from './price-service';
 import { Precision } from '../utils/precision';
-import { SupportedToken } from '../models/SupportedToken';
+import {
+  DiscoveredJetton,
+  WalletAssetDiscoveryService,
+} from './wallet-asset-discovery';
 
 export type ValuationStatus = 'valued' | 'price_unavailable' | 'balance_unavailable';
 
@@ -34,25 +36,30 @@ export interface PortfolioSummary {
   priceTimestamp: Date | null;
 }
 
+type MakePortfolioLine = (
+  masterAddress: string,
+  symbol: string,
+  name: string,
+  decimals: number,
+  balanceBase: bigint,
+  priceUsd: string | null,
+  priceSource: string | null,
+  priceUpdatedAt: Date | null
+) => PortfolioLine;
+
 /**
  * Portfolio engine.
  *
  * Rules enforced:
  *  - Decimal-safe totals (bigint + Decimal), never float.
- *  - An asset with NO price is reported valueUsd=null, excluded from totals.
- *  - ATF/TON valuation path UNCHANGED (existing PriceService).
- *  - Duplicate master addresses deduped by canonical Address.parse form.
+ *  - An asset with NO price is reported valueUsd=null and remains visible.
+ *  - ATF/TON valuation path UNCHANGED (existing PriceService methods).
+ *  - Other Jettons are discovered from the user's actual wallet.
+ *  - Duplicate master addresses are deduped by canonical Address.parse form.
  */
 export class PortfolioService {
-  private tonClient: TonClient;
   private priceService = PriceService.getInstance();
-
-  constructor() {
-    this.tonClient = new TonClient({
-      endpoint: config.tonRpcUrl,
-      apiKey: config.tonApiKey,
-    });
-  }
+  private assetDiscovery = WalletAssetDiscoveryService.getInstance();
 
   async buildPortfolio(
     walletAddress: string,
@@ -129,46 +136,10 @@ export class PortfolioService {
       atfPrice?.timestamp ?? null
     );
 
-    /* ── Other assets: discover holdings, dedupe, price-check ── */
-    const registryTokens = await TokenRegistry.listTradeable().catch(() => []);
-    const seen = new Set<string>([
-      Address.parse(config.atfJettonAddress).toString(),
-    ]);
-
-    const others: PortfolioLine[] = [];
-
-    for (const token of registryTokens) {
-      let canonical: string;
-      try {
-        canonical = Address.parse(token.masterAddress).toString();
-      } catch {
-        continue;
-      }
-      if (seen.has(canonical)) continue;
-      seen.add(canonical);
-
-      const balanceBase = await this.readJettonBalance(
-        walletAddress,
-        canonical
-      ).catch(() => null);
-
-      if (balanceBase === null || balanceBase <= 0n) continue;
-
-      const doc = await SupportedToken.findOne({ masterAddress: canonical });
-
-      others.push(
-        mkLine(
-          canonical,
-          token.symbol,
-          token.name,
-          token.decimals,
-          balanceBase,
-          doc?.lastPriceUsd ?? null,
-          doc?.priceSource ?? null,
-          doc?.priceUpdatedAt ?? null
-        )
-      );
-    }
+    const others = await this.discoverOtherAssets(
+      walletAddress,
+      mkLine
+    );
 
     /* ── Totals: only valued assets contribute ── */
     let totalUsdD = new Decimal(tonLine.valueUsd ?? '0').plus(atfLine.valueUsd ?? '0');
@@ -177,7 +148,9 @@ export class PortfolioService {
     for (const line of others) {
       if (line.valueUsd) {
         totalUsdD = totalUsdD.plus(line.valueUsd);
-        othersTotalD = othersTotalD ? othersTotalD.plus(line.valueUsd) : new Decimal(line.valueUsd);
+        othersTotalD = othersTotalD
+          ? othersTotalD.plus(line.valueUsd)
+          : new Decimal(line.valueUsd);
       }
     }
 
@@ -196,6 +169,163 @@ export class PortfolioService {
       ngnRate: ngnRateStr,
       priceTimestamp: tonPrice?.timestamp ?? atfPrice?.timestamp ?? null,
     };
+        }
+    /**
+   * Discovers every positive Jetton balance in the user's wallet.
+   *
+   * ATF is excluded here because it is valued by the unchanged ATF code path
+   * above. Other master addresses are deduplicated canonically.
+   *
+   * Price lookup concurrency is intentionally bounded so a wallet holding
+   * many unpriced tokens cannot produce an unbounded burst of provider calls.
+   */
+  private async discoverOtherAssets(
+    walletAddress: string,
+    mkLine: MakePortfolioLine
+  ): Promise<PortfolioLine[]> {
+    const holdings = await this.assetDiscovery
+      .discover(walletAddress)
+      .catch((error: any) => {
+        console.warn(
+          '[PortfolioService] Wallet Jetton discovery failed:',
+          error?.message || error
+        );
+
+        return [] as DiscoveredJetton[];
+      });
+
+    const seen = new Set<string>([
+      Address.parse(config.atfJettonAddress).toString(),
+    ]);
+
+    const uniqueHoldings: DiscoveredJetton[] = [];
+
+    for (const holding of holdings) {
+      try {
+        const canonical = Address.parse(
+          holding.masterAddress
+        ).toString();
+
+        if (
+          holding.balanceBase <= 0n ||
+          seen.has(canonical)
+        ) {
+          continue;
+        }
+
+        seen.add(canonical);
+        uniqueHoldings.push({
+          ...holding,
+          masterAddress: canonical,
+        });
+      } catch {
+        // Ignore malformed indexer rows.
+      }
+    }
+
+    const lines = await this.mapWithConcurrency(
+      uniqueHoldings,
+      3,
+      async (asset) => {
+        let priceUsd = this.positiveUsdPrice(asset.priceUsd);
+        let priceSource = priceUsd
+          ? asset.priceSource ?? 'TON Indexer'
+          : null;
+        let priceUpdatedAt = priceUsd
+          ? asset.priceUpdatedAt ?? new Date()
+          : null;
+
+        /*
+         * If the indexer did not provide a usable USD price, query the
+         * existing/fallback price-provider chain. ATF is never passed here.
+         */
+        if (!priceUsd) {
+          const priceData = await this.priceService
+            .getJettonPriceUsd(asset.masterAddress)
+            .catch(() => null);
+
+          if (
+            priceData &&
+            Number.isFinite(priceData.price) &&
+            priceData.price > 0
+          ) {
+            priceUsd = String(priceData.price);
+            priceSource = priceData.source;
+            priceUpdatedAt = priceData.timestamp;
+          }
+        }
+
+        try {
+          return mkLine(
+            asset.masterAddress,
+            asset.symbol,
+            asset.name,
+            asset.decimals,
+            asset.balanceBase,
+            priceUsd,
+            priceSource,
+            priceUpdatedAt
+          );
+        } catch (error: any) {
+          console.warn(
+            `[PortfolioService] Failed to render ${asset.symbol}:`,
+            error?.message || error
+          );
+
+          return null;
+        }
+      }
+    );
+
+    return lines.filter(
+      (line): line is PortfolioLine => line !== null
+    );
+  }
+
+  private positiveUsdPrice(
+    value: string | null | undefined
+  ): string | null {
+    if (value === null || value === undefined || value === '') {
+      return null;
+    }
+
+    const parsed = Number(value);
+
+    return Number.isFinite(parsed) && parsed > 0
+      ? String(parsed)
+      : null;
+  }
+
+  private async mapWithConcurrency<T, R>(
+    items: T[],
+    limit: number,
+    mapper: (item: T, index: number) => Promise<R>
+  ): Promise<R[]> {
+    const results: R[] = new Array(items.length);
+    let cursor = 0;
+
+    const workerCount = Math.max(
+      1,
+      Math.min(limit, items.length)
+    );
+
+    const workers = Array.from(
+      { length: workerCount },
+      async () => {
+        while (cursor < items.length) {
+          const index = cursor;
+          cursor += 1;
+
+          results[index] = await mapper(
+            items[index],
+            index
+          );
+        }
+      }
+    );
+
+    await Promise.all(workers);
+    return results;
   }
 
   private cryptoToUsd(
@@ -207,20 +337,4 @@ export class PortfolioService {
       .times(priceUsd)
       .toFixed(2);
   }
-
-  private async readJettonBalance(
-    ownerAddress: string,
-    masterAddress: string
-  ): Promise<bigint> {
-    const master = this.tonClient.open(
-      JettonMaster.create(Address.parse(masterAddress))
-    );
-    const jettonWalletAddress = await master.getWalletAddress(
-      Address.parse(ownerAddress)
-    );
-    const jettonWallet = this.tonClient.open(
-      JettonWallet.create(jettonWalletAddress)
-    );
-    return await jettonWallet.getBalance();
-  }
-        }
+                           }
