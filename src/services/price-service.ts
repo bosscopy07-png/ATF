@@ -465,7 +465,7 @@ export class PriceService {
       },
     );
 }
-  /**
+    /**
    * Fetches a Jetton USD price using the same provider timeout and
    * database-backed cache infrastructure as the existing price methods.
    *
@@ -831,8 +831,7 @@ export class PriceService {
                   : null,
             }),
           },
-
-          /* ─────────────────────────────
+                    /* ─────────────────────────────
              6️⃣ TONAPI
              ─────────────────────────────
              
@@ -910,70 +909,7 @@ export class PriceService {
           },
 
           /* ─────────────────────────────
-             7️⃣ CoinCap
-             ───────────────────────────── */
-
-          {
-            name: 'CoinCap',
-            url:
-              'https://api.coincap.io/v2/assets/toncoin',
-
-            extract: (d: any) => ({
-              price:
-                parseFloat(
-                  d?.data?.priceUsd,
-                ),
-
-              change24hPercent:
-                d?.data
-                  ?.changePercent24Hr !=
-                null
-                  ? parseFloat(
-                      d.data
-                        .changePercent24Hr,
-                    )
-                  : null,
-            }),
-          },
-
-          /* ─────────────────────────────
-             8️⃣ CoinPaprika
-             ───────────────────────────── */
-
-          {
-            name: 'CoinPaprika',
-            url:
-              'https://api.coinpaprika.com/v1/tickers/ton-toncoin',
-
-            extract: (d: any) => ({
-              price:
-                d?.quotes?.USD?.price,
-
-              change24hPercent:
-                d?.quotes?.USD
-                  ?.percent_change_24h ??
-                null,
-            }),
-          },
-
-          /* ─────────────────────────────
-             9️⃣ CryptoCompare
-             ───────────────────────────── */
-
-          {
-            name: 'CryptoCompare',
-            url:
-              'https://min-api.cryptocompare.com/data/price?fsym=TON&tsyms=USD',
-
-            extract: (d: any) => ({
-              price: d?.USD,
-              change24hPercent:
-                null,
-            }),
-          },
-
-          /* ─────────────────────────────
-             🔟 CoinGecko
+             7️⃣ CoinGecko
              Last because of possible
              rate limits.
              ───────────────────────────── */
@@ -1015,8 +951,9 @@ export class PriceService {
         };
       },
     );
-                }
-                  /* ─────────────────────────────────────────────
+  }
+
+  /* ─────────────────────────────────────────────
      🇳🇬 USD / NGN
      ───────────────────────────────────────────── */
 
@@ -1158,7 +1095,7 @@ export class PriceService {
      💱 USD → NGN
      ───────────────────────────────────────────── */
 
-  convertUsdToNgn(
+convertUsdToNgn(
     usdAmount: string,
     ngnRate: number,
   ): string {
@@ -1178,4 +1115,5 @@ export class PriceService {
       ),
     );
   }
-}
+      }
+  
