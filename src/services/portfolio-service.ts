@@ -169,8 +169,9 @@ export class PortfolioService {
       ngnRate: ngnRateStr,
       priceTimestamp: tonPrice?.timestamp ?? atfPrice?.timestamp ?? null,
     };
-        }
-    /**
+  }
+
+  /**
    * Discovers every positive Jetton balance in the user's wallet.
    *
    * ATF is excluded here because it is valued by the unchanged ATF code path
@@ -237,7 +238,7 @@ export class PortfolioService {
 
         /*
          * If the indexer did not provide a usable USD price, query the
-         * existing/fallback price-provider chain. ATF is never passed here.
+         * fallback price-provider chain. ATF is never passed here.
          */
         if (!priceUsd) {
           const priceData = await this.priceService
@@ -337,4 +338,4 @@ export class PortfolioService {
       .times(priceUsd)
       .toFixed(2);
   }
-                           }
+      }
