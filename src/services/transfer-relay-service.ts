@@ -22,10 +22,12 @@ import { WalletService } from './wallet-service';
  * walletService.sendTon deducts the network forward fee FROM the carried
  * amount (receiver gets amount − fee, observed ≈ 66,667 nano). We over-send
  * by this carry so the relay still receives ≥ the required funding.
- * 100,000 nano gives comfortable headroom; the excess stays on the relay
+ * The observed fee varies (≈66k–115k nano), and since funding is now measured
+ * against a clean per-operation baseline (no leftover dust to mask a small
+ * shortfall), 1,000,000 nano (0.001 TON) gives safe headroom; the excess stays on the relay
  * (reserve / platform residual).
  */
-const FUNDING_FEE_CARRY_NANO = 100_000n;
+const FUNDING_FEE_CARRY_NANO = 1_000_000n;
 
 export interface RelayQuote {
   quoteId: string;
@@ -428,7 +430,7 @@ export class TransferRelayService {
 
           const notBefore = Math.floor(Date.now() / 1000) - 60; // 60s clock-skew allowance
 
-           // Sender-side baseline for the cross-check fallback
+          // Sender-side baseline for the cross-check fallback
           const senderBefore = await this.getTonBalance(walletAddress);
 
           // sendTon deducts the forward fee from the carried amount — over-send
@@ -939,8 +941,7 @@ export class TransferRelayService {
     }
     return null;
   }
-
-  /**
+/**
    * User-initiated reclaim: returns the relay's ACTUAL balance to the
    * user's custodial wallet, keeping the platform fee (2%) for the admin
    * fee wallet. Network reserve stays as dust. Abandoned FUNDED ops are
@@ -1539,3 +1540,4 @@ export class TransferRelayService {
   }
       }
 
+        
