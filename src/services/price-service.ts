@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { Address } from '@ton/core';
 import { PriceCache } from '../models/PriceCache';
 import { config } from '../config';
 
@@ -29,7 +30,7 @@ interface Provider {
    Rotate the credential previously pasted into chat.
    ───────────────────────────────────────────── */
 
-const TONAPI_KEY = 'AF7REGDCFASR4BQAAAADDBL2HHXD67ZQPQDXXACJULJ2DUORN5ZVHJ3WSRQ3O2M2MBNPGAI';
+const TONAPI_KEY = process.env.TON_API_KEY || '';
 
 /* ─────────────────────────────────────────────
    🧭 Shared helpers
@@ -56,6 +57,11 @@ export class PriceService {
     config.priceCacheTtlMs || 60_000;
 
   private readonly providerTimeoutMs = 5_000;
+
+  private readonly jettonPriceInflight = new Map<
+    string,
+    Promise<PriceData | null>
+  >();
 
   private constructor() {}
 
@@ -458,6 +464,213 @@ export class PriceService {
         };
       },
     );
+}
+  /**
+   * Fetches a Jetton USD price using the same provider timeout and
+   * database-backed cache infrastructure as the existing price methods.
+   *
+   * In-flight requests for the same Jetton are deduplicated per process.
+   */
+  async getJettonPriceUsd(
+    masterAddress: string,
+  ): Promise<PriceData | null> {
+    let canonical: string;
+
+    try {
+      canonical = Address.parse(masterAddress).toString();
+    } catch {
+      return null;
+    }
+
+    const pending = this.jettonPriceInflight.get(canonical);
+    if (pending) return pending;
+
+    const request = this.getCachedOrFetch(
+      `jetton:${canonical}`,
+      async () => {
+        const providers: Provider[] = [
+          {
+            name: 'STON.fi',
+
+            url:
+              `https://api.ston.fi/v1/assets/${encodeURIComponent(canonical)}`,
+
+            extract: (d: any) => {
+              const asset = d?.asset ?? d;
+
+              return {
+                price:
+                  asset?.dex_price_usd ??
+                  asset?.third_party_price_usd ??
+                  asset?.price_usd ??
+                  asset?.price ??
+                  asset?.usd_price,
+
+                change24hPercent:
+                  asset?.price_change_24h ??
+                  asset?.priceChange24h ??
+                  asset?.change_24h ??
+                  null,
+              };
+            },
+          },
+
+          {
+            name: 'DexScreener',
+
+            url:
+              `https://api.dexscreener.com/latest/dex/tokens/${encodeURIComponent(canonical)}`,
+
+            extract: (d: any) => {
+              const pairs = Array.isArray(d?.pairs)
+                ? d.pairs.filter(
+                    (pair: any) =>
+                      Number.isFinite(
+                        Number(pair?.priceUsd),
+                      ) &&
+                      Number(pair?.priceUsd) > 0,
+                  )
+                : [];
+
+              /*
+               * Prefer the pair with the greatest reported liquidity.
+               * This is more reliable than blindly selecting pairs[0].
+               */
+              pairs.sort(
+                (
+                  left: any,
+                  right: any,
+                ) =>
+                  Number(right?.liquidity?.usd ?? 0) -
+                  Number(left?.liquidity?.usd ?? 0),
+              );
+
+              const pair = pairs[0];
+
+              return pair
+                ? {
+                    price: pair.priceUsd,
+                    change24hPercent:
+                      pair?.priceChange?.h24 ?? null,
+                  }
+                : null;
+            },
+          },
+
+          {
+            name: 'CoinGecko',
+
+            url:
+              `https://api.coingecko.com/api/v3/simple/token_price/ton?contract_addresses=${encodeURIComponent(
+                canonical.toLowerCase(),
+              )}&vs_currencies=usd&include_24hr_change=true`,
+
+            extract: (d: any) => {
+              const row =
+                d?.[canonical.toLowerCase()] ??
+                (Object.values(d || {})[0] as any);
+
+              return {
+                price: row?.usd,
+
+                change24hPercent:
+                  row?.usd_24h_change ?? null,
+              };
+            },
+          },
+
+          {
+            name: 'GeckoTerminal',
+
+            url:
+              `https://api.geckoterminal.com/api/v2/simple/networks/ton/token_price/${encodeURIComponent(canonical)}`,
+
+            extract: (d: any) => {
+              const prices =
+                d?.data?.attributes?.token_prices;
+
+              const key =
+                Object.keys(prices || {})[0];
+
+              return prices?.[key]
+                ? {
+                    price: prices[key],
+                    change24hPercent: null,
+                  }
+                : null;
+            },
+          },
+
+          {
+            name: 'TONAPI',
+
+            url:
+              `https://tonapi.io/v2/rates?tokens=${encodeURIComponent(
+                canonical,
+              )}&currencies=USD`,
+
+            headers:
+              TONAPI_KEY &&
+              !TONAPI_KEY.includes('PASTE_YOUR')
+                ? {
+                    Authorization:
+                      `Bearer ${TONAPI_KEY}`,
+                  }
+                : {},
+
+            extract: (d: any) => {
+              const rates =
+                d?.rates ?? d?.data?.rates;
+
+              const tokenRate =
+                rates?.[canonical] ??
+                rates?.[canonical.toUpperCase()] ??
+                rates?.[canonical.toLowerCase()] ??
+                (Object.values(rates || {})[0] as any);
+
+              const rawPrice =
+                tokenRate?.prices?.USD ??
+                tokenRate?.prices?.usd ??
+                tokenRate?.USD ??
+                tokenRate?.usd ??
+                tokenRate?.price ??
+                tokenRate?.rate;
+
+              const price = Number(rawPrice);
+
+              return Number.isFinite(price) && price > 0
+                ? {
+                    price,
+                    change24hPercent:
+                      tokenRate?.change24h ??
+                      tokenRate?.price_change_24h ??
+                      null,
+                  }
+                : null;
+            },
+          },
+        ];
+
+        const {
+          price,
+          source,
+          change24hPercent,
+        } = await this.fetchWithProviders(providers);
+
+        return {
+          price,
+          currency: 'USD',
+          source,
+          timestamp: new Date(),
+          change24hPercent,
+        };
+      },
+    ).finally(() => {
+      this.jettonPriceInflight.delete(canonical);
+    });
+
+    this.jettonPriceInflight.set(canonical, request);
+    return request;
   }
 
   /* ─────────────────────────────────────────────
@@ -802,9 +1015,8 @@ export class PriceService {
         };
       },
     );
-  }
-
-  /* ─────────────────────────────────────────────
+                }
+                  /* ─────────────────────────────────────────────
      🇳🇬 USD / NGN
      ───────────────────────────────────────────── */
 
@@ -945,7 +1157,8 @@ export class PriceService {
   /* ─────────────────────────────────────────────
      💱 USD → NGN
      ───────────────────────────────────────────── */
-convertUsdToNgn(
+
+  convertUsdToNgn(
     usdAmount: string,
     ngnRate: number,
   ): string {
