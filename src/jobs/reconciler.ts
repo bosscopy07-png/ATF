@@ -429,6 +429,23 @@ class ReconciliationService {
   }
 
   /**
+   * Fast-path entry: judge ONE multi-token swap right now instead of waiting
+   * for the next tick. Same code path, same transaction guard — if the tick
+   * wins the race this simply finds the swap already finalized.
+   */
+  async reconcileMultiTokenNow(swapId: string): Promise<void> {
+    const swap = await Transaction.findOne({
+      _id: swapId,
+      type: 'swap' as TransactionType,
+      status: { $in: ['pending', 'processing'] },
+    }).lean();
+    if (!swap || !isMultiTokenSwapMeta((swap as any).metadata)) return;
+
+    const metrics: ReconcileMetrics = { processed: 0, confirmed: 0, failed: 0, feesRecovered: 0, skipped: 0 };
+    await this.reconcileMultiTokenSwap(swap, metrics);
+  }
+
+  /**
    * Determines the REAL outcome of a TON→TOKEN / TOKEN→TON swap from on-chain
    * evidence and persists it. The bot never does this — a broadcast is not a
    * result. Fee collection and gas recovery are then driven through the
@@ -526,7 +543,7 @@ class ReconciliationService {
     return this.ensureFeeTransfer(swap, session);
   }
 
-/**
+  /**
    * Failed on-chain. A swap that did not happen owes NO platform fee (it is
    * waived and recorded), and any TON advance is reclaimed by the existing
    * gas recovery. Nothing is refunded to an internal ledger because the
@@ -1131,6 +1148,11 @@ const service = new ReconciliationService();
 
 export async function startReconciler(): Promise<void> {
   await service.start();
+}
+
+/** Fast-path used by the multi-token swap screen (additive). */
+export async function reconcileMultiTokenSwapNow(swapId: string): Promise<void> {
+  await service.reconcileMultiTokenNow(swapId);
 }
 
 export function stopReconciler(): void {
