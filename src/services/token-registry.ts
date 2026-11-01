@@ -1,7 +1,15 @@
 import axios from 'axios';
 import { Address } from '@ton/core';
 import { config } from '../config';
-import { SupportedToken, ISupportedToken } from '../models/SupportedToken';
+import { SupportedToken } from '../models/SupportedToken';
+import {
+  CatalogToken,
+  NATIVE_TON,
+  filterAndRank,
+  isNativeTonQuery,
+  isSelectableJetton,
+  parseProviderAssets,
+} from './token-catalog';
 
 export interface TokenRef {
   masterAddress: string;
@@ -9,183 +17,295 @@ export interface TokenRef {
   name: string;
   decimals: number;
   verification: string;
+  imageUrl?: string;
+}
+
+type HttpFn = (
+  method: 'GET' | 'POST',
+  path: string,
+  opts?: { params?: Record<string, any>; data?: any }
+) => Promise<any>;
+
+/** STON.fi API root without a trailing slash or /v1 (paths below add /v1). */
+function providerRoot(): string {
+  return String(config.stonfiApiUrl || 'https://api.ston.fi')
+    .trim()
+    .replace(/\/+$/, '')
+    .replace(/\/v1$/i, '');
+}
+
+const defaultHttp: HttpFn = async (method, path, opts) => {
+  const res = await axios.request({
+    method,
+    url: `${providerRoot()}${path}`,
+    params: opts?.params,
+    data: opts?.data,
+    timeout: 12_000,
+    headers: { Accept: 'application/json' },
+  });
+  return res.data;
+};
+
+function toRef(t: CatalogToken): TokenRef {
+  return {
+    masterAddress: t.masterAddress,
+    symbol: t.symbol,
+    name: t.name,
+    decimals: t.decimals,
+    verification: t.verification,
+    imageUrl: t.imageUrl,
+  };
 }
 
 /**
- * Token registry.
+ * Token registry — the STON.fi asset registry is the AUTHORITY.
  *
- * - Discovery: STON.fi asset list (provider reality, not fabricated).
- * - Verification: provider flags mapped onto our 4-state lifecycle.
- *   'suspicious'/'blacklisted' tokens are NEVER returned for swap/search.
- * - Self-healing: search() refreshes from the provider when the local
- *   registry is empty (e.g., first boot after deploy).
+ *  - Discovery reads the provider (never fabricated, never limited to what a
+ *    local database happens to contain). MongoDB is only a write-through
+ *    cache for admin tooling; a local miss NEVER marks a token unavailable.
+ *  - An empty query is a BROWSE request (most popular listed tokens), not an
+ *    empty result.
+ *  - TON is a NATIVE asset: it is never returned as, searched as, or treated
+ *    as a Jetton (pTON / wTON proxies are excluded too).
+ *  - ATF is excluded: it has its own dedicated swap interface.
+ *  - Blacklisted / deprecated assets are never returned.
+ *  - A provider OUTAGE throws; it is never reported as "no results".
+ *
+ * Whether a listed token has an actually EXECUTABLE route is decided at
+ * quote time by the multi-token swap service (a real STON.fi simulation),
+ * not here.
  */
 export class TokenRegistry {
-  private static cache: { tokens: TokenRef[]; at: number } | null = null;
-  private static readonly CACHE_TTL_MS = 10 * 60 * 1000;
+  private static cache: { tokens: CatalogToken[]; at: number } | null = null;
+  private static inflight: Promise<void> | null = null;
+  private static http: HttpFn = defaultHttp;
+
+  static readonly CACHE_TTL_MS = 10 * 60 * 1000;
+
+  /** Test seam — replace the provider transport. */
+  static setHttpForTests(fn: HttpFn | null): void {
+    this.http = fn ?? defaultHttp;
+    this.cache = null;
+    this.inflight = null;
+  }
 
   static normalize(addr: string): string {
-    return Address.parse(addr).toString();
+    return Address.parse(addr.trim()).toString();
   }
 
-  static isNative(symbolOrAddress: string): boolean {
-    const s = symbolOrAddress.trim().toLowerCase();
-    return s === 'ton' || s === 'gram' || s === 'native';
-  }
-
-  /**
-   * Refresh registry from STON.fi. Fail-soft: keeps last good cache.
-   * Defensive against multiple response shapes and price-field names.
-   */
-  static async refresh(): Promise<void> {
+  /** Canonical address, or null when the input is not an address. */
+  static tryNormalize(addr: string): string | null {
     try {
-      const res = await axios.get(`${config.stonfiApiUrl}/assets`, {
-        timeout: 10_000,
-        params: { limit: 300 },
-      });
-
-      const payload: any = res.data;
-      const rows: any[] = Array.isArray(payload)
-        ? payload
-        : (payload?.asset_list ?? payload?.assets ?? payload?.data ?? []);
-
-      console.log(`[TokenRegistry] refresh: ${rows.length} assets from provider`);
-
-      for (const raw of rows) {
-        try {
-          const masterAddress =
-            raw.contract_address ?? raw.address ?? raw.jetton_address ?? raw.master;
-          if (!masterAddress) continue;
-
-          const normalized = this.normalize(masterAddress);
-
-          const verification = this.mapVerification(raw.verification);
-          const symbol = String(raw.symbol ?? '').toUpperCase();
-          const name = String(raw.name ?? raw.display_name ?? symbol);
-          const decimals = Number(raw.decimals ?? 9);
-          const price =
-            raw.dex_price_usd ?? raw.price_usd ?? raw.usd_price ?? raw.price ?? null;
-
-          if (!symbol || !Number.isInteger(decimals)) continue;
-          if (verification === 'blacklisted') {
-            await SupportedToken.updateOne(
-              { masterAddress: normalized },
-              { $set: { isActive: false, verification: 'blacklisted' } }
-            );
-            continue;
-          }
-
-          await SupportedToken.updateOne(
-            { masterAddress: normalized },
-            {
-              $set: {
-                symbol,
-                name,
-                decimals,
-                verification,
-                imageUrl: raw.image_url ?? raw.image ?? undefined,
-                priceSource: 'ston.fi',
-                priceUpdatedAt: new Date(),
-                lastPriceUsd: price != null ? String(price) : undefined,
-                isActive: verification !== 'suspicious',
-              },
-            },
-            { upsert: true }
-          );
-        } catch {
-          // skip malformed asset rows — never crash discovery
-        }
-      }
-
-      const docs = await SupportedToken.find({ isActive: true });
-      this.cache = {
-        tokens: docs.map((d) => ({
-          masterAddress: d.masterAddress,
-          symbol: d.symbol,
-          name: d.name,
-          decimals: d.decimals,
-          verification: d.verification,
-        })),
-        at: Date.now(),
-      };
-    } catch (err) {
-      console.error('[TokenRegistry] refresh failed (keeping cache):', (err as Error).message);
-      if (!this.cache) throw err;
-    }
-  }
-
-  private static mapVerification(
-    raw: any
-  ): 'verified' | 'community' | 'suspicious' | 'blacklisted' {
-    const v = String(raw ?? '').toLowerCase();
-    if (v === 'whitelist' || v === 'verified' || v === 'trusted') return 'verified';
-    if (v === 'blacklist' || v === 'scam' || v === 'fake') return 'blacklisted';
-    if (v === 'none' || v === 'unverified') return 'suspicious';
-    return 'community';
-  }
-
-  static async listTradeable(): Promise<TokenRef[]> {
-    if (!this.cache || Date.now() - this.cache.at > this.CACHE_TTL_MS) {
-      await this.refresh();
-    }
-    return (this.cache?.tokens ?? []).filter(
-      (t) => t.verification === 'verified' || t.verification === 'community'
-    );
-  }
-
-  /**
-   * Search by name, symbol, or exact master address. Paginated.
-   * Self-heals: populates the registry on first use if empty.
-   */
-  static async search(
-    query: string,
-    page = 1,
-    pageSize = 8
-  ): Promise<{ items: ISupportedToken[]; total: number }> {
-    const q = query.trim();
-    if (!q) return { items: [], total: 0 };
-
-    // Self-heal: refresh from provider if the registry was never populated
-    if ((await SupportedToken.estimatedDocumentCount()) === 0) {
-      await this.refresh().catch(() => {});
-    }
-
-    let filter: any;
-
-    try {
-      const normalized = Address.parse(q).toString();
-      filter = { masterAddress: normalized, isActive: true };
-    } catch {
-      const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      filter = {
-        isActive: true,
-        verification: { $in: ['verified', 'community'] },
-        $or: [{ symbol: rx }, { name: rx }],
-      };
-    }
-
-    const [items, total] = await Promise.all([
-      SupportedToken.find(filter)
-        .sort({ verification: 1, symbol: 1 })
-        .skip((page - 1) * pageSize)
-        .limit(pageSize),
-      SupportedToken.countDocuments(filter),
-    ]);
-
-    return { items, total };
-  }
-
-  static async resolve(
-    masterAddress: string
-  ): Promise<ISupportedToken | null> {
-    try {
-      const normalized = this.normalize(masterAddress);
-      return await SupportedToken.findOne({
-        masterAddress: normalized,
-        isActive: true,
-      });
+      return this.normalize(addr);
     } catch {
       return null;
     }
   }
-}
+
+  static isNative(symbolOrAddress: string): boolean {
+    if (isNativeTonQuery(symbolOrAddress)) return true;
+    return (symbolOrAddress || '').trim() === NATIVE_TON.apiAddress;
+  }
+
+  /** Addresses that must never be offered as a swappable Jetton. */
+  static excludedAddresses(): string[] {
+    const out = new Set<string>();
+    for (const a of [config.atfJettonAddress, config.ptonMasterAddress, NATIVE_TON.apiAddress]) {
+      const n = a ? this.tryNormalize(a) : null;
+      if (n) out.add(n);
+    }
+    return [...out];
+  }
+
+  static isAtf(masterAddress: string): boolean {
+    const n = this.tryNormalize(masterAddress);
+    const atf = config.atfJettonAddress ? this.tryNormalize(config.atfJettonAddress) : null;
+    return !!n && !!atf && n === atf;
+  }
+
+  /* ───────────────── provider access ───────────────── */
+
+  private static async fetchCatalog(): Promise<CatalogToken[]> {
+    const norm = (a: string) => this.tryNormalize(a);
+    let lastError: unknown = null;
+
+    // /v1/assets is the documented listing; bare /assets kept as a fallback
+    // for self-hosted / proxied API roots.
+    for (const path of ['/v1/assets', '/assets']) {
+      try {
+        const payload = await this.http('GET', path);
+        const tokens = parseProviderAssets(payload, norm);
+        if (tokens.length > 0) return tokens;
+        lastError = new Error(`${path} returned no assets`);
+      } catch (err) {
+        lastError = err;
+      }
+    }
+
+    throw new Error(
+      `Token provider unavailable: ${(lastError as Error)?.message || 'unknown error'}`
+    );
+  }
+
+  /** Refresh the in-memory catalog from STON.fi. Keeps the last good copy on failure. */
+  static async refresh(): Promise<void> {
+    if (this.inflight) return this.inflight;
+
+    this.inflight = (async () => {
+      try {
+        const tokens = await this.fetchCatalog();
+        console.log(`[TokenRegistry] refresh: ${tokens.length} assets from provider`);
+        this.cache = { tokens, at: Date.now() };
+        void this.persist(tokens);
+      } catch (err) {
+        console.error('[TokenRegistry] refresh failed:', (err as Error).message);
+        if (!this.cache) throw err; // never pretend an outage is "no results"
+      } finally {
+        this.inflight = null;
+      }
+    })();
+
+    return this.inflight;
+  }
+
+  private static async ensureCatalog(): Promise<CatalogToken[]> {
+    if (!this.cache || Date.now() - this.cache.at > this.CACHE_TTL_MS) {
+      await this.refresh();
+    }
+    return this.cache?.tokens ?? [];
+  }
+
+  /** Best-effort write-through cache for admin tooling. Never authoritative. */
+  private static async persist(tokens: CatalogToken[]): Promise<void> {
+    try {
+      const ops = tokens
+        .filter((t) => t.kind === 'jetton')
+        .map((t) => ({
+          updateOne: {
+            filter: { masterAddress: t.masterAddress },
+            update: {
+              $set: {
+                symbol: t.symbol,
+                name: t.name,
+                decimals: t.decimals,
+                verification: t.verification,
+                imageUrl: t.imageUrl,
+                priceSource: 'ston.fi',
+                priceUpdatedAt: new Date(),
+                lastPriceUsd: t.priceUsd,
+                isActive: t.verification === 'verified' || t.verification === 'community',
+              },
+            },
+            upsert: true,
+          },
+        }));
+      if (ops.length > 0) await SupportedToken.bulkWrite(ops as any, { ordered: false });
+    } catch (err) {
+      console.warn('[TokenRegistry] cache write skipped:', (err as Error).message);
+    }
+  }
+
+  /** Authoritative single-asset lookup for tokens missing from the listing. */
+  private static async fetchSingle(canonical: string): Promise<CatalogToken | null> {
+    const norm = (a: string) => this.tryNormalize(a);
+    try {
+      const payload = await this.http('GET', `/v1/assets/${encodeURIComponent(canonical)}`);
+      return parseProviderAssets(payload, norm).find((t) => t.masterAddress === canonical) ?? null;
+    } catch (err: any) {
+      const status = err?.response?.status;
+      if (status === 404) return null; // provider says: not listed
+      throw err; // outage ≠ "not listed"
+    }
+  }
+
+  /** Provider-side name/symbol search for assets absent from the cached listing. */
+  private static async providerTextSearch(query: string): Promise<CatalogToken[]> {
+    const norm = (a: string) => this.tryNormalize(a);
+    const attempts: Array<() => Promise<any>> = [
+      () => this.http('POST', '/v1/assets/query', { data: { search_string: query } }),
+      () => this.http('GET', '/v1/assets/search', { params: { search_string: query } }),
+    ];
+    for (const attempt of attempts) {
+      try {
+        const tokens = parseProviderAssets(await attempt(), norm);
+        if (tokens.length > 0) return tokens;
+      } catch {
+        // try the next documented variant
+      }
+    }
+    return [];
+  }
+
+  /* ───────────────── public API ───────────────── */
+
+  /** All swappable Jettons the provider lists (popularity order). */
+  static async listTradeable(): Promise<TokenRef[]> {
+    const ex = { addresses: this.excludedAddresses() };
+    const catalog = await this.ensureCatalog();
+    return filterAndRank(
+      catalog.filter((t) => isSelectableJetton(t, ex)),
+      ''
+    ).map(toRef);
+  }
+
+  /**
+   * Search by name, symbol, or exact master address — all matches, ranked.
+   * Empty query = browse popular tokens. Throws on provider outage.
+   */
+  static async searchAll(query: string, limit = 60): Promise<TokenRef[]> {
+    const q = (query || '').trim();
+    const ex = { addresses: this.excludedAddresses() };
+
+    if (q && this.isNative(q)) return []; // native TON is not a Jetton
+
+    // ── Exact contract address: provider is the authority ──
+    const asAddress = q ? this.tryNormalize(q) : null;
+    if (asAddress) {
+      const catalog = await this.ensureCatalog();
+      let found = catalog.find((t) => t.masterAddress === asAddress) ?? null;
+      if (!found) found = await this.fetchSingle(asAddress);
+      return found && isSelectableJetton(found, ex) ? [toRef(found)] : [];
+    }
+
+    // ── Name / symbol / browse ──
+    const catalog = await this.ensureCatalog();
+    const selectable = catalog.filter((t) => isSelectableJetton(t, ex));
+    let ranked = filterAndRank(selectable, q);
+
+    if (ranked.length === 0 && q.length >= 2) {
+      const extra = (await this.providerTextSearch(q)).filter((t) => isSelectableJetton(t, ex));
+      ranked = filterAndRank(extra, q);
+    }
+
+    return ranked.slice(0, limit).map(toRef);
+  }
+
+  /** Paginated search (kept for callers that page server-side). */
+  static async search(
+    query: string,
+    page = 1,
+    pageSize = 8
+  ): Promise<{ items: TokenRef[]; total: number }> {
+    const all = await this.searchAll(query, 500);
+    const p = Math.max(1, Math.floor(page) || 1);
+    return { items: all.slice((p - 1) * pageSize, p * pageSize), total: all.length };
+  }
+
+  /**
+   * Resolve a master address against the PROVIDER. A local database miss never
+   * makes a token unavailable. Returns null only when the provider does not
+   * list it (or lists it as blacklisted/deprecated/excluded).
+   */
+  static async resolve(masterAddress: string): Promise<TokenRef | null> {
+    const canonical = this.tryNormalize(masterAddress);
+    if (!canonical) return null;
+
+    const ex = { addresses: this.excludedAddresses() };
+    const catalog = await this.ensureCatalog();
+    const found =
+      catalog.find((t) => t.masterAddress === canonical) ?? (await this.fetchSingle(canonical));
+
+    return found && isSelectableJetton(found, ex) ? toRef(found) : null;
+  }
+  }
+          
