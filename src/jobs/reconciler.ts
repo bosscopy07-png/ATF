@@ -6,6 +6,8 @@ import { Precision } from '../utils/precision';
 import { config, TON_DECIMALS, ATF_DECIMALS } from '../config';
 import { WalletService } from '../services/wallet-service';
 import { GasRecoveryService } from '../services/gas-recovery-service';
+import { isMultiTokenSwapMeta } from '../services/multi-token-swap-policy';
+import type { MultiTokenSwapService } from '../services/multi-token-swap-service';
 import {
   txTotalFeesNano,
   txOutMessageCount,
@@ -297,6 +299,16 @@ class ReconciliationService {
       if (this.shuttingDown) break;
       metrics.processed++;
 
+      // ── Multi-token swaps (TON→TOKEN / TOKEN→TON) are judged by their own
+      //    token-side evidence. They must never reach the ATF logic below,
+      //    which reads ATF balances and credits/refunds the ATF ledger.
+      if (isMultiTokenSwapMeta(swap.metadata)) {
+        await this.reconcileMultiTokenSwap(swap, metrics).catch((err) =>
+          console.error(`[Reconciler] Multi-token swap ${swap._id} error:`, err)
+        );
+        continue;
+      }
+
       if (!swap.txHash || !swap.toAddress) {
         metrics.skipped++;
         continue;
@@ -402,6 +414,168 @@ class ReconciliationService {
         await this.handleSwapError(swap, error as Error, metrics);
       }
     }
+  }
+
+  // ─── Multi-token swaps (isolated from the ATF logic) ───────────────────
+
+  private multiTokenSvc: MultiTokenSwapService | null = null;
+
+  private async multiToken(): Promise<MultiTokenSwapService> {
+    if (!this.multiTokenSvc) {
+      const { MultiTokenSwapService: Svc } = await import('../services/multi-token-swap-service');
+      this.multiTokenSvc = new Svc();
+    }
+    return this.multiTokenSvc;
+  }
+
+  /**
+   * Determines the REAL outcome of a TON→TOKEN / TOKEN→TON swap from on-chain
+   * evidence and persists it. The bot never does this — a broadcast is not a
+   * result. Fee collection and gas recovery are then driven through the
+   * existing ensureFeeTransfer() / gas-recovery machinery (no second collector).
+   */
+  private async reconcileMultiTokenSwap(swap: any, metrics: ReconcileMetrics): Promise<void> {
+    const meta = (swap.metadata || {}) as Record<string, any>;
+    const createdMs = new Date(swap.createdAt).getTime();
+    const broadcastedLike =
+      !!swap.toAddress || meta.swapBroadcasted === true || meta.broadcastUncertain === true;
+
+    // A row that never recorded a broadcast may still be mid-execution
+    // (treasury advance + confirmation). Give it ample time, then let the
+    // on-chain evidence — not the clock alone — decide.
+    if (!broadcastedLike && Date.now() - createdMs < 5 * 60_000) {
+      metrics.skipped++;
+      return;
+    }
+
+    let verdict: Awaited<ReturnType<MultiTokenSwapService['evaluateOutcome']>>;
+    try {
+      verdict = await (await this.multiToken()).evaluateOutcome(swap);
+    } catch (err) {
+      // Evidence could not be read — never a verdict. Retry next tick.
+      console.warn(
+        `[Reconciler] Multi-token swap ${swap._id}: evidence unreadable (${(err as Error).message}) — will retry`
+      );
+      metrics.skipped++;
+      return;
+    }
+
+    if (verdict.status === 'pending') {
+      metrics.skipped++;
+      return;
+    }
+
+    console.log(
+      `[Reconciler] Multi-token swap ${swap._id} outcome=${verdict.status} method=${verdict.method} ` +
+        `actualOutput=${verdict.actualOutputBase}`
+    );
+
+    let postCommit = undefined as (() => Promise<void>) | undefined;
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        postCommit = undefined;
+        const locked = await Transaction.findOne(
+          { _id: swap._id, status: { $in: ['pending', 'processing'] } },
+          null,
+          { session }
+        );
+        if (!locked) return; // already finalized elsewhere — nothing to do
+
+        locked.metadata = {
+          ...locked.metadata,
+          swapOutcome: verdict.status,
+          actualOutputBaseUnits: verdict.actualOutputBase.toString(),
+          outcomeDetectedAt: new Date().toISOString(),
+          outputDetectionMethod: verdict.method,
+          ...(verdict.tokenDeltaBase !== undefined ? { tokenDeltaBase: verdict.tokenDeltaBase } : {}),
+        };
+
+        if (verdict.status === 'success') {
+          postCommit = await this.finalizeMultiTokenSwap(locked, session, metrics);
+        } else {
+          await this.failMultiTokenSwap(locked, session, metrics);
+        }
+      });
+    } finally {
+      await session.endSession();
+    }
+
+    // Only AFTER the Mongo transaction committed (so the fee record is visible).
+    if (postCommit) {
+      await postCommit().catch((err) =>
+        console.error('[Reconciler] Multi-token post-swap actions failed:', err)
+      );
+    }
+  }
+
+  /** Completed on proven on-chain output. No internal-ledger changes (none were made at execution). */
+  private async finalizeMultiTokenSwap(
+    swap: any,
+    session: ClientSession,
+    metrics: ReconcileMetrics
+  ): Promise<() => Promise<void>> {
+    swap.status = 'completed';
+    swap.reconciledAt = new Date();
+    swap.metadata = { ...(swap.metadata || {}), swapOutcome: 'success' };
+    await swap.save({ session });
+    metrics.confirmed++;
+
+    // Same canonical fee-record + post-commit handoff the ATF swaps use:
+    // platform fee (+ TOKEN→TON output fee) first, then the gas clawback.
+    return this.ensureFeeTransfer(swap, session);
+  }
+
+/**
+   * Failed on-chain. A swap that did not happen owes NO platform fee (it is
+   * waived and recorded), and any TON advance is reclaimed by the existing
+   * gas recovery. Nothing is refunded to an internal ledger because the
+   * multi-token flow never debits one.
+   */
+  private async failMultiTokenSwap(
+    swap: any,
+    session: ClientSession,
+    metrics: ReconcileMetrics
+  ): Promise<void> {
+    if (swap.status === 'failed') return;
+
+    const meta = (swap.metadata || {}) as Record<string, any>;
+    const waived = swap.fee || '0';
+
+    swap.status = 'failed';
+    swap.fee = '0';
+    swap.feeStatus = 'failed';
+    swap.metadata = {
+      ...meta,
+      onChainFailure: true,
+      swapOutcome: 'failed',
+      feeWaivedBase: waived,
+    };
+    await swap.save({ session });
+    metrics.failed++;
+
+    setImmediate(() => {
+      const m = (swap.metadata || {}) as Record<string, any>;
+      if (m.gasRecoveryWalletAddress && m.gasRecoveryStatus) {
+        this.gasRecovery
+          .recoverAdminGasSafely({
+            swapTransactionId: swap._id.toString(),
+            userId: swap.userId,
+            walletAddress: m.gasRecoveryWalletAddress as string,
+          })
+          .then((result) => {
+            console.log(
+              `[Reconciler] Gas recovery after failed multi-token swap ${swap._id}: status=${result.status}, ` +
+                `recovered=${Precision.fromBaseUnits(result.totalRecoveredNano, TON_DECIMALS)} TON, ` +
+                `pending=${Precision.fromBaseUnits(result.pendingNano, TON_DECIMALS)} TON` +
+                (result.skippedReason ? ` (${result.skippedReason})` : '')
+            );
+          })
+          .catch((err) => {
+            console.error(`[Reconciler] Gas recovery failed for multi-token swap ${swap._id}:`, err);
+          });
+      }
+    });
   }
 
   /** True when the offered ATF has left the swap wallet (>= 99% of the swapped amount). */
@@ -963,4 +1137,4 @@ export function stopReconciler(): void {
   service.stop();
       }
 
-            
+
