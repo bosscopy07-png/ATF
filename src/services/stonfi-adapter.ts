@@ -15,6 +15,10 @@ export interface SwapQuote {
   ptonMasterAddress: string;
   route: string;
   expiresAt: Date;
+  /** Router version reported by the simulation (additive; ATF builder ignores these). */
+  routerMajorVersion?: number;
+  routerMinorVersion?: number;
+  routerType?: string;
 }
 
 export interface SwapTxParams {
@@ -138,6 +142,10 @@ export class STONFiAdapter {
         ptonMasterAddress,
         route: result.route || routerAddress,
         expiresAt: new Date(Date.now() + 30_000),
+        routerMajorVersion: Number(result.router?.majorVersion ?? result.router?.major_version) || undefined,
+        routerMinorVersion:
+          result.router?.minorVersion ?? result.router?.minor_version ?? undefined,
+        routerType: result.router?.routerType ?? result.router?.router_type ?? undefined,
       };
     } catch (error: any) {
       const status = error?.response?.status ?? error?.status;
@@ -253,6 +261,82 @@ export class STONFiAdapter {
     };
   }
 
+  /**
+   * Version-aware builder for the multi-token flow. STON.fi may route a pair
+   * through a v1 or v2.x router; building with the wrong class is rejected by
+   * the SDK ("instance v2.1 Router with a v1 address"). The simulation tells
+   * us which router it chose, so use exactly that. When the simulation gave
+   * no version, behaviour is identical to buildSwapTransaction (v2.1).
+   *
+   * The ATF builder above is intentionally untouched.
+   */
+  async buildRoutedSwapTransaction(
+    userWalletAddress: string,
+    quote: SwapQuote,
+    offerAddress: string,
+    askAddress: string
+  ): Promise<SwapTxParams> {
+    const offer = normalizeAsset(offerAddress);
+    const ask = normalizeAsset(askAddress);
+
+    if (!userWalletAddress) throw new Error('User wallet address is required');
+    if (!quote.routerAddress) throw new Error('Swap quote is missing router address');
+
+    const ptonMasterAddress: string = quote.ptonMasterAddress || PTON_MASTER_ADDRESS;
+
+    const routerInfo: any = {
+      address: quote.routerAddress,
+      ptonMasterAddress,
+      majorVersion: quote.routerMajorVersion ?? 2,
+      minorVersion: quote.routerMinorVersion ?? (quote.routerMajorVersion === 1 ? 0 : 1),
+      routerType: quote.routerType ?? 'ConstantProduct',
+    };
+
+    const dexContracts: any = dexFactory(routerInfo);
+    const router = this.tonClient.open(dexContracts.Router.create(routerInfo.address));
+
+    const nativeOffer = isNativeGram(offer);
+    const nativeAsk = isNativeGram(ask);
+    if (nativeOffer && nativeAsk) throw new Error('Cannot build GRAM to GRAM swap');
+
+    const sharedParams = {
+      userWalletAddress,
+      offerAmount: quote.offerUnits,
+      minAskAmount: quote.minAskUnits,
+    };
+
+    let rawParams: any;
+    if (nativeOffer && !nativeAsk) {
+      const proxyTon = dexContracts.pTON.create(ptonMasterAddress);
+      rawParams = await router.getSwapTonToJettonTxParams({
+        ...sharedParams, proxyTon, askJettonAddress: ask,
+      });
+    } else if (!nativeOffer && nativeAsk) {
+      const proxyTon = dexContracts.pTON.create(ptonMasterAddress);
+      rawParams = await router.getSwapJettonToTonTxParams({
+        ...sharedParams, proxyTon, offerJettonAddress: offer,
+      });
+    } else {
+      rawParams = await router.getSwapJettonToJettonTxParams({
+        ...sharedParams, offerJettonAddress: offer, askJettonAddress: ask,
+      });
+    }
+
+    if (!rawParams || !rawParams.to || rawParams.value === undefined || !rawParams.body) {
+      throw new Error('Failed to build the swap transaction');
+    }
+
+    const valueNano = BigInt(rawParams.value.toString());
+    const whole = valueNano / 1_000_000_000n;
+    const remainder = valueNano % 1_000_000_000n;
+    return {
+      to: extractAddress(rawParams.to),
+      value: valueNano,
+      body: rawParams.body,
+      gasTon: `${whole}.${remainder.toString().padStart(9, '0')}`,
+    };
+  }
+
   async getSwapStatus(routerAddress: string, ownerAddress: string, queryId: string): Promise<any> {
     if (!routerAddress) throw new Error('Router address is required');
     if (!ownerAddress) throw new Error('Owner address is required');
@@ -261,4 +345,5 @@ export class STONFiAdapter {
     return this.apiClient.getSwapStatus({ routerAddress, ownerAddress, queryId });
   }
   }
-  
+
+      
