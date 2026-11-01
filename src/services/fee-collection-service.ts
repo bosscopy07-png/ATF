@@ -52,8 +52,8 @@ type DeliveryOutcome = 'delivered' | 'bounced' | 'unknown';
 // tx's own success). Polling 20 x 4s burned ~80s on EVERY jetton fee before
 // the output fee and the gas clawback could start. 3 x 3s still catches a
 // normal arrival and keeps the whole post-swap sequence to seconds.
-const DELIVERY_POLL_ATTEMPTS = 3;
-const DELIVERY_POLL_INTERVAL_MS = 3_000;
+const DELIVERY_POLL_ATTEMPTS = 5; // 5 × 2s = 10s (was 3 × 3s = 9s): same patience, faster first answer
+const DELIVERY_POLL_INTERVAL_MS = 2_000; // latency only (was 3s); attempts×interval budget kept below
 const JETTON_TRANSFER_OP = 0x0f8a7ea5;
 
 // 0.1 TON — matches the attach sendJetton needs. Configurable; the earlier
@@ -919,4 +919,5 @@ export class FeeCollectorJob {
     }
   }
        }
-    
+
+      
