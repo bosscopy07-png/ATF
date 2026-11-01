@@ -56,18 +56,27 @@ export async function handleCallback(query: TelegramBot.CallbackQuery): Promise<
   if (data === 'cancel_swap') { await clearState(userId); await swapScreens.showSwapPair(userId, chatId); return; }
   if (data === 'confirm_swap') { await swapScreens.executeSwap(userId, chatId); return; }
 
-  /* ── PHASE 2: Multi-token swap ── */
+  /* ── PHASE 2: Multi-token swap (callback_data stays < 64 bytes: no addresses) ── */
   if (data === 'token_search') { await swapScreens.onTokenSearch(userId, chatId, user); return; }
-  if (data.startsWith('tokpage_')) {
-    const parts = data.split('_');
-    await swapScreens.showTokenList(userId, chatId, parts[1], parseInt(parts[2], 10));
+  if (data === 'mt_dir_t2k') { await swapScreens.startTonToToken(userId, chatId, user); return; }
+  if (data === 'mt_dir_k2t') { await swapScreens.startTokenToTon(userId, chatId, user); return; }
+  if (data === 'mt_browse') { await swapScreens.browseTokens(userId, chatId, user); return; }
+  if (data.startsWith('mt_page_')) {
+    await swapScreens.showTokenPage(userId, chatId, user, parseInt(data.replace('mt_page_', ''), 10) || 1);
     return;
   }
-  if (data.startsWith('tokpick_')) {
-    const parts = data.split('_');
-    await swapScreens.startTokenSwapInput(userId, chatId, parts[1], parts.slice(2).join('_'));
+  if (data.startsWith('mt_pick_')) {
+    const idx = parseInt(data.replace('mt_pick_', ''), 10);
+    if (Number.isInteger(idx) && idx >= 0) await swapScreens.pickToken(userId, chatId, user, idx);
+    else await swapScreens.onTokenSearch(userId, chatId, user);
     return;
   }
+  if (data === 'mt_refresh') {
+    if (user.state !== 'swap_token_confirm') { await showMainMenu(userId, chatId); return; }
+    await swapScreens.refreshTokenQuote(userId, chatId, user);
+    return;
+  }
+  if (data === 'mt_cancel') { await swapScreens.cancelTokenSwap(userId, chatId); return; }
   if (data === 'confirm_token_swap') {
     if (user.state !== 'swap_token_confirm') { await showMainMenu(userId, chatId); return; }
     await swapScreens.executeTokenSwap(userId, chatId, user);
@@ -264,7 +273,10 @@ export async function handleText(msg: TelegramBot.Message): Promise<void> {
   if (user.state === 'sweep_amount_input') { await adminScreens.handleSweepAmountInput(userId, chatId, text); return; }
 
   // PHASE 2: token search / swap amount
-  if (user.state === 'token_search') { await swapScreens.handleTokenSearchInput(userId, chatId, user, text); return; }
+  if (
+    user.state === 'token_search' ||
+    (user.state === 'token_pick' && user.stateData?.direction === 'ton_to_token')
+  ) { await swapScreens.handleTokenSearchInput(userId, chatId, user, text); return; }
   if (user.state === 'swap_token_amount') { await swapScreens.handleTokenSwapAmount(userId, chatId, user, text); return; }
 
   // PHASE 4: relay input states
@@ -294,4 +306,5 @@ export async function delUserMsg(msg: TelegramBot.Message): Promise<void> {
     await getBot().deleteMessage(msg.chat.id, msg.message_id);
   } catch { /* ignore */ }
      }
-                                
+
+                                                                            
