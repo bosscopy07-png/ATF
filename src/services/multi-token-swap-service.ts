@@ -143,7 +143,7 @@ export class QuoteExpiredError extends Error {
 
 export class NoRouteError extends Error {
   constructor(symbol: string) {
-    super(`No executable STON.fi swap route exists for ${symbol} right now.`);
+    super(`No swap route is available for ${symbol} right now.`);
     this.name = 'NoRouteError';
   }
 }
@@ -391,7 +391,7 @@ export class MultiTokenSwapService {
       throw new Error('Quote changed while preparing. Please try again.');
     }
 
-    const txParams = await this.stonfi.buildSwapTransaction(walletAddress, quote, offer, ask);
+    const txParams = await this.stonfi.buildRoutedSwapTransaction(walletAddress, quote, offer, ask);
     const swapValueNano = BigInt(txParams.value.toString());
 
     // ── Funding checks ──
@@ -512,7 +512,7 @@ export class MultiTokenSwapService {
 
     await checkRateLimit('swap:execute', userId, config.swapExecuteRateLimit, config.swapExecuteRateWindowMs);
 
-    // Execution can wait on the treasury lock + advance confirmation (~80s), so the
+     // Execution can wait on the treasury lock + advance confirmation (~80s), so the
     // per-user lock outlives the default 30s TTL.
     return withLock(`lock:swap:${userId}`, Math.max(config.swapLockTtlMs, 180_000), async () => {
       const idemKey = `mtswap:${userId}:${c.confirmationId}`;
@@ -581,7 +581,7 @@ export class MultiTokenSwapService {
     const { offer, ask } = this.pair(direction, token.masterAddress);
 
     // Rebuild the swap message from the quoted route (deterministic).
-    const swapParams = await this.stonfi.buildSwapTransaction(walletAddress, c.quote, offer, ask);
+    const swapParams = await this.stonfi.buildRoutedSwapTransaction(walletAddress, c.quote, offer, ask);
     const swapValue = BigInt(swapParams.value.toString());
     const quotedValue = BigInt(c.swapValueNano);
     if (swapValue > quotedValue + 20_000_000n) {
@@ -864,7 +864,7 @@ export class MultiTokenSwapService {
     // accept 98% of target — storage fees / rounding on the wallet
     const threshold = (target * 98n) / 100n;
     while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 3000));
+      await new Promise((r) => setTimeout(r, 1500));
       try {
         if ((await this.wallets.getTonBalanceStrict(address)) >= threshold) return true;
       } catch {
@@ -872,6 +872,59 @@ export class MultiTokenSwapService {
       }
     }
     return false;
+  }
+
+  /** Hand one swap to the shared reconciler (lazy import: no load-time cycle). */
+  protected async reconcileNow(swapId: string): Promise<void> {
+    const { reconcileMultiTokenSwapNow } = await import('../jobs/reconciler');
+    await reconcileMultiTokenSwapNow(swapId);
+  }
+
+  /* ═════ FAST SETTLEMENT (screen + background) ═════ */
+
+  /**
+   * Watch a broadcast swap until the chain decides it, polling every 2s
+   * instead of waiting for the 10s reconciler tick. The moment the evidence
+   * is definitive it hands the swap to the SAME reconciler code path, which
+   * persists the outcome and then collects the fee and reclaims the TON
+   * advance. Nothing is marked complete here — status only ever changes in
+   * the reconciler; this just reads it back.
+   */
+  async settle(
+    swapId: string,
+    opts: { timeoutMs?: number; pollMs?: number } = {}
+  ): Promise<{ status: 'completed' | 'failed' | 'pending'; tx: any }> {
+    const timeoutMs = opts.timeoutMs ?? 45_000;
+    const pollMs = opts.pollMs ?? 2_000;
+    const deadline = Date.now() + timeoutMs;
+    let handingOver = false;
+
+    for (;;) {
+      const tx: any = await Transaction.findById(swapId);
+      if (tx?.status === 'completed') return { status: 'completed', tx };
+      if (tx?.status === 'failed') return { status: 'failed', tx };
+      if (!tx || Date.now() >= deadline) return { status: 'pending', tx };
+
+      if (!handingOver) {
+        try {
+          const v = await this.evaluateOutcome(tx);
+          if (v.status !== 'pending') {
+            handingOver = true;
+            // Not awaited: the reconciler also collects the fee and reclaims the
+            // advance after the swap itself is final. Status flips at commit and
+            // the next poll picks it up.
+            this.reconcileNow(swapId)
+              .catch((err: any) => console.error(`[MultiTokenSwap] fast reconcile ${swapId}:`, err))
+              .finally(() => { handingOver = false; });
+          }
+        } catch (err: any) {
+          // evidence unreadable — keep polling; never a verdict
+          console.warn(`[MultiTokenSwap] settle ${swapId}: evidence read failed (${err?.message || err})`);
+        }
+      }
+
+      await new Promise((r) => setTimeout(r, pollMs));
+    }
   }
 
   /* ═════════════ OUTCOME EVIDENCE (called by the reconciler) ═════════════ */
@@ -1007,4 +1060,4 @@ export class MultiTokenSwapService {
   }
 }
 
-    
+      
