@@ -12,6 +12,7 @@ import { Transaction } from '../models/Transaction';
 import { AdminAction } from '../models/AdminAction';
 import { Referral } from '../models/Referral';
 import { SwapService } from '../services/swap-service';
+import { MultiTokenSwapService } from '../services/multi-token-swap-service';
 import { WithdrawalService } from '../services/withdrawal-service';
 import { WalletService } from '../services/wallet-service';
 import { PriceService } from '../services/price-service';
@@ -42,6 +43,7 @@ export type { RelayQuote };
 /* ── Service instances (single shared set) ── */
 
 export const swapService = new SwapService();
+export const multiTokenSwapService = new MultiTokenSwapService();
 export const withdrawalService = new WithdrawalService();
 export const walletService = new WalletService();
 export const priceService = PriceService.getInstance();
@@ -383,4 +385,4 @@ export function reviveRelayQuote(raw: any): RelayQuote {
     expiresAt: new Date(raw.expiresAt),
   };
     }
-    
+
