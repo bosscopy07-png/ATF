@@ -5,7 +5,7 @@
  */
 import {
   TelegramBot, User, Transaction, Precision, config, TON_DECIMALS, ATF_DECIMALS,
-  swapService, priceService, walletService,
+  swapService, multiTokenSwapService, priceService, walletService,
   render, toast, clearState,
   terminalHeader, stepHeader, explorerRow, fmtMoney, marketMovement,
   isValidAmount,
@@ -14,6 +14,7 @@ import {
 import { showMainMenu } from './main-menu';
 import * as keyboards from '../keyboards';
 import { TokenRegistry } from '../../services/token-registry';
+import { SwapInProgressError, QuoteExpiredError } from '../../services/multi-token-swap-service';
 
 /* ───────────────────────────────────────────────────────────────────────────
    🔄 SWAP FLOW (TON ↔ ATF — existing behavior preserved)
@@ -185,235 +186,400 @@ export async function executeSwap(userId: number, chatId: number): Promise<void>
 }
 
 /* ═══════════════════════════════════════════════════════════
-   PHASE 2 — MULTI-TOKEN SWAP UI
+   PHASE 2 — MULTI-TOKEN SWAP UI  (TON → TOKEN, TOKEN → TON)
+   All logic lives in MultiTokenSwapService. These screens only render and
+   route; they never decide an outcome or claim a swap succeeded.
    ═══════════════════════════════════════════════════════════ */
 
-const PAGE_SIZE_TOKENS = 8;
+const PAGE_SIZE_TOKENS = 6;
 
-export async function showTokenList(userId: number, chatId: number, direction: string, page: number): Promise<void> {
-  if (!config.features.multiTokenSwap) {
-    await toast(userId, chatId, '⏳ coming soon', keyboards.tokenSearchKeyboard());
-    return;
-  }
+const esc = (v: unknown): string =>
+  String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-  try {
-    const { items, total } = await TokenRegistry.search('', page, PAGE_SIZE_TOKENS);
-
-    await toast(userId, chatId,
-      [
-        terminalHeader('SELECT TOKEN', `page ${page} · ${total} token(s)`),
-        '',
-        `Only verified &amp; community tokens with executable routes are listed.`,
-      ].join('\n'),
-      keyboards.tokenListKeyboard(
-        items.map((t) => ({ masterAddress: t.masterAddress, symbol: t.symbol })),
-        page,
-        page * PAGE_SIZE_TOKENS < total,
-        direction
-      ));
-  } catch (err: any) {
-    await toast(userId, chatId,
-      `❌ token list unavailable: ${String(err.message).slice(0, 200)}`,
-      keyboards.tokenSearchKeyboard());
-  }
+/** base units → trimmed decimal string (never scientific, never float). */
+function fmt(base: string | bigint, decimals: number): string {
+  const full = Precision.fromBaseUnits(BigInt(base), decimals);
+  return full.includes('.') ? full.replace(/0+$/, '').replace(/\.$/, '') || '0' : full;
 }
 
-/** Callback entry for the 'token_search' button (routes through feature gate). */
-export async function onTokenSearch(userId: number, chatId: number, user: any): Promise<void> {
-  if (!config.features.multiTokenSwap) {
-    await toast(userId, chatId, '⏳ coming soon', keyboards.swapPairKeyboard());
-    return;
-  }
+const comingSoon = (userId: number, chatId: number) =>
+  toast(userId, chatId, '⏳ coming soon', keyboards.swapPairKeyboard());
 
-  user.state = 'token_search';
-  user.stateData = { direction: user.stateData?.direction ?? 'ton_to_token' };
+/** Entry for the 'token_search' button: pick a direction. */
+export async function onTokenSearch(userId: number, chatId: number, user: any): Promise<void> {
+  if (!config.features.multiTokenSwap) { await comingSoon(userId, chatId); return; }
+
+  user.state = 'idle';
+  user.stateData = {};
   await user.save();
 
   await toast(userId, chatId,
-    `${terminalHeader('TOKEN SEARCH')}\nType a token <b>name</b>, <b>symbol</b>, or exact <b>contract address</b>.`,
+    [
+      terminalHeader('SWAP OTHER TOKENS', 'real STON.fi routes · quoted before you confirm'),
+      '',
+      `💎 <b>TON → TOKEN</b> — buy any listed token`,
+      `🪙 <b>TOKEN → TON</b> — sell a token your wallet holds`,
+      '',
+      `<i>ATF has its own swap — use TON ⇄ ATF.</i>`,
+    ].join('\n'),
+    keyboards.multiTokenMenuKeyboard());
+}
+
+/** TON → TOKEN: ask for a name / symbol / contract address. */
+export async function startTonToToken(userId: number, chatId: number, user: any): Promise<void> {
+  if (!config.features.multiTokenSwap) { await comingSoon(userId, chatId); return; }
+
+  user.state = 'token_search';
+  user.stateData = { direction: 'ton_to_token' };
+  await user.save();
+
+  await toast(userId, chatId,
+    [
+      terminalHeader('TON → TOKEN', 'search the STON.fi registry'),
+      '',
+      `Type the token <b>name</b>, <b>symbol</b>, or <b>Jetton contract address</b>.`,
+    ].join('\n'),
     keyboards.tokenSearchKeyboard());
 }
 
-export async function handleTokenSearchInput(userId: number, chatId: number, user: any, text: string): Promise<void> {
-  const direction = user.stateData?.direction ?? 'ton_to_token';
+async function showChoices(userId: number, chatId: number, user: any, page: number, header: string): Promise<void> {
+  const st = user.stateData || {};
+  const choices: any[] = st.choices || [];
+  const isHoldings = st.direction === 'token_to_ton';
 
-  if (!config.features.multiTokenSwap) {
-    await toast(userId, chatId, '⏳ coming soon', keyboards.tokenSearchKeyboard());
+  const labels = choices.map((c) =>
+    isHoldings
+      ? `🪙 ${c.symbol} · ${fmt(c.balanceBase, c.decimals)}`
+      : `🪙 ${c.symbol} · ${String(c.name).slice(0, 24)}`
+  );
+
+  const start = (page - 1) * PAGE_SIZE_TOKENS;
+  const lines = choices.slice(start, start + PAGE_SIZE_TOKENS).map((c) =>
+    isHoldings
+      ? `• <b>${esc(c.symbol)}</b> — ${esc(c.name)}\n   balance <code>${fmt(c.balanceBase, c.decimals)}</code>`
+      : `• <b>${esc(c.symbol)}</b> — ${esc(c.name)}`
+  );
+
+  await toast(userId, chatId,
+    [header, '', ...lines, '', `<i>page ${page} · ${choices.length} token(s)</i>`].join('\n'),
+    keyboards.tokenChoiceKeyboard(labels, page, PAGE_SIZE_TOKENS, choices.length, !isHoldings));
+}
+
+/** Free-text search (state: token_search). */
+export async function handleTokenSearchInput(userId: number, chatId: number, user: any, text: string): Promise<void> {
+  if (!config.features.multiTokenSwap) { await comingSoon(userId, chatId); return; }
+
+  const query = text.trim().slice(0, 80);
+  if (!query) {
+    await startTonToToken(userId, chatId, user);
     return;
   }
+  await runSearch(userId, chatId, user, query);
+}
 
-  const query = text.trim().slice(0, 60);
-  if (!query) {
+/** Browse popular tokens (empty query is a BROWSE request, not "no results"). */
+export async function browseTokens(userId: number, chatId: number, user: any): Promise<void> {
+  if (!config.features.multiTokenSwap) { await comingSoon(userId, chatId); return; }
+  user.state = 'token_search';
+  user.stateData = { direction: 'ton_to_token' };
+  await user.save();
+  await runSearch(userId, chatId, user, '');
+}
+
+async function runSearch(userId: number, chatId: number, user: any, query: string): Promise<void> {
+  if (query && TokenRegistry.isNative(query)) {
     await toast(userId, chatId,
-      `${terminalHeader('TOKEN SEARCH')}\nType a token <b>name</b>, <b>symbol</b>, or exact <b>contract address</b>.`,
+      `${terminalHeader('TON → TOKEN')}\n💎 <b>TON</b> is the native asset you are paying with.\n\nType the token you want to <b>receive</b>.`,
       keyboards.tokenSearchKeyboard());
     return;
   }
-
-  try {
-    const { items, total } = await TokenRegistry.search(query, 1, PAGE_SIZE_TOKENS);
-
-    if (!total) {
+  if (query) {
+    const asAddr = TokenRegistry.tryNormalize(query);
+    if (asAddr && TokenRegistry.isAtf(asAddr)) {
       await toast(userId, chatId,
-        `${terminalHeader('TOKEN SEARCH')}\n❌ nothing supported found for <b>${query.slice(0, 40)}</b>.\n\nsearch by name, symbol, or exact contract address.`,
+        `${terminalHeader('TON → TOKEN')}\n🔷 ATF has its own dedicated swap — use <b>TON → ATF</b> from the swap menu.`,
         keyboards.tokenSearchKeyboard());
       return;
     }
-
-    await toast(userId, chatId,
-      `${terminalHeader('TOKEN SEARCH')}\n${total} result(s) for <b>${query.slice(0, 40)}</b>:`,
-      keyboards.tokenListKeyboard(
-        items.map((t) => ({ masterAddress: t.masterAddress, symbol: t.symbol })),
-        1,
-        total > PAGE_SIZE_TOKENS,
-        direction
-      ));
-  } catch (err: any) {
-    await toast(userId, chatId,
-      `❌ search failed: ${String(err.message).slice(0, 200)}`,
-      keyboards.tokenSearchKeyboard());
   }
+
+  let tokens;
+  try {
+    tokens = await multiTokenSwapService.searchTokens(query);
+  } catch (err: any) {
+    // Provider outage is NOT "no results".
+    await toast(userId, chatId,
+      `${terminalHeader('TOKEN SEARCH')}\n⚠️ The STON.fi token registry is unreachable right now. Please try again shortly.`,
+      keyboards.tokenSearchKeyboard());
+    console.error('[MultiToken] search failed:', err?.message || err);
+    return;
+  }
+
+  if (tokens.length === 0) {
+    await toast(userId, chatId,
+      `${terminalHeader('TOKEN SEARCH')}\n❌ No listed token matches <b>${esc(query.slice(0, 40))}</b>.\n\nTry the exact symbol or the Jetton contract address.`,
+      keyboards.tokenSearchKeyboard());
+    return;
+  }
+
+  user.state = 'token_pick';
+  user.stateData = { direction: 'ton_to_token', choices: tokens, query };
+  await user.save();
+
+  await showChoices(userId, chatId, user, 1,
+    terminalHeader('SELECT TOKEN', query ? `results for "${esc(query.slice(0, 30))}"` : 'popular on STON.fi'));
 }
 
-export async function startTokenSwapInput(userId: number, chatId: number, direction: string, master: string): Promise<void> {
-  if (!config.features.multiTokenSwap) {
-    await toast(userId, chatId, '⏳ coming soon', keyboards.tokenSearchKeyboard());
-    return;
-  }
+/** TOKEN → TON: load the wallet's actual Jetton balances. */
+export async function startTokenToTon(userId: number, chatId: number, user: any): Promise<void> {
+  if (!config.features.multiTokenSwap) { await comingSoon(userId, chatId); return; }
 
-  const token = await TokenRegistry.resolve(master);
-  if (!token) {
+  let result;
+  try {
+    result = await multiTokenSwapService.listWalletTokens(userId);
+  } catch (err: any) {
     await toast(userId, chatId,
-      `${terminalHeader('SWAP')}\n❌ token unavailable, unverified, or route unsupported.`,
-      keyboards.tokenSearchKeyboard());
+      `${terminalHeader('TOKEN → TON')}\n⚠️ Could not load your wallet tokens right now. Please try again shortly.`,
+      keyboards.multiTokenMenuKeyboard());
+    console.error('[MultiToken] wallet discovery failed:', err?.message || err);
     return;
   }
 
-  const user = await User.findOne({ telegramId: userId });
-  if (!user) return;
+  if (result.holdings.length === 0) {
+    await toast(userId, chatId,
+      `${terminalHeader('TOKEN → TON')}\nYour wallet holds no swappable tokens with a positive balance.\n\n<i>ATF is swapped from the TON ⇄ ATF screen.</i>`,
+      keyboards.multiTokenMenuKeyboard());
+    return;
+  }
+
+  user.state = 'token_pick';
+  user.stateData = { direction: 'token_to_ton', choices: result.holdings };
+  await user.save();
+
+  await showChoices(userId, chatId, user, 1, terminalHeader('YOUR TOKENS', 'select one to sell for TON'));
+}
+
+export async function showTokenPage(userId: number, chatId: number, user: any, page: number): Promise<void> {
+  if (user.state !== 'token_pick') { await onTokenSearch(userId, chatId, user); return; }
+  const header = user.stateData?.direction === 'token_to_ton'
+    ? terminalHeader('YOUR TOKENS', 'select one to sell for TON')
+    : terminalHeader('SELECT TOKEN');
+  await showChoices(userId, chatId, user, Math.max(1, page), header);
+}
+
+/** A choice was tapped: verify an EXECUTABLE route, then ask for the amount. */
+export async function pickToken(userId: number, chatId: number, user: any, index: number): Promise<void> {
+  if (!config.features.multiTokenSwap) { await comingSoon(userId, chatId); return; }
+  if (user.state !== 'token_pick') { await onTokenSearch(userId, chatId, user); return; }
+
+  const st = user.stateData || {};
+  const choice = (st.choices || [])[index];
+  if (!choice) { await onTokenSearch(userId, chatId, user); return; }
+
+  const direction: 'ton_to_token' | 'token_to_ton' = st.direction;
+  const token = {
+    masterAddress: choice.masterAddress,
+    symbol: choice.symbol,
+    name: choice.name,
+    decimals: choice.decimals,
+  };
+
+  // Probe with a tenth of the held balance when selling, minimum swap when buying.
+  let probe: bigint | undefined;
+  if (direction === 'token_to_ton') {
+    const held = BigInt(choice.balanceBase);
+    probe = held / 10n > 0n ? held / 10n : held;
+  }
+  const route = await multiTokenSwapService.checkRoute(direction, token, probe);
+
+  if (route === 'no_route') {
+    await toast(userId, chatId,
+      `${terminalHeader('NO ROUTE')}\n❌ STON.fi has no executable swap route for <b>${esc(token.symbol)}</b> right now.`,
+      keyboards.tokenChoiceKeyboard(
+        (st.choices || []).map((c: any) => `🪙 ${c.symbol}`),
+        1, PAGE_SIZE_TOKENS, (st.choices || []).length, direction === 'ton_to_token'));
+    return;
+  }
+  if (route === 'unknown') {
+    await toast(userId, chatId,
+      `${terminalHeader('ROUTE CHECK')}\n⚠️ Could not verify a STON.fi route for <b>${esc(token.symbol)}</b> just now. Tap it again in a moment.`,
+      keyboards.tokenChoiceKeyboard(
+        (st.choices || []).map((c: any) => `🪙 ${c.symbol}`),
+        1, PAGE_SIZE_TOKENS, (st.choices || []).length, direction === 'ton_to_token'));
+    return;
+  }
 
   user.state = 'swap_token_amount';
   user.stateData = {
     direction,
-    tokenMaster: token.masterAddress,
-    tokenSymbol: token.symbol,
-    tokenDecimals: token.decimals,
+    token,
+    balanceBase: direction === 'token_to_ton' ? choice.balanceBase : undefined,
   };
   await user.save();
 
-  const inputName = direction === 'ton_to_token' ? 'TON' : token.symbol;
-
-  await toast(userId, chatId,
-    [
-      stepHeader('SWAP', `${direction === 'ton_to_token' ? 'TON → ' + token.symbol : token.symbol + ' → TON'}`),
-      '',
-      `Enter the amount of <b>${inputName}</b> to swap:`,
-    ].join('\n'),
-    keyboards.cancelKeyboard('swap'));
+  const inputSym = direction === 'ton_to_token' ? 'TON' : token.symbol;
+  const lines = [
+    stepHeader('SWAP', direction === 'ton_to_token' ? `TON → ${esc(token.symbol)}` : `${esc(token.symbol)} → TON`),
+    '',
+    `Enter the amount of <b>${esc(inputSym)}</b> to swap.`,
+  ];
+  if (direction === 'token_to_ton') {
+    lines.push('', `💳 Balance: <code>${fmt(choice.balanceBase, token.decimals)} ${esc(token.symbol)}</code>`);
+  } else {
+    lines.push('', `📌 Min: <code>${config.minSwapTon} TON</code>`);
+  }
+  await toast(userId, chatId, lines.join('\n'), keyboards.cancelKeyboard('mt_cancel'));
 }
 
+function renderQuote(c: any): string {
+  const outSym = esc(c.outputSymbol);
+  const inSym = esc(c.inputSymbol);
+  const lines: string[] = [
+    stepHeader('CONFIRM SWAP', `${inSym} → ${outSym}`),
+    '',
+    `▸ <b>YOU PAY</b>`,
+    `<code>${fmt(c.inputBase, c.inputDecimals)} ${inSym}</code>`,
+    `├ platform fee (${c.feePlan.platformPercent}%)  <code>${fmt(c.platformFee.amountBase, c.platformFee.decimals)} ${esc(c.platformFee.symbol)}</code>`,
+    `└ swaps with  <code>${fmt(c.feePlan.netInputBase, c.inputDecimals)} ${inSym}</code>`,
+    '',
+    `▸ <b>YOU RECEIVE</b>`,
+    `<code>${fmt(c.expectedOutputBase, c.outputDecimals)} ${outSym}</code> (DEX quote)`,
+    `└ minimum  <code>${fmt(c.minOutputBase, c.outputDecimals)} ${outSym}</code>`,
+  ];
+
+  if (BigInt(c.tonOutputFeeNano) > 0n) {
+    lines.push(
+      `├ TON output fee (${config.feePolicy.tokenToTonOutputPercent}%)  <code>${fmt(c.tonOutputFeeNano, TON_DECIMALS)} TON</code>`,
+      `└ after all fees ≈  <code>${fmt(c.netExpectedOutputBase, c.outputDecimals)} TON</code>  (min <code>${fmt(c.netMinOutputBase, c.outputDecimals)}</code>)`
+    );
+  }
+
+  // Network costs
+  const swapValue = BigInt(c.swapValueNano);
+  const netIn = BigInt(c.feePlan.netInputBase);
+  const gasAttach = c.direction === 'ton_to_token' ? (swapValue > netIn ? swapValue - netIn : 0n) : swapValue;
+  lines.push('', `⛽ <b>NETWORK</b>`, `└ gas attached  <code>${fmt(gasAttach, TON_DECIMALS)} TON</code> <i>(unused part is returned)</i>`);
+
+  if (BigInt(c.advanceNano) > 0n) {
+    lines.push(
+      `└ platform gas advance  <code>${fmt(c.advanceNano, TON_DECIMALS)} TON</code> <i>— sent to your wallet now and recovered from this swap</i>`
+    );
+  }
+
+  const secs = Math.max(0, Math.floor((new Date(c.expiresAt).getTime() - Date.now()) / 1000));
+  lines.push('', `rate  ${esc(c.rate)}`, `<i>quote expires in ~${secs}s — revalidated before sending</i>`);
+  return lines.join('\n');
+}
+
+/** Amount typed (state: swap_token_amount) → real STON.fi quote. */
 export async function handleTokenSwapAmount(userId: number, chatId: number, user: any, text: string): Promise<void> {
-  const { direction, tokenMaster, tokenSymbol, tokenDecimals } = user.stateData || {};
-  if (!direction || !tokenMaster) { await showMainMenu(userId, chatId); return; }
+  const { direction, token } = user.stateData || {};
+  if (!direction || !token) { await showMainMenu(userId, chatId); return; }
 
   const amount = text.trim();
-  if (!isValidAmount(amount) || Number(amount) <= 0) {
+  if (!isValidAmount(amount)) {
     await toast(userId, chatId,
       `${terminalHeader('SWAP')}\n❌ invalid amount — enter a positive number.`,
-      keyboards.cancelKeyboard('swap'));
+      keyboards.cancelKeyboard('mt_cancel'));
     return;
   }
 
+  await quoteAndShow(userId, chatId, user, direction, token, amount);
+}
+
+async function quoteAndShow(
+  userId: number, chatId: number, user: any,
+  direction: 'ton_to_token' | 'token_to_ton', token: any, amount: string
+): Promise<void> {
   let confirmation: any;
   try {
-    confirmation = await swapService.prepareTokenSwap(
-      userId, direction, tokenMaster, tokenDecimals, amount
-    );
+    confirmation = await multiTokenSwapService.prepare({ userId, direction, token, amount });
   } catch (err: any) {
+    const msg = String(err?.message || 'Quote failed').slice(0, 400);
     await toast(userId, chatId,
-      `${terminalHeader('SWAP')}\n❌ ${String(err.message).slice(0, 300)}`,
-      keyboards.tokenSearchKeyboard());
-    return;
+      `${terminalHeader('SWAP')}\n❌ ${msg}`,
+      keyboards.cancelKeyboard('mt_cancel'));
+    return; // stay in swap_token_amount so the user can try a smaller amount
   }
 
   user.state = 'swap_token_confirm';
-  user.stateData = { ...user.stateData, confirmation };
+  user.stateData = { direction, token, amount, confirmation };
   await user.save();
 
-  const fp = confirmation.feePlan;
-  const inputSymbol = direction === 'ton_to_token' ? 'TON' : tokenSymbol;
-  const outputSymbol = direction === 'ton_to_token' ? tokenSymbol : 'TON';
-
-  const feeLines: string[] = [];
-  if (fp.platformFeeInputBase && fp.platformFeeInputBase !== '0') {
-    feeLines.push(
-      `├ platform fee (${fp.platformPercent}%)  <code>${confirmation.platformFee}</code> ${inputSymbol} — from input`
-    );
-  } else {
-    feeLines.push(
-      `├ platform fee (${fp.platformPercent}%)  <code>${Precision.fromBaseUnits(BigInt(fp.platformFeeOutputBase), tokenDecimals)}</code> ${outputSymbol} — from output`
-    );
-  }
-  if (fp.tonOutputFeeBase && fp.tonOutputFeeBase !== '0') {
-    feeLines.push(
-      `├ TON output fee (${config.feePolicy.tokenToTonOutputPercent}%)  <code>${Precision.fromBaseUnits(BigInt(fp.tonOutputFeeBase), TON_DECIMALS)}</code> TON`
-    );
-  }
-
-  await toast(userId, chatId,
-    [
-      stepHeader('CONFIRM SWAP', `${inputSymbol} → ${outputSymbol}`),
-      '',
-      `<code>${confirmation.inputAmount}</code> ${inputSymbol}`,
-      ...feeLines,
-      `└ you receive  <code>${confirmation.expectedOutput}</code> ${outputSymbol}`,
-      `   minimum    <code>${confirmation.minOutput}</code> ${outputSymbol}`,
-      `⛽ DEX costs   <code>${confirmation.dexCosts}</code> TON`,
-      '',
-      `Quote valid until ${new Date(confirmation.expiresAt).toLocaleTimeString()} — revalidated before execution.`,
-    ].join('\n'),
-    { inline_keyboard: [
-      [{ text: '✅ Confirm Swap', callback_data: 'confirm_token_swap' }],
-      [{ text: '❌ Cancel', callback_data: 'swap' }],
-    ] });
+  await toast(userId, chatId, renderQuote(confirmation), keyboards.tokenConfirmKeyboard());
 }
 
+/** Re-quote with the same inputs (quotes live ~30s). */
+export async function refreshTokenQuote(userId: number, chatId: number, user: any): Promise<void> {
+  const { direction, token, amount } = user.stateData || {};
+  if (!direction || !token || !amount) { await onTokenSearch(userId, chatId, user); return; }
+  await quoteAndShow(userId, chatId, user, direction, token, amount);
+}
+
+export async function cancelTokenSwap(userId: number, chatId: number): Promise<void> {
+  await clearState(userId);
+  await showSwapPair(userId, chatId);
+}
+
+/** Confirm tapped. BROADCASTS ONLY — final status comes from the reconciler. */
 export async function executeTokenSwap(userId: number, chatId: number, user: any): Promise<void> {
   const st = user.stateData || {};
-  const { confirmation, tokenDecimals } = st;
+  const confirmation = st.confirmation;
 
   if (!config.features.multiTokenSwap || !confirmation) {
     await showMainMenu(userId, chatId);
     return;
   }
 
+  if (new Date() > new Date(confirmation.expiresAt)) {
+    await toast(userId, chatId,
+      `⏳ <b>Quote expired</b>\n\nTap Refresh for a new quote.`,
+      keyboards.tokenConfirmKeyboard());
+    return;
+  }
+
+  // Leave the confirm state first: a second tap now routes to the main menu,
+  // and anything that races past this still hits the idempotency row.
   user.state = 'idle';
   user.stateData = {};
   await user.save();
 
   await render(userId, chatId,
-    `🔄 <b>Executing swap…</b>\n\nbroadcasting to TON ⛓️`,
+    `🔄 <b>Sending swap…</b>\n\nbroadcasting to TON ⛓️`,
     { inline_keyboard: [[{ text: '🏠 Main Menu', callback_data: 'back_main' }]] }, { withImage: true });
 
   try {
-    const txId = await swapService.executeTokenSwap(userId, confirmation, tokenDecimals);
-    const txRecord = await Transaction.findById(txId);
-    const txHash = txRecord?.txHash || '';
+    const { transactionId } = await multiTokenSwapService.execute(userId, confirmation);
+    const txRecord = await Transaction.findById(transactionId);
+    const txHash = txRecord?.txHash && /^[0-9a-f]{64}$/i.test(txRecord.txHash) ? txRecord.txHash : '';
 
     await render(userId, chatId,
       [
-        `✅ <b>SWAP SUBMITTED</b>`,
+        `📨 <b>SWAP SUBMITTED</b>`,
         '',
-        `<code>${confirmation.inputAmount}</code> sent`,
-        `└ expect ~<code>${confirmation.expectedOutput}</code> back`,
-        `└ track final status in ◷ Activity`,
+        `<code>${fmt(confirmation.inputBase, confirmation.inputDecimals)} ${esc(confirmation.inputSymbol)}</code> → ~<code>${fmt(confirmation.expectedOutputBase, confirmation.outputDecimals)} ${esc(confirmation.outputSymbol)}</code>`,
+        `└ submitted to the network — <b>not confirmed yet</b>`,
+        `└ the final result is verified on-chain; track it in ◷ Activity`,
         explorerRow(txHash),
       ].filter(Boolean).join('\n'),
       keyboards.backKeyboard('back_main'), { withImage: true });
   } catch (err: any) {
+    if (err instanceof SwapInProgressError) {
+      // A duplicate tap / retry of a swap that is already being handled.
+      await toast(userId, chatId,
+        `⏳ This swap is already being processed. Check ◷ Activity for its status.`,
+        keyboards.backKeyboard('back_main'));
+      return;
+    }
+    if (err instanceof QuoteExpiredError) {
+      await toast(userId, chatId,
+        `⏳ <b>Quote expired</b>\n\nStart the swap again for a fresh quote.`,
+        keyboards.multiTokenMenuKeyboard());
+      return;
+    }
     await toast(userId, chatId,
-      `❌ <b>Swap failed</b>\n\n${String(err.message).slice(0, 300)}`,
-      keyboards.tokenSearchKeyboard());
+      `❌ <b>Swap not sent</b>\n\n${esc(String(err?.message || err).slice(0, 400))}`,
+      keyboards.multiTokenMenuKeyboard());
   }
-                                                                                             }
-  
+                                        }
+    
