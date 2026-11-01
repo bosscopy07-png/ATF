@@ -28,8 +28,9 @@ export function isMultiTokenSwapMeta(meta: any): boolean {
    ───────────────────────────────────────────── */
 
 export const MT_TIMING = {
-  /** token → TON: jettons must stay gone this long (refund window) before success. */
-  tokenSettleMs: 30_000,
+  /** token → TON: jettons must stay gone this long (refund window) before success.
+   *  10s = the window the live ATF flow already uses; was 30s (the main delay). */
+  tokenSettleMs: 10_000,
   /** token → TON: jettons still in the wallet this long after broadcast → failed. */
   tokenNotConsumedFailMs: 90_000,
   /** TON → token: no output token this long after broadcast → failed. */
@@ -245,4 +246,5 @@ export function parseDecimalToBase(amount: string, decimals: number): bigint | n
   } catch {
     return null;
   }
-}
+          }
+        
