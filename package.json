@@ -1,7 +1,7 @@
 {
   "name": "aftswap",
   "version": "1.0.0",
-  "description": "TON ↔ ATF Custodial Exchange Telegram Bot",
+  "description": "TON \u2194 ATF Custodial Exchange Telegram Bot",
   "main": "dist/app.js",
   "scripts": {
     "build": "tsc && node scripts/copy-admin-dashboard.js",
@@ -9,7 +9,8 @@
     "dev:server": "APP_MODE=server ts-node src/app.ts",
     "dev:worker": "APP_MODE=worker ts-node src/app.ts",
     "test": "tsc && node --test dist/tests/",
-    "test:regression": "tsc && node --test tests/*.test.cjs"
+    "test:regression": "tsc && node --test tests/*.test.cjs",
+    "test:multitoken": "tsx --test tests/multi-token-swap.test.ts tests/multi-token-policy.test.ts"
   },
   "dependencies": {
     "@ston-fi/api": "^0.14.0",
@@ -36,6 +37,7 @@
     "@types/node-cron": "^3.0.11",
     "@types/node-telegram-bot-api": "^0.64.7",
     "ts-node": "^10.9.2",
+    "tsx": "^4.19.0",
     "typescript": "^5.6.3"
   }
 }
