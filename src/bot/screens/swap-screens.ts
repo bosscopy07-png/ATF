@@ -202,6 +202,15 @@ function fmt(base: string | bigint, decimals: number): string {
   return full.includes('.') ? full.replace(/0+$/, '').replace(/\.$/, '') || '0' : full;
 }
 
+/** Our own, already user-safe messages pass through; anything else is generic. */
+const SAFE_ERROR = /^(Insufficient|Invalid amount|Minimum swap|You hold no|Quote expired|Your active wallet|Network gas|Platform gas|The gas top-up|Account is frozen|This swap|No swap route|Quote changed|ATF has its own|Unsupported)/i;
+function friendlyError(err: any): string {
+  const msg = String(err?.message || err || '');
+  if (SAFE_ERROR.test(msg)) return esc(msg.slice(0, 400));
+  console.error('[MultiToken] hidden internal error:', msg);
+  return "This swap can't be completed right now. Please try again, or try a different amount or token.";
+}
+
 const comingSoon = (userId: number, chatId: number) =>
   toast(userId, chatId, '⏳ coming soon', keyboards.swapPairKeyboard());
 
@@ -215,12 +224,10 @@ export async function onTokenSearch(userId: number, chatId: number, user: any): 
 
   await toast(userId, chatId,
     [
-      terminalHeader('SWAP OTHER TOKENS', 'real STON.fi routes · quoted before you confirm'),
+      terminalHeader('SWAP OTHER TOKENS', 'live quote before you confirm'),
       '',
       `💎 <b>TON → TOKEN</b> — buy any listed token`,
       `🪙 <b>TOKEN → TON</b> — sell a token your wallet holds`,
-      '',
-      `<i>ATF has its own swap — use TON ⇄ ATF.</i>`,
     ].join('\n'),
     keyboards.multiTokenMenuKeyboard());
 }
@@ -235,7 +242,7 @@ export async function startTonToToken(userId: number, chatId: number, user: any)
 
   await toast(userId, chatId,
     [
-      terminalHeader('TON → TOKEN', 'search the STON.fi registry'),
+      terminalHeader('TON → TOKEN', 'search any listed token'),
       '',
       `Type the token <b>name</b>, <b>symbol</b>, or <b>Jetton contract address</b>.`,
     ].join('\n'),
@@ -309,7 +316,7 @@ async function runSearch(userId: number, chatId: number, user: any, query: strin
   } catch (err: any) {
     // Provider outage is NOT "no results".
     await toast(userId, chatId,
-      `${terminalHeader('TOKEN SEARCH')}\n⚠️ The STON.fi token registry is unreachable right now. Please try again shortly.`,
+      `${terminalHeader('TOKEN SEARCH')}\n⚠️ Token search is unavailable right now. Please try again shortly.`,
       keyboards.tokenSearchKeyboard());
     console.error('[MultiToken] search failed:', err?.message || err);
     return;
@@ -327,7 +334,7 @@ async function runSearch(userId: number, chatId: number, user: any, query: strin
   await user.save();
 
   await showChoices(userId, chatId, user, 1,
-    terminalHeader('SELECT TOKEN', query ? `results for "${esc(query.slice(0, 30))}"` : 'popular on STON.fi'));
+    terminalHeader('SELECT TOKEN', query ? `results for "${esc(query.slice(0, 30))}"` : 'popular tokens'));
 }
 
 /** TOKEN → TON: load the wallet's actual Jetton balances. */
@@ -394,7 +401,7 @@ export async function pickToken(userId: number, chatId: number, user: any, index
 
   if (route === 'no_route') {
     await toast(userId, chatId,
-      `${terminalHeader('NO ROUTE')}\n❌ STON.fi has no executable swap route for <b>${esc(token.symbol)}</b> right now.`,
+      `${terminalHeader('NO ROUTE')}\n❌ No swap route is available for <b>${esc(token.symbol)}</b> right now.`,
       keyboards.tokenChoiceKeyboard(
         (st.choices || []).map((c: any) => `🪙 ${c.symbol}`),
         1, PAGE_SIZE_TOKENS, (st.choices || []).length, direction === 'ton_to_token'));
@@ -402,7 +409,7 @@ export async function pickToken(userId: number, chatId: number, user: any, index
   }
   if (route === 'unknown') {
     await toast(userId, chatId,
-      `${terminalHeader('ROUTE CHECK')}\n⚠️ Could not verify a STON.fi route for <b>${esc(token.symbol)}</b> just now. Tap it again in a moment.`,
+      `${terminalHeader('ROUTE CHECK')}\n⚠️ Could not check <b>${esc(token.symbol)}</b> just now. Tap it again in a moment.`,
       keyboards.tokenChoiceKeyboard(
         (st.choices || []).map((c: any) => `🪙 ${c.symbol}`),
         1, PAGE_SIZE_TOKENS, (st.choices || []).length, direction === 'ton_to_token'));
@@ -471,7 +478,7 @@ function renderQuote(c: any): string {
   return lines.join('\n');
 }
 
-/** Amount typed (state: swap_token_amount) → real STON.fi quote. */
+/** Amount typed (state: swap_token_amount) → live quote. */
 export async function handleTokenSwapAmount(userId: number, chatId: number, user: any, text: string): Promise<void> {
   const { direction, token } = user.stateData || {};
   if (!direction || !token) { await showMainMenu(userId, chatId); return; }
@@ -495,9 +502,8 @@ async function quoteAndShow(
   try {
     confirmation = await multiTokenSwapService.prepare({ userId, direction, token, amount });
   } catch (err: any) {
-    const msg = String(err?.message || 'Quote failed').slice(0, 400);
     await toast(userId, chatId,
-      `${terminalHeader('SWAP')}\n❌ ${msg}`,
+      `${terminalHeader('SWAP')}\n❌ ${friendlyError(err)}`,
       keyboards.cancelKeyboard('mt_cancel'));
     return; // stay in swap_token_amount so the user can try a smaller amount
   }
@@ -550,19 +556,48 @@ export async function executeTokenSwap(userId: number, chatId: number, user: any
 
   try {
     const { transactionId } = await multiTokenSwapService.execute(userId, confirmation);
-    const txRecord = await Transaction.findById(transactionId);
-    const txHash = txRecord?.txHash && /^[0-9a-f]{64}$/i.test(txRecord.txHash) ? txRecord.txHash : '';
 
+    // Watch the chain every 2s; the screen flips to COMPLETE the moment the
+    // result is proven on-chain (fee + rent recovery then finish behind it).
+    const result = await multiTokenSwapService.settle(transactionId, { timeoutMs: 40_000 });
+    const meta = (result.tx?.metadata || {}) as Record<string, any>;
+    const txHash =
+      result.tx?.txHash && /^[0-9a-f]{64}$/i.test(result.tx.txHash) ? result.tx.txHash : '';
+
+    if (result.status === 'completed') {
+      // ton→token: the OBSERVED token increase. token→ton: the quoted net (the
+      // chain guarantees at least the minimum shown on the quote screen).
+      const received =
+        confirmation.direction === 'ton_to_token' && BigInt(meta.actualOutputBaseUnits || '0') > 0n
+          ? `<code>${fmt(meta.actualOutputBaseUnits, confirmation.outputDecimals)} ${esc(confirmation.outputSymbol)}</code>`
+          : `≈ <code>${fmt(confirmation.netExpectedOutputBase, confirmation.outputDecimals)} ${esc(confirmation.outputSymbol)}</code>`;
+
+      await render(userId, chatId,
+        [
+          `✅ <b>SWAP COMPLETE</b>`,
+          '',
+          `Paid  <code>${fmt(confirmation.inputBase, confirmation.inputDecimals)} ${esc(confirmation.inputSymbol)}</code>`,
+          `Received  ${received}`,
+          '',
+          `Your balance is updated.`,
+          explorerRow(txHash),
+        ].join('\n'),
+        keyboards.backKeyboard('back_main'), { withImage: true });
+      return;
+    }
+
+    if (result.status === 'failed') {
+      await render(userId, chatId,
+        `❌ <b>Swap failed</b>\n\nNothing was swapped and no fee was charged. Your funds are safe in your wallet.`,
+        keyboards.multiTokenMenuKeyboard(), { withImage: true });
+      return;
+    }
+
+    // Still finalizing on-chain (rare): keep watching and report the real result.
     await render(userId, chatId,
-      [
-        `📨 <b>SWAP SUBMITTED</b>`,
-        '',
-        `<code>${fmt(confirmation.inputBase, confirmation.inputDecimals)} ${esc(confirmation.inputSymbol)}</code> → ~<code>${fmt(confirmation.expectedOutputBase, confirmation.outputDecimals)} ${esc(confirmation.outputSymbol)}</code>`,
-        `└ submitted to the network — <b>not confirmed yet</b>`,
-        `└ the final result is verified on-chain; track it in ◷ Activity`,
-        explorerRow(txHash),
-      ].filter(Boolean).join('\n'),
+      `⏳ <b>Finalizing your swap…</b>\n\nThis is taking a little longer than usual. We'll message you the moment it's done.`,
       keyboards.backKeyboard('back_main'), { withImage: true });
+    void followUpSettlement(userId, chatId, transactionId, confirmation);
   } catch (err: any) {
     if (err instanceof SwapInProgressError) {
       // A duplicate tap / retry of a swap that is already being handled.
@@ -578,8 +613,26 @@ export async function executeTokenSwap(userId: number, chatId: number, user: any
       return;
     }
     await toast(userId, chatId,
-      `❌ <b>Swap not sent</b>\n\n${esc(String(err?.message || err).slice(0, 400))}`,
+      `❌ <b>Swap not sent</b>\n\n${friendlyError(err)}`,
       keyboards.multiTokenMenuKeyboard());
   }
-                                        }
-    
+}
+
+
+/** Background: keep watching a slow swap and tell the user the real result. */
+async function followUpSettlement(userId: number, chatId: number, swapId: string, confirmation: any): Promise<void> {
+  try {
+    const result = await multiTokenSwapService.settle(swapId, { timeoutMs: 5 * 60_000, pollMs: 3_000 });
+    if (result.status === 'completed') {
+      await toast(userId, chatId,
+        `✅ <b>SWAP COMPLETE</b>\n\n<code>${fmt(confirmation.inputBase, confirmation.inputDecimals)} ${esc(confirmation.inputSymbol)}</code> → ${esc(confirmation.outputSymbol)}\nYour balance is updated.`,
+        keyboards.backKeyboard('back_main'));
+    } else if (result.status === 'failed') {
+      await toast(userId, chatId,
+        `❌ <b>Swap failed</b>\n\nNothing was swapped and no fee was charged.`,
+        keyboards.multiTokenMenuKeyboard());
+    }
+  } catch (err) {
+    console.error('[MultiToken] follow-up settlement failed:', err);
+  }
+}
