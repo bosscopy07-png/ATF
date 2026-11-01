@@ -225,31 +225,54 @@ export function portfolioKeyboard(page: number, hasMore: boolean): TelegramBot.I
 
 /* ═══════════════════════════════════════════════════════════
    PHASE 2 — MULTI-TOKEN SWAP
+   Telegram limits callback_data to 64 BYTES. A Jetton address alone is 48
+   characters, so addresses are NEVER put in callbacks: choices are stored in
+   the user's state and referenced by index (mt_pick_<i>).
    ═══════════════════════════════════════════════════════════ */
 
-export function tokenSearchKeyboard(): TelegramBot.InlineKeyboardMarkup {
+export function multiTokenMenuKeyboard(): TelegramBot.InlineKeyboardMarkup {
   return { inline_keyboard: [
-    row(b('🔍 Search Token', 'token_search')),
+    row(b('💎 TON → TOKEN', 'mt_dir_t2k')),
+    row(b('🪙 TOKEN → TON', 'mt_dir_k2t')),
     row(b('‹ Back', 'swap')),
   ] };
 }
 
-export function tokenListKeyboard(
-  tokens: Array<{ masterAddress: string; symbol: string }>,
+export function tokenSearchKeyboard(): TelegramBot.InlineKeyboardMarkup {
+  return { inline_keyboard: [
+    row(b('🔥 Browse Popular', 'mt_browse')),
+    row(b('‹ Back', 'token_search')),
+  ] };
+}
+
+export function tokenChoiceKeyboard(
+  labels: string[],
   page: number,
-  hasMore: boolean,
-  direction: string
+  pageSize: number,
+  total: number,
+  allowSearch: boolean
 ): TelegramBot.InlineKeyboardMarkup {
-  const rows = tokens.map((t) => [
-    b(`🪙 ${t.symbol}`, `tokpick_${direction}_${t.masterAddress}`),
-  ]);
+  const start = (page - 1) * pageSize;
+  const rows = labels
+    .slice(start, start + pageSize)
+    .map((label, i) => [b(label, `mt_pick_${start + i}`)]);
+
   const nav: TelegramBot.InlineKeyboardButton[] = [];
-  if (page > 1) nav.push(b('‹', `tokpage_${direction}_${page - 1}`));
-  if (hasMore) nav.push(b('›', `tokpage_${direction}_${page + 1}`));
+  if (page > 1) nav.push(b('‹ Prev', `mt_page_${page - 1}`));
+  if (start + pageSize < total) nav.push(b('Next ›', `mt_page_${page + 1}`));
   if (nav.length) rows.push(nav);
-  rows.push(row(b('🔍 Search', 'token_search')));
-  rows.push(row(b('‹ Back', 'swap')));
+
+  if (allowSearch) rows.push(row(b('🔍 New Search', 'mt_dir_t2k')));
+  rows.push(row(b('‹ Back', 'token_search')));
   return { inline_keyboard: rows };
+}
+
+export function tokenConfirmKeyboard(): TelegramBot.InlineKeyboardMarkup {
+  return { inline_keyboard: [
+    row(b('✅ Confirm Swap', 'confirm_token_swap')),
+    row(b('⟳ Refresh Quote', 'mt_refresh')),
+    row(b('❌ Cancel', 'mt_cancel')),
+  ] };
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -271,4 +294,4 @@ export function relayConfirmKeyboard(): TelegramBot.InlineKeyboardMarkup {
     row(b('✅ Confirm Transfer', 'relay_confirm')),
     row(b('❌ Cancel', 'transfer_relay')),
   ] };
-                                  }
+}
