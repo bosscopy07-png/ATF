@@ -56,6 +56,14 @@ const VERIFICATIONS = new Set<DiscoveredVerification>([
 
 function asVerification(value: any): DiscoveredVerification {
   const normalized = String(value ?? '').toLowerCase();
+
+  // TonAPI reports whitelist | graylist | blacklist | none. Previously these
+  // all fell through to 'community', so a BLACKLISTED (scam) jetton looked
+  // swappable. Map them explicitly; an unknown/absent value stays 'community'.
+  if (normalized === 'whitelist') return 'verified';
+  if (normalized === 'blacklist') return 'blacklisted';
+  if (normalized === 'graylist') return 'suspicious';
+
   return VERIFICATIONS.has(normalized as DiscoveredVerification)
     ? (normalized as DiscoveredVerification)
     : 'community';
@@ -114,10 +122,15 @@ export class WalletAssetDiscoveryService {
    * Balances are canonicalized, deduplicated by Jetton master address, and
    * returned as bigint base units.
    */
-  async discover(walletAddress: string): Promise<DiscoveredJetton[]> {
+  async discover(
+    walletAddress: string,
+    options?: { fresh?: boolean }
+  ): Promise<DiscoveredJetton[]> {
     const owner = Address.parse(walletAddress).toString();
 
-    const cached = this.walletCache.get(owner);
+    // `fresh` bypasses the 30s wallet cache. Used right before a swap is
+    // offered so a balance that just changed is never presented as current.
+    const cached = options?.fresh ? undefined : this.walletCache.get(owner);
     if (cached && cached.expiresAt > Date.now()) {
       return cached.items;
     }
@@ -506,4 +519,5 @@ export class WalletAssetDiscoveryService {
 
     return metadata;
   }
-    }
+  }
+    
