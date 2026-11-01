@@ -487,8 +487,9 @@ export class GasRecoveryService {
   ): Promise<boolean> {
     const threshold = amount / 2n;
 
-    for (let attempt = 0; attempt < 30; attempt++) {
-      await new Promise((r) => setTimeout(r, 3000));
+    // 45 × 2s = same 90s patience as before (was 30 × 3s), but answers up to 1s sooner.
+    for (let attempt = 0; attempt < 45; attempt++) {
+      await new Promise((r) => setTimeout(r, 2000));
 
       try {
         const [fromNow, toNow] = await Promise.all([
@@ -518,4 +519,5 @@ function min2(a: bigint, b: bigint): bigint {
 export function gasTonToNano(gasTon: string): bigint {
   return Precision.toBaseUnits(gasTon, TON_DECIMALS);
   }
+
           
