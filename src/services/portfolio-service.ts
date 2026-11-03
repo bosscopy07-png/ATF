@@ -23,6 +23,8 @@ export interface PortfolioLine {
   valueUsd: string | null;
   valueNgn: string | null;
   valuationStatus: ValuationStatus;
+  /** 24h change in percent when a provider reports it (display only). */
+  change24hPercent?: number | null;
 }
 
 export interface PortfolioSummary {
@@ -44,7 +46,8 @@ type MakePortfolioLine = (
   balanceBase: bigint,
   priceUsd: string | null,
   priceSource: string | null,
-  priceUpdatedAt: Date | null
+  priceUpdatedAt: Date | null,
+  change24hPercent?: number | null
 ) => PortfolioLine;
 
 /**
@@ -82,7 +85,8 @@ export class PortfolioService {
       balanceBase: bigint,
       priceUsd: string | null,
       priceSource: string | null,
-      priceUpdatedAt: Date | null
+      priceUpdatedAt: Date | null,
+      change24hPercent?: number | null
     ): PortfolioLine => {
       let valueUsd: string | null = null;
       let valueNgn: string | null = null;
@@ -111,6 +115,7 @@ export class PortfolioService {
         valueUsd,
         valueNgn,
         valuationStatus: status,
+        change24hPercent: change24hPercent ?? null,
       };
     };
 
@@ -122,7 +127,8 @@ export class PortfolioService {
       onChainTon,
       tonPrice ? String(tonPrice.price) : null,
       tonPrice?.source ?? null,
-      tonPrice?.timestamp ?? null
+      tonPrice?.timestamp ?? null,
+      tonPrice?.change24hPercent ?? null
     );
 
     const atfLine = mkLine(
@@ -133,7 +139,8 @@ export class PortfolioService {
       onChainAtf,
       atfPrice ? String(atfPrice.price) : null,
       atfPrice?.source ?? null,
-      atfPrice?.timestamp ?? null
+      atfPrice?.timestamp ?? null,
+      atfPrice?.change24hPercent ?? null
     );
 
     const others = await this.discoverOtherAssets(
@@ -235,6 +242,7 @@ export class PortfolioService {
         let priceUpdatedAt = priceUsd
           ? asset.priceUpdatedAt ?? new Date()
           : null;
+        let change24h: number | null = asset.change24hPercent ?? null;
 
         /*
          * If the indexer did not provide a usable USD price, query the
@@ -253,7 +261,15 @@ export class PortfolioService {
             priceUsd = String(priceData.price);
             priceSource = priceData.source;
             priceUpdatedAt = priceData.timestamp;
+            change24h = priceData.change24hPercent ?? change24h;
           }
+        } else if (change24h === null) {
+          // price known but the indexer sent no 24h change — ask the provider
+          // chain (cached, bounded by the concurrency limit above). Display only.
+          const priceData = await this.priceService
+            .getJettonPriceUsd(asset.masterAddress)
+            .catch(() => null);
+          change24h = priceData?.change24hPercent ?? null;
         }
 
         try {
@@ -265,7 +281,8 @@ export class PortfolioService {
             asset.balanceBase,
             priceUsd,
             priceSource,
-            priceUpdatedAt
+            priceUpdatedAt,
+            change24h
           );
         } catch (error: any) {
           console.warn(
@@ -338,4 +355,5 @@ export class PortfolioService {
       .times(priceUsd)
       .toFixed(2);
   }
-      }
+  }
+                                                                     
