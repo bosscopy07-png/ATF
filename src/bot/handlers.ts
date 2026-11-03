@@ -76,6 +76,11 @@ export async function handleCallback(query: TelegramBot.CallbackQuery): Promise<
     await swapScreens.refreshTokenQuote(userId, chatId, user);
     return;
   }
+  if (data === 'mt_all') {
+    if (user.state !== 'swap_token_amount') { await showMainMenu(userId, chatId); return; }
+    await swapScreens.swapAllTokens(userId, chatId, user);
+    return;
+  }
   if (data === 'mt_cancel') { await swapScreens.cancelTokenSwap(userId, chatId); return; }
   if (data === 'confirm_token_swap') {
     if (user.state !== 'swap_token_confirm') { await showMainMenu(userId, chatId); return; }
@@ -307,4 +312,4 @@ export async function delUserMsg(msg: TelegramBot.Message): Promise<void> {
   } catch { /* ignore */ }
      }
 
-                                                                            
+   
