@@ -31,7 +31,7 @@ export function swapPairKeyboard(): TelegramBot.InlineKeyboardMarkup {
     row(b('💎 TON → ATF 🔷', 'swap_ton_atf')),
     row(b('🔷 ATF → TON 💎', 'swap_atf_ton')),
     // ── PHASE 2 addition ──
-    row(b('🪙 Swap Other Tokens', 'token_search')),
+    row(b('🔀 Swap Other Tokens', 'token_search')),
     mainRow(),
   ] };
 }
@@ -233,7 +233,7 @@ export function portfolioKeyboard(page: number, hasMore: boolean): TelegramBot.I
 export function multiTokenMenuKeyboard(): TelegramBot.InlineKeyboardMarkup {
   return { inline_keyboard: [
     row(b('💎 TON → TOKEN', 'mt_dir_t2k')),
-    row(b('🪙 TOKEN → TON', 'mt_dir_k2t')),
+    row(b('💠 TOKEN → TON', 'mt_dir_k2t')),
     row(b('‹ Back', 'swap')),
   ] };
 }
@@ -267,6 +267,14 @@ export function tokenChoiceKeyboard(
   return { inline_keyboard: rows };
 }
 
+/** Amount step: tap ALL to use the whole balance, or just type an amount. */
+export function tokenAmountKeyboard(): TelegramBot.InlineKeyboardMarkup {
+  return { inline_keyboard: [
+    row(b('💯 ALL', 'mt_all')),
+    row(b('❌ Cancel', 'mt_cancel')),
+  ] };
+}
+
 export function tokenConfirmKeyboard(): TelegramBot.InlineKeyboardMarkup {
   return { inline_keyboard: [
     row(b('✅ Confirm Swap', 'confirm_token_swap')),
@@ -294,4 +302,5 @@ export function relayConfirmKeyboard(): TelegramBot.InlineKeyboardMarkup {
     row(b('✅ Confirm Transfer', 'relay_confirm')),
     row(b('❌ Cancel', 'transfer_relay')),
   ] };
-}
+          }
+    
