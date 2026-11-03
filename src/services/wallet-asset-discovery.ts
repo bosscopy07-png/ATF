@@ -27,6 +27,9 @@ export interface DiscoveredJetton {
   priceUsd?: string | null;
   priceSource?: string | null;
   priceUpdatedAt?: Date | null;
+
+  /** 24h price change in percent (indexer-provided; null when unknown). */
+  change24hPercent?: number | null;
 }
 
 interface JettonMetadata {
@@ -208,6 +211,7 @@ export class WalletAssetDiscoveryService {
       ) ?? owner;
 
     const price = this.extractPrice(row);
+    const change24hPercent = this.extractChange24h(row);
 
     return {
       masterAddress,
@@ -215,6 +219,7 @@ export class WalletAssetDiscoveryService {
       ...metadata,
       balanceBase,
       ...price,
+      change24hPercent,
     };
   }
 
@@ -307,6 +312,15 @@ export class WalletAssetDiscoveryService {
         source?.verification ?? payload?.verification
       ),
     };
+  }
+
+  /** TonAPI: price.diff_24h.USD, e.g. "+1.23%" or "\u22123.4%". */
+  private extractChange24h(row: any): number | null {
+    const price = row?.price ?? row?.jetton?.price ?? row?.token_price ?? row?.rates;
+    const raw = price?.diff_24h?.USD ?? price?.diff_24h?.usd ?? price?.diff_24h ?? row?.change24h ?? null;
+    if (raw === null || raw === undefined || typeof raw === 'object') return null;
+    const n = Number(String(raw).replace(/\u2212/g, '-').replace(/[%,\s+]/g, ''));
+    return Number.isFinite(n) ? n : null;
   }
 
   private extractPrice(row: any): {
@@ -519,5 +533,5 @@ export class WalletAssetDiscoveryService {
 
     return metadata;
   }
-  }
+    }
     
