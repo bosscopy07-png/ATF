@@ -41,6 +41,7 @@ import {
   WalletAssetDiscoveryService,
   DiscoveredJetton,
 } from './wallet-asset-discovery';
+import { PriceService } from './price-service';
 
 import { FeeEngine, SwapFeePlan } from '../config/fees';
 import { Precision } from '../utils/precision';
@@ -68,6 +69,9 @@ export interface MtToken {
   symbol: string;
   name: string;
   decimals: number;
+  /** Display only (never used for fees or quotes). */
+  priceUsd?: string | null;
+  change24h?: number | null;
 }
 
 /** A token the user's wallet really holds (TOKEN → TON picker). */
@@ -126,6 +130,9 @@ export interface MtConfirmation {
   createdAt: string;
   expiresAt: Date;
 }
+
+/** TON that must stay in the wallet for network gas when swapping ALL TON. */
+export const ALL_TON_RESERVE_NANO = 350_000_000n;
 
 export class SwapInProgressError extends Error {
   constructor() {
@@ -200,6 +207,7 @@ export class MultiTokenSwapService {
     symbol: t.symbol,
     name: t.name,
     decimals: t.decimals,
+    priceUsd: t.priceUsd ?? null,
   });
 
   /**
@@ -228,11 +236,97 @@ export class MultiTokenSwapService {
         decimals: j.decimals,
         balanceBase: j.balanceBase.toString(),
         balanceDisplay: dec(j.balanceBase, j.decimals),
+        priceUsd: j.priceUsd ?? null,
+        change24h: j.change24hPercent ?? null,
       });
     }
 
     holdings.sort((a, b) => a.symbol.localeCompare(b.symbol));
     return { walletAddress, holdings };
+  }
+
+  /**
+   * Fill in price + 24h change for the tokens about to be shown (display only).
+   * Uses the shared, cached PriceService; bounded in time and concurrency so a
+   * slow provider can never hold up the list. Unknown stays unknown (null).
+   */
+  async enrichMarket<T extends { masterAddress: string; priceUsd?: string | null; change24h?: number | null }>(
+    items: T[],
+    timeoutMs = 3_000
+  ): Promise<T[]> {
+    const prices = PriceService.getInstance();
+    const work = items.map(async (item) => {
+      if (item.priceUsd && item.change24h !== undefined && item.change24h !== null) return;
+      try {
+        const p = await prices.getJettonPriceUsd(item.masterAddress);
+        if (p && Number.isFinite(p.price) && p.price > 0) {
+          if (!item.priceUsd) item.priceUsd = String(p.price);
+          if (item.change24h === undefined || item.change24h === null) {
+            item.change24h = p.change24hPercent ?? null;
+          }
+        }
+      } catch {
+        // price is cosmetic — never block the list
+      }
+    });
+    await Promise.race([
+      Promise.all(work),
+      new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+    ]);
+    return items;
+  }
+
+  /**
+   * How much TON the user can swap with ALL: balance minus the gas reserve.
+   * Display only — prepareAll() re-checks everything with a real quote.
+   */
+  async maxTonSwappable(userId: number): Promise<{ spendNano: bigint; reserveNano: bigint; balanceNano: bigint }> {
+    const walletAddress = await this.wallets.getAddress(userId);
+    if (!walletAddress) throw new Error('Wallet not found');
+    const balanceNano = await this.wallets.getTonBalanceStrict(walletAddress);
+    const spendNano = balanceNano > ALL_TON_RESERVE_NANO ? balanceNano - ALL_TON_RESERVE_NANO : 0n;
+    return { spendNano, reserveNano: ALL_TON_RESERVE_NANO, balanceNano };
+  }
+
+  /**
+   * "ALL": quote the largest amount that can really be swapped.
+   *  TOKEN → TON : the wallet's entire token balance (the platform advances the
+   *                TON gas, so nothing else is needed).
+   *  TON → TOKEN : the TON balance minus network gas, because the swap message
+   *                itself must carry gas. Retries with a slightly bigger gas
+   *                reserve only when the quote shows the wallet cannot afford it.
+   */
+  async prepareAll(args: {
+    userId: number;
+    direction: MultiTokenDirection;
+    token: MtToken;
+  }): Promise<MtConfirmation> {
+    const { userId, direction, token } = args;
+    const walletAddress = await this.wallets.getAddress(userId);
+    if (!walletAddress) throw new Error('Wallet not found');
+
+    if (direction === 'token_to_ton') {
+      const bal = await this.readJettonBalanceStrict(walletAddress, token.masterAddress);
+      if (bal <= 0n) throw new Error(`You hold no ${token.symbol} in this wallet.`);
+      return this.prepare({ userId, direction, token, amount: dec(bal, token.decimals) });
+    }
+
+    const ton = await this.wallets.getTonBalanceStrict(walletAddress);
+    const min = Precision.toBaseUnits(config.minSwapTon.toString(), TON_DECIMALS);
+    let lastError: unknown = null;
+
+    for (const reserve of [ALL_TON_RESERVE_NANO, 450_000_000n, 600_000_000n]) {
+      const spend = ton - reserve;
+      if (spend < min) break;
+      try {
+        return await this.prepare({ userId, direction, token, amount: dec(spend, TON_DECIMALS) });
+      } catch (err: any) {
+        lastError = err;
+        if (!/Insufficient TON/i.test(String(err?.message))) throw err; // only gas shortfalls retry
+      }
+    }
+
+    throw new Error('Insufficient TON to swap everything — a little TON must stay for network gas.');
   }
 
   /* ═════════════ CHAIN READS ═════════════ */
@@ -512,7 +606,7 @@ export class MultiTokenSwapService {
 
     await checkRateLimit('swap:execute', userId, config.swapExecuteRateLimit, config.swapExecuteRateWindowMs);
 
-     // Execution can wait on the treasury lock + advance confirmation (~80s), so the
+    // Execution can wait on the treasury lock + advance confirmation (~80s), so the
     // per-user lock outlives the default 30s TTL.
     return withLock(`lock:swap:${userId}`, Math.max(config.swapLockTtlMs, 180_000), async () => {
       const idemKey = `mtswap:${userId}:${c.confirmationId}`;
@@ -1060,4 +1154,3 @@ export class MultiTokenSwapService {
   }
 }
 
-      
