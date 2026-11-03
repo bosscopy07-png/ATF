@@ -1,3 +1,4 @@
+
 /**
  * token-display — pure formatting for token rows (no I/O, no SDK).
  * One place decides the trend emoji, price and percent text so the token
@@ -51,12 +52,13 @@ export interface TokenRowInput {
   balance?: string;
 }
 
-/** Short one-line label for an inline button (Telegram buttons are narrow). */
+/**
+ * Inline-button label: trend emoji + symbol (+ the amount held, in the wallet
+ * list). Price and percent are NOT repeated here — they are in the message.
+ */
 export function tokenButtonLabel(t: TokenRowInput): string {
   const parts = [`${trendEmoji(t.change24h)} ${t.symbol}`];
   if (t.balance !== undefined) parts.push(t.balance);
-  parts.push(priceText(t.priceUsd));
-  if (t.change24h !== undefined && t.change24h !== null) parts.push(pctText(t.change24h));
   return parts.join(' · ').slice(0, 56);
 }
 
