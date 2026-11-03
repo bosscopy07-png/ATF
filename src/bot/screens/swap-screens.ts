@@ -1,3 +1,4 @@
+
 /**
  * Swap screens — TON↔ATF flow + PHASE 2 multi-token swap.
  * Imports context + main-menu (static). Never imported by main-menu at
@@ -15,6 +16,7 @@ import { showMainMenu } from './main-menu';
 import * as keyboards from '../keyboards';
 import { TokenRegistry } from '../../services/token-registry';
 import { SwapInProgressError, QuoteExpiredError } from '../../services/multi-token-swap-service';
+import { tokenButtonLabel, tokenDetailLine, trendEmoji } from '../token-display';
 
 /* ───────────────────────────────────────────────────────────────────────────
    🔄 SWAP FLOW (TON ↔ ATF — existing behavior preserved)
@@ -227,7 +229,7 @@ export async function onTokenSearch(userId: number, chatId: number, user: any): 
       terminalHeader('SWAP OTHER TOKENS', 'live quote before you confirm'),
       '',
       `💎 <b>TON → TOKEN</b> — buy any listed token`,
-      `🪙 <b>TOKEN → TON</b> — sell a token your wallet holds`,
+      `💠 <b>TOKEN → TON</b> — sell a token your wallet holds`,
     ].join('\n'),
     keyboards.multiTokenMenuKeyboard());
 }
@@ -254,17 +256,28 @@ async function showChoices(userId: number, chatId: number, user: any, page: numb
   const choices: any[] = st.choices || [];
   const isHoldings = st.direction === 'token_to_ton';
 
-  const labels = choices.map((c) =>
-    isHoldings
-      ? `🪙 ${c.symbol} · ${fmt(c.balanceBase, c.decimals)}`
-      : `🪙 ${c.symbol} · ${String(c.name).slice(0, 24)}`
+  const start = (page - 1) * PAGE_SIZE_TOKENS;
+  const pageItems = choices.slice(start, start + PAGE_SIZE_TOKENS);
+
+  // price + 24h change for just the rows on screen (cached, time-boxed, cosmetic)
+  await multiTokenSwapService.enrichMarket(pageItems);
+
+  const row = (c: any) => ({
+    symbol: c.symbol,
+    priceUsd: c.priceUsd,
+    change24h: c.change24h,
+    balance: isHoldings ? fmt(c.balanceBase, c.decimals) : undefined,
+  });
+
+  // the keyboard indexes by absolute position; only the visible page needs a full label
+  const labels = choices.map((c, i) =>
+    i >= start && i < start + PAGE_SIZE_TOKENS
+      ? tokenButtonLabel(row(c))
+      : `${trendEmoji(c.change24h)} ${c.symbol}`
   );
 
-  const start = (page - 1) * PAGE_SIZE_TOKENS;
-  const lines = choices.slice(start, start + PAGE_SIZE_TOKENS).map((c) =>
-    isHoldings
-      ? `• <b>${esc(c.symbol)}</b> — ${esc(c.name)}\n   balance <code>${fmt(c.balanceBase, c.decimals)}</code>`
-      : `• <b>${esc(c.symbol)}</b> — ${esc(c.name)}`
+  const lines = pageItems.map((c) =>
+    `${trendEmoji(c.change24h)} <b>${esc(c.symbol)}</b> — ${esc(c.name)}\n   ${tokenDetailLine(row(c))}`
   );
 
   await toast(userId, chatId,
@@ -403,7 +416,7 @@ export async function pickToken(userId: number, chatId: number, user: any, index
     await toast(userId, chatId,
       `${terminalHeader('NO ROUTE')}\n❌ No swap route is available for <b>${esc(token.symbol)}</b> right now.`,
       keyboards.tokenChoiceKeyboard(
-        (st.choices || []).map((c: any) => `🪙 ${c.symbol}`),
+        (st.choices || []).map((c: any) => `${trendEmoji(c.change24h)} ${c.symbol}`),
         1, PAGE_SIZE_TOKENS, (st.choices || []).length, direction === 'ton_to_token'));
     return;
   }
@@ -411,7 +424,7 @@ export async function pickToken(userId: number, chatId: number, user: any, index
     await toast(userId, chatId,
       `${terminalHeader('ROUTE CHECK')}\n⚠️ Could not check <b>${esc(token.symbol)}</b> just now. Tap it again in a moment.`,
       keyboards.tokenChoiceKeyboard(
-        (st.choices || []).map((c: any) => `🪙 ${c.symbol}`),
+        (st.choices || []).map((c: any) => `${trendEmoji(c.change24h)} ${c.symbol}`),
         1, PAGE_SIZE_TOKENS, (st.choices || []).length, direction === 'ton_to_token'));
     return;
   }
@@ -434,11 +447,23 @@ export async function pickToken(userId: number, chatId: number, user: any, index
     lines.push('', `💳 Balance: <code>${fmt(choice.balanceBase, token.decimals)} ${esc(token.symbol)}</code>`);
   } else {
     lines.push('', `📌 Min: <code>${config.minSwapTon} TON</code>`);
+    // how much ALL would swap, and what stays behind for network gas
+    try {
+      const m = await multiTokenSwapService.maxTonSwappable(userId);
+      lines.push(
+        m.spendNano > 0n
+          ? `💯 ALL = <code>${fmt(m.spendNano, TON_DECIMALS)} TON</code> <i>(${fmt(m.reserveNano, TON_DECIMALS)} TON stays in your wallet for network gas)</i>`
+          : `⚠️ Your balance is too low to swap — ${fmt(m.reserveNano, TON_DECIMALS)} TON must stay for network gas.`
+      );
+    } catch {
+      // cosmetic line — never block the amount step
+    }
   }
-  await toast(userId, chatId, lines.join('\n'), keyboards.cancelKeyboard('mt_cancel'));
+  lines.push('', `Type an amount, or tap <b>ALL</b> to use your whole balance.`);
+  await toast(userId, chatId, lines.join('\n'), keyboards.tokenAmountKeyboard());
 }
 
-function renderQuote(c: any): string {
+function renderQuote(c: any, isAll = false): string {
   const outSym = esc(c.outputSymbol);
   const inSym = esc(c.inputSymbol);
   const lines: string[] = [
@@ -473,6 +498,10 @@ function renderQuote(c: any): string {
     );
   }
 
+  if (isAll && c.direction === 'ton_to_token') {
+    lines.push('', `💯 <b>ALL</b> — the rest of your TON stays in your wallet for network gas`);
+  }
+
   const secs = Math.max(0, Math.floor((new Date(c.expiresAt).getTime() - Date.now()) / 1000));
   lines.push('', `rate  ${esc(c.rate)}`, `<i>quote expires in ~${secs}s — revalidated before sending</i>`);
   return lines.join('\n');
@@ -484,10 +513,11 @@ export async function handleTokenSwapAmount(userId: number, chatId: number, user
   if (!direction || !token) { await showMainMenu(userId, chatId); return; }
 
   const amount = text.trim();
+  if (/^(all|max)$/i.test(amount)) { await swapAllTokens(userId, chatId, user); return; }
   if (!isValidAmount(amount)) {
     await toast(userId, chatId,
-      `${terminalHeader('SWAP')}\n❌ invalid amount — enter a positive number.`,
-      keyboards.cancelKeyboard('mt_cancel'));
+      `${terminalHeader('SWAP')}\n❌ invalid amount — enter a positive number, or tap ALL.`,
+      keyboards.tokenAmountKeyboard());
     return;
   }
 
@@ -496,30 +526,40 @@ export async function handleTokenSwapAmount(userId: number, chatId: number, user
 
 async function quoteAndShow(
   userId: number, chatId: number, user: any,
-  direction: 'ton_to_token' | 'token_to_ton', token: any, amount: string
+  direction: 'ton_to_token' | 'token_to_ton', token: any, amount: string,
+  useAll = false
 ): Promise<void> {
   let confirmation: any;
   try {
-    confirmation = await multiTokenSwapService.prepare({ userId, direction, token, amount });
+    confirmation = useAll
+      ? await multiTokenSwapService.prepareAll({ userId, direction, token })
+      : await multiTokenSwapService.prepare({ userId, direction, token, amount });
   } catch (err: any) {
     await toast(userId, chatId,
       `${terminalHeader('SWAP')}\n❌ ${friendlyError(err)}`,
-      keyboards.cancelKeyboard('mt_cancel'));
+      keyboards.tokenAmountKeyboard());
     return; // stay in swap_token_amount so the user can try a smaller amount
   }
 
   user.state = 'swap_token_confirm';
-  user.stateData = { direction, token, amount, confirmation };
+  user.stateData = { direction, token, amount, all: useAll, confirmation };
   await user.save();
 
-  await toast(userId, chatId, renderQuote(confirmation), keyboards.tokenConfirmKeyboard());
+  await toast(userId, chatId, renderQuote(confirmation, useAll), keyboards.tokenConfirmKeyboard());
 }
 
 /** Re-quote with the same inputs (quotes live ~30s). */
 export async function refreshTokenQuote(userId: number, chatId: number, user: any): Promise<void> {
-  const { direction, token, amount } = user.stateData || {};
+  const { direction, token, amount, all } = user.stateData || {};
   if (!direction || !token || !amount) { await onTokenSearch(userId, chatId, user); return; }
-  await quoteAndShow(userId, chatId, user, direction, token, amount);
+  await quoteAndShow(userId, chatId, user, direction, token, amount, !!all);
+}
+
+/** ALL tapped (or "all" typed): quote the whole swappable balance. */
+export async function swapAllTokens(userId: number, chatId: number, user: any): Promise<void> {
+  const { direction, token } = user.stateData || {};
+  if (!direction || !token) { await showMainMenu(userId, chatId); return; }
+  await quoteAndShow(userId, chatId, user, direction, token, 'ALL', true);
 }
 
 export async function cancelTokenSwap(userId: number, chatId: number): Promise<void> {
@@ -635,4 +675,4 @@ async function followUpSettlement(userId: number, chatId: number, swapId: string
   } catch (err) {
     console.error('[MultiToken] follow-up settlement failed:', err);
   }
-}
+      }
