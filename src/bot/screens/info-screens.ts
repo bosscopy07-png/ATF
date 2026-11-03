@@ -12,6 +12,7 @@ import {
   formatAddressShort,
 } from '../context';
 import * as keyboards from '../keyboards';
+import { trendEmoji, pctText, priceText } from '../token-display';
 
 /** Support desk — surfaced as a button, never as visible URL text. */
 const SUPPORT_URL = 'https://orbit-talk-pro.lovable.app/atfswap';
@@ -205,14 +206,11 @@ export async function showPortfolio(userId: number, chatId: number, page: number
         ? `\n   ⚠️ <i>price unavailable — excluded from total</i>`
         : '';
 
-    const priceLine = line.priceUsd
-      ? `$${new Intl.NumberFormat('en-US', { maximumFractionDigits: 6 }).format(Number(line.priceUsd))}`
-      : '—';
-
     lines.push(
-      `🪙 <b>${line.symbol}</b> · ${line.name}\n` +
+      `${trendEmoji(line.change24hPercent)} <b>${line.symbol}</b> · ${line.name}\n` +
       `   <code>${line.balanceDisplay}</code>\n` +
-      `   ${priceLine} · ${line.valueUsd ? `$${line.valueUsd}` : 'unvalued'}` +
+      `   ${priceText(line.priceUsd)} · ${pctText(line.change24hPercent)}\n` +
+      `   ${line.valueUsd ? `<b>$${line.valueUsd}</b>` : 'unvalued'}` +
       (line.valueNgn ? ` · ≈ ₦${line.valueNgn}` : '') +
       statusTag
     );
@@ -237,4 +235,5 @@ export async function showPortfolio(userId: number, chatId: number, page: number
 
   await toast(userId, chatId, text, keyboards.portfolioKeyboard(page, hasMore));
        }
-        
+
+    
