@@ -18,6 +18,7 @@ export interface TokenRef {
   decimals: number;
   verification: string;
   imageUrl?: string;
+  priceUsd?: string;
 }
 
 type HttpFn = (
@@ -54,6 +55,7 @@ function toRef(t: CatalogToken): TokenRef {
     decimals: t.decimals,
     verification: t.verification,
     imageUrl: t.imageUrl,
+    priceUsd: t.priceUsd,
   };
 }
 
@@ -307,5 +309,5 @@ export class TokenRegistry {
 
     return found && isSelectableJetton(found, ex) ? toRef(found) : null;
   }
-  }
-          
+            }
+            
