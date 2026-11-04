@@ -1,4 +1,3 @@
-
 /**
  * Swap screens — TON↔ATF flow + PHASE 2 multi-token swap.
  * Imports context + main-menu (static). Never imported by main-menu at
@@ -219,6 +218,8 @@ const comingSoon = (userId: number, chatId: number) =>
 /** Entry for the 'token_search' button: pick a direction. */
 export async function onTokenSearch(userId: number, chatId: number, user: any): Promise<void> {
   if (!config.features.multiTokenSwap) { await comingSoon(userId, chatId); return; }
+
+  multiTokenSwapService.warmRegistry(); // start loading the token list before they search
 
   user.state = 'idle';
   user.stateData = {};
@@ -675,4 +676,5 @@ async function followUpSettlement(userId: number, chatId: number, swapId: string
   } catch (err) {
     console.error('[MultiToken] follow-up settlement failed:', err);
   }
-      }
+            }
+                                            
