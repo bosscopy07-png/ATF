@@ -1,3 +1,4 @@
+
 import axios from 'axios';
 import { Address } from '@ton/core';
 import { config } from '../config';
@@ -24,7 +25,7 @@ export interface TokenRef {
 type HttpFn = (
   method: 'GET' | 'POST',
   path: string,
-  opts?: { params?: Record<string, any>; data?: any }
+  opts?: { params?: Record<string, any>; data?: any; timeoutMs?: number }
 ) => Promise<any>;
 
 /** STON.fi API root without a trailing slash or /v1 (paths below add /v1). */
@@ -41,7 +42,7 @@ const defaultHttp: HttpFn = async (method, path, opts) => {
     url: `${providerRoot()}${path}`,
     params: opts?.params,
     data: opts?.data,
-    timeout: 12_000,
+    timeout: opts?.timeoutMs ?? 12_000,
     headers: { Accept: 'application/json' },
   });
   return res.data;
@@ -89,6 +90,7 @@ export class TokenRegistry {
     this.http = fn ?? defaultHttp;
     this.cache = null;
     this.inflight = null;
+    this.lastPersistAt = 0;
   }
 
   static normalize(addr: string): string {
@@ -129,24 +131,23 @@ export class TokenRegistry {
 
   private static async fetchCatalog(): Promise<CatalogToken[]> {
     const norm = (a: string) => this.tryNormalize(a);
-    let lastError: unknown = null;
+    const errors: string[] = [];
 
-    // /v1/assets is the documented listing; bare /assets kept as a fallback
-    // for self-hosted / proxied API roots.
+    // The full listing is ~40,000 assets, so it needs a far longer timeout than
+    // a normal API call (a 12s limit was failing the first, cold request).
     for (const path of ['/v1/assets', '/assets']) {
       try {
-        const payload = await this.http('GET', path);
+        const payload = await this.http('GET', path, { timeoutMs: 60_000 });
         const tokens = parseProviderAssets(payload, norm);
         if (tokens.length > 0) return tokens;
-        lastError = new Error(`${path} returned no assets`);
+        errors.push(`${path}: returned no assets`);
       } catch (err) {
-        lastError = err;
+        // keep EVERY attempt's error — the last one is usually just a 404 on the fallback path
+        errors.push(`${path}: ${(err as Error)?.message || 'unknown error'}`);
       }
     }
 
-    throw new Error(
-      `Token provider unavailable: ${(lastError as Error)?.message || 'unknown error'}`
-    );
+    throw new Error(`Token provider unavailable (${errors.join(' | ')})`);
   }
 
   /** Refresh the in-memory catalog from STON.fi. Keeps the last good copy on failure. */
@@ -170,37 +171,57 @@ export class TokenRegistry {
     return this.inflight;
   }
 
+  /**
+   * Fresh cache → use it. Stale cache → use it NOW and refresh in the
+   * background (users never wait on a 40k-asset download). No cache → wait.
+   */
   private static async ensureCatalog(): Promise<CatalogToken[]> {
-    if (!this.cache || Date.now() - this.cache.at > this.CACHE_TTL_MS) {
+    if (!this.cache) {
       await this.refresh();
+    } else if (Date.now() - this.cache.at > this.CACHE_TTL_MS) {
+      void this.refresh().catch(() => undefined);
     }
     return this.cache?.tokens ?? [];
   }
 
-  /** Best-effort write-through cache for admin tooling. Never authoritative. */
+  /** Start loading the catalog in the background (called when the menu opens). */
+  static warmUp(): void {
+    if (!this.cache && !this.inflight) void this.refresh().catch(() => undefined);
+  }
+
+  private static lastPersistAt = 0;
+  private static readonly PERSIST_LIMIT = 400;
+  private static readonly PERSIST_EVERY_MS = 60 * 60 * 1000;
+
+  /**
+   * Best-effort write-through cache for admin tooling. Never authoritative.
+   * The provider lists ~40,000 assets; only the most popular few hundred are
+   * mirrored, and at most once an hour (a full upsert on every refresh would
+   * hammer MongoDB for no benefit).
+   */
   private static async persist(tokens: CatalogToken[]): Promise<void> {
+    if (Date.now() - this.lastPersistAt < this.PERSIST_EVERY_MS) return;
+    this.lastPersistAt = Date.now();
     try {
-      const ops = tokens
-        .filter((t) => t.kind === 'jetton')
-        .map((t) => ({
-          updateOne: {
-            filter: { masterAddress: t.masterAddress },
-            update: {
-              $set: {
-                symbol: t.symbol,
-                name: t.name,
-                decimals: t.decimals,
-                verification: t.verification,
-                imageUrl: t.imageUrl,
-                priceSource: 'ston.fi',
-                priceUpdatedAt: new Date(),
-                lastPriceUsd: t.priceUsd,
-                isActive: t.verification === 'verified' || t.verification === 'community',
-              },
+      const top = tokens
+        .filter((t) => t.kind === 'jetton' && (t.verification === 'verified' || t.verification === 'community'))
+        .sort((a, b) => b.popularity - a.popularity)
+        .slice(0, this.PERSIST_LIMIT);
+
+      const ops = top.map((t) => ({
+        updateOne: {
+          filter: { masterAddress: t.masterAddress },
+          update: {
+            $set: {
+              symbol: t.symbol, name: t.name, decimals: t.decimals,
+              verification: t.verification, imageUrl: t.imageUrl,
+              priceSource: 'ston.fi', priceUpdatedAt: new Date(), lastPriceUsd: t.priceUsd,
+              isActive: true,
             },
-            upsert: true,
           },
-        }));
+          upsert: true,
+        },
+      }));
       if (ops.length > 0) await SupportedToken.bulkWrite(ops as any, { ordered: false });
     } catch (err) {
       console.warn('[TokenRegistry] cache write skipped:', (err as Error).message);
@@ -309,5 +330,5 @@ export class TokenRegistry {
 
     return found && isSelectableJetton(found, ex) ? toRef(found) : null;
   }
-            }
-            
+}
+  
