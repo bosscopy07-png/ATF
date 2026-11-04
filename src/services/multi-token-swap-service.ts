@@ -245,30 +245,64 @@ export class MultiTokenSwapService {
     return { walletAddress, holdings };
   }
 
+  private readonly marketCache = new Map<
+    string,
+    { priceUsd: string | null; change24h: number | null; expires: number }
+  >();
+  private static readonly MARKET_OK_TTL_MS = 5 * 60_000;
+  /** Failures are remembered too, so a down/rate-limited provider isn't hit on every page flip. */
+  private static readonly MARKET_FAIL_TTL_MS = 10 * 60_000;
+
+  /** Begin loading the token registry in the background (menu opened). */
+  warmRegistry(): void {
+    TokenRegistry.warmUp();
+  }
+
   /**
    * Fill in price + 24h change for the tokens about to be shown (display only).
-   * Uses the shared, cached PriceService; bounded in time and concurrency so a
-   * slow provider can never hold up the list. Unknown stays unknown (null).
+   * Uses the shared PriceService, bounded in time, and remembers both results
+   * AND failures so provider rate limits are not hammered. Unknown stays null.
    */
   async enrichMarket<T extends { masterAddress: string; priceUsd?: string | null; change24h?: number | null }>(
     items: T[],
     timeoutMs = 3_000
   ): Promise<T[]> {
     const prices = PriceService.getInstance();
+    const now = Date.now();
+
     const work = items.map(async (item) => {
-      if (item.priceUsd && item.change24h !== undefined && item.change24h !== null) return;
+      const needPrice = !item.priceUsd;
+      const needChange = item.change24h === undefined || item.change24h === null;
+      if (!needPrice && !needChange) return;
+
+      const apply = (priceUsd: string | null, change24h: number | null) => {
+        if (needPrice && priceUsd) item.priceUsd = priceUsd;
+        if (needChange && change24h !== null) item.change24h = change24h;
+      };
+
+      const hit = this.marketCache.get(item.masterAddress);
+      if (hit && hit.expires > now) { apply(hit.priceUsd, hit.change24h); return; }
+
       try {
         const p = await prices.getJettonPriceUsd(item.masterAddress);
         if (p && Number.isFinite(p.price) && p.price > 0) {
-          if (!item.priceUsd) item.priceUsd = String(p.price);
-          if (item.change24h === undefined || item.change24h === null) {
-            item.change24h = p.change24hPercent ?? null;
-          }
+          const entry = {
+            priceUsd: String(p.price),
+            change24h: p.change24hPercent ?? null,
+            expires: Date.now() + MultiTokenSwapService.MARKET_OK_TTL_MS,
+          };
+          this.marketCache.set(item.masterAddress, entry);
+          apply(entry.priceUsd, entry.change24h);
+          return;
         }
       } catch {
         // price is cosmetic — never block the list
       }
+      this.marketCache.set(item.masterAddress, {
+        priceUsd: null, change24h: null, expires: Date.now() + MultiTokenSwapService.MARKET_FAIL_TTL_MS,
+      });
     });
+
     await Promise.race([
       Promise.all(work),
       new Promise((resolve) => setTimeout(resolve, timeoutMs)),
@@ -1154,3 +1188,4 @@ export class MultiTokenSwapService {
   }
 }
 
+    
